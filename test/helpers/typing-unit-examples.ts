@@ -292,14 +292,49 @@ const U5: TypingExample[] = [
     off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
   // Restart guard: a later plain mention no cue reads (an onboarding week) keeps the stint open; without the guard the
   // leave would close the current job for good (the dev trace's onboarding losses).
-  { id: 'u5-rejoin-restart-guard', unit: 'U5', target: ACME,
+  { id: 'u56-rejoin-restart-guard', unit: ['U5', 'U6'], target: ACME,
     content: page(`Alice works at ${L(ACME)} as head of sales.`, [`**2015-01-02** | linkedin — Joined ${L(ACME)} as engineer`, `**2018-03-04** | linkedin — Parted company with ${L(ACME)}`, `**2020-08-11** | linkedin — Onboarding week at ${L(ACME)} as head of sales`]),
     off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'], live: { type: 'works_at', at: { '2019-01-01': true, today: true } } },
-    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'], live: { type: 'works_at', at: { '2019-01-01': true, today: true } } } },
+    on: units => !units.has('U6')
+      ? { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'], live: { type: 'works_at', at: { '2019-01-01': true, today: true } } }
+      : { types: ['mentions', 'works_at'],
+        transitions: units.has('U5') ? ['works_at start 2015-01-02', 'works_at end 2018-03-04', 'works_at start 2020-08-11'] : ['works_at start 2015-01-02', 'works_at start 2020-08-11'],
+        live: { type: 'works_at', at: { '2019-01-01': !units.has('U5'), today: true } } } },
   { id: 'u5-leave-not-guarded-by-event-mention', unit: 'U5', target: ACME,
     content: JOB([`**2019-03-04** | linkedin — Parted company with ${L(ACME)}`, `**2021-05-06** | event — Back at ${L(ACME)} for the alumni dinner`]),
     off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] },
     on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'], live: { type: 'works_at', at: { today: false } } } },
 ];
 
-export const EXAMPLES: TypingExample[] = [...U1, ...U2, ...U3, ...U4, ...U5];
+// ─── U6: start framings (dated starts of an asserted works_at) ─────────
+const NOW_AT = (line: string) => page(`Alice works at ${L(ACME)} as designer.`, [`**2021-09-01** | ${line.replace('{X}', L(ACME))}`]);
+const U6: TypingExample[] = [
+  { id: 'u6-first-day-at', unit: 'U6', target: ACME, content: NOW_AT('linkedin — First day at {X} as designer'),
+    off: { types: ['mentions', 'works_at'], transitions: [] },
+    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2021-09-01'], live: { type: 'works_at', at: { '2021-01-01': false, today: true } } } },
+  { id: 'u6-day-one', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Day one with {X}'),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2021-09-01'] } },
+  { id: 'u6-kicked-off-role', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Kicked off a new role at {X}'),
+    off: { types: ['works_at'], transitions: [] }, on: { types: ['works_at'], transitions: ['works_at start 2021-09-01'] } },
+  { id: 'u6-onboarded-at', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Onboarded at {X} this week'),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2021-09-01'] } },
+  { id: 'u6-began-working-at', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Began working at {X}'),
+    off: { types: ['works_at'], transitions: [] }, on: { types: ['works_at'], transitions: ['works_at start 2021-09-01'] } },
+  { id: 'u6-new-chapter-at', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Starting a new chapter at {X} as designer'),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2021-09-01'] } },
+  { id: 'u6-kickoff-without-employment-noun', unit: 'U6', target: ACME, content: NOW_AT('note — Kick-off at {X} for the new project'),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
+  { id: 'u6-first-day-of-summit', unit: 'U6', target: ACME, content: NOW_AT('event — First day of the {X} summit'),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
+  { id: 'u6-event-line-first-day', unit: 'U6', target: ACME, content: NOW_AT('event — First day at the {X} hackathon'),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
+  { id: 'u6-onboarding-call-qualified', unit: 'U6', target: ACME, content: NOW_AT("meeting — Onboarding call with the {X} alumni mentors"),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
+  { id: 'u6-began-working-with-collaboration', unit: 'U6', target: ACME, content: NOW_AT('note — Began working with {X} on a pilot'),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
+  { id: 'u6-untyped-target-not-started', unit: 'U6', target: BETA,
+    content: page(`Alice works at ${L(ACME)}.`, [`**2021-09-01** | linkedin — First day at ${L(BETA)}`]),
+    off: { types: ['mentions'], transitions: [] }, on: { types: ['mentions'], transitions: [] } },
+];
+
+export const EXAMPLES: TypingExample[] = [...U1, ...U2, ...U3, ...U4, ...U5, ...U6];

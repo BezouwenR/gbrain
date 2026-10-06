@@ -223,3 +223,11 @@ export const U5_LEAVE = new RegExp(String.raw`\b(?:${SPLIT_LEAVE}|${IDIOM_LEAVE}
 /** U5: "traded [A] for [B]" ends A (the "for" then starts B). "Traded shares of [A]" is not an exchange. */
 export const U5_EXCHANGE_BEFORE = /\b(?:traded|swapped|exchanged|ditched|dropped)\s*$/i;
 export const U5_EXCHANGE_AFTER = /^\s+for\s+(?:\[|the\s+\[|an?\s+\[)/i;
+
+/**
+ * U6: start framings: a first day, week or month at, day one at, kicking off a role, job, position, chapter or stint
+ * at, onboarding, "began working at/for", a new chapter at. Only dates a works_at relationship the page already
+ * asserts (natural cues never create one). "First day of the [X] summit" and an event line never start a job.
+ */
+const START_ROLE = String.raw`(?:[\w&./-]+\s+){0,4}?`;
+export const U6_START = new RegExp(String.raw`\b(?:(?:(?:her|his|their|my|a|the)\s+)?(?:first\s+(?:day|week|month)|day\s+one)\s+(?:as\s+${START_ROLE})?(?:at|with)|kick(?:ed|s|ing)?[\s-]?off\s+(?:(?:a|her|his|their|my)\s+)?(?:new\s+)?(?:role|job|position|chapter|stint)\s+(?:at|with)|(?:was\s+|got\s+|been\s+)?onboarded\s+(?:at|with|to|into|by)|onboarding\s+(?:week|day|period)\s+(?:at|with)|began\s+(?:work(?:ing)?\s+)?(?:at|for)|start(?:ed|ing|s)?\s+(?:a\s+|her\s+|his\s+|their\s+|my\s+)?new\s+chapter\s+(?:at|with)|(?:a\s+)?new\s+chapter\s+(?:at|with))\s*$`, 'i');

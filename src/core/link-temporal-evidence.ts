@@ -25,7 +25,7 @@ import {
   type TransitionKind, type TransitionProducer,
 } from './link-validity.ts';
 import { KNOWN_LINK_TYPES } from './search/relational-intent.ts';
-import { U4_NOT_EMPLOYMENT_ROLE, U5_EXCHANGE_AFTER, U5_EXCHANGE_BEFORE, U5_LEAVE, typingUnitEnabled } from './link-typing-units.ts';
+import { U4_NOT_EMPLOYMENT_ROLE, U5_EXCHANGE_AFTER, U5_EXCHANGE_BEFORE, U5_LEAVE, U6_START, typingUnitEnabled } from './link-typing-units.ts';
 
 export interface OwnedRow {
   from_slug: string;
@@ -271,6 +271,7 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
           else if (u5 && r.link_type === 'works_at' && U5_LEAVE.test(window)) { kind = 'end'; rule = 'unit.u5.leave'; }
           else if (u5 && r.link_type === 'works_at' && U5_EXCHANGE_BEFORE.test(window) && U5_EXCHANGE_AFTER.test(line.text.slice(ref.end))) { kind = 'end'; rule = 'unit.u5.exchange'; }
           else if (cues.start.test(window)) { kind = 'start'; rule = `cue.${family}.start`; }
+          else if (r.link_type === 'works_at' && typingUnitEnabled('U6') && U6_START.test(window)) { kind = 'start'; rule = 'unit.u6.start_framing'; }
           else if (prevEnded.has(r.link_type) && /^\s*(?:to|for)\s*$/i.test(between)) { kind = 'start'; rule = 'cue.after_end.to_for'; }
         } else if (EVENT_START[r.link_type]?.test(window)) { kind = 'start'; rule = `cue.event.${r.link_type}`; }
         if (!kind) {
