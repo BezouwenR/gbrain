@@ -382,21 +382,72 @@ function parseRelationContent(content: string, original: string, declared: Reado
   return { type, context, effective };
 }
 
+const TRUTHY = new Set(['true', '1', 'yes', 'on']);
 const FALSY = new Set(['false', '0', 'no', 'off']);
-const isTrue = (value: string | null) => value != null && ['true', '1', 'yes', 'on'].includes(value.trim().toLowerCase());
+/** A grammar boolean as written: true, false, null when unset, or 'invalid' for anything else. */
+export function parseGrammarBoolean(value: string | null | undefined): boolean | null | 'invalid' {
+  if (value == null) return null;
+  const v = value.trim().toLowerCase();
+  return TRUTHY.has(v) ? true : FALSY.has(v) ? false : 'invalid';
+}
 
-/** `line_grammar.enabled` (default off, held-out verdict H3) and `line_grammar.allow_undeclared_types` (default off). */
+/** Defaults of the line-grammar settings (held-out verdicts H3 and H7). */
+export const LINE_GRAMMAR_DEFAULTS = { enabled: false, allowUndeclaredTypes: false, effectiveRanges: true } as const;
+export const LINE_GRAMMAR_KEYS = ['line_grammar.enabled', 'line_grammar.allow_undeclared_types', 'line_grammar.effective_ranges'] as const;
+/**
+ * Internal config row: when the effective line-grammar behavior last changed.
+ * Link extraction treats pages extracted before it as stale (see
+ * core/link-extraction-watermark.ts). Not a user setting; `config unset`
+ * refuses `_internal.*` keys.
+ */
+export const LINK_EXTRACTION_GENERATION_KEY = '_internal.link_extraction_generation';
+
+export interface LineGrammarSettings {
+  enabled: boolean;
+  allowUndeclaredTypes: boolean;
+  /** Ranges are stored only while the grammar is on. */
+  effectiveRanges: boolean;
+  /** ISO time of the last effective change, or null when never changed. */
+  generation: string | null;
+}
+
+const resolveBoolean = (value: string | null, fallback: boolean) => { const v = parseGrammarBoolean(value); return typeof v === 'boolean' ? v : fallback; };
+
+/** Settings from raw config values (unset or unreadable spellings take the default). */
+export function lineGrammarSettingsFrom(raw: { enabled: string | null; allow: string | null; ranges: string | null; generation: string | null }): LineGrammarSettings {
+  const enabled = resolveBoolean(raw.enabled, LINE_GRAMMAR_DEFAULTS.enabled);
+  return { enabled, allowUndeclaredTypes: resolveBoolean(raw.allow, LINE_GRAMMAR_DEFAULTS.allowUndeclaredTypes),
+    effectiveRanges: enabled && resolveBoolean(raw.ranges, LINE_GRAMMAR_DEFAULTS.effectiveRanges), generation: raw.generation };
+}
+
+/**
+ * The line-grammar settings link extraction runs under, read once. Strict: a
+ * failed config read throws, so the caller leaves the page stale instead of
+ * extracting under defaults it did not mean.
+ */
+export async function readLineGrammarSettings(engine: { getConfig(key: string): Promise<string | null> }): Promise<LineGrammarSettings> {
+  const [enabled, allow, ranges, generation] = await Promise.all([...LINE_GRAMMAR_KEYS, LINK_EXTRACTION_GENERATION_KEY].map(key => engine.getConfig(key)));
+  return lineGrammarSettingsFrom({ enabled, allow, ranges, generation });
+}
+
+/** What extraction actually does under these settings; two settings with the same fingerprint extract identically. */
+export function lineGrammarFingerprint(s: Pick<LineGrammarSettings, 'enabled' | 'allowUndeclaredTypes' | 'effectiveRanges'>): string {
+  return s.enabled ? `on|undeclared:${s.allowUndeclaredTypes}|ranges:${s.effectiveRanges}` : 'off';
+}
+
+/** `line_grammar.enabled` and `line_grammar.allow_undeclared_types`, best-effort (read failures take the defaults); for advisories and lint. */
 export async function lineGrammarOptions(engine: { getConfig(key: string): Promise<string | null> }): Promise<{ enabled: boolean; allowUndeclaredTypes: boolean }> {
   const read = (key: string) => engine.getConfig(key).catch(() => null);
   const [enabled, allow] = await Promise.all([read('line_grammar.enabled'), read('line_grammar.allow_undeclared_types')]);
-  return { enabled: isTrue(enabled), allowUndeclaredTypes: isTrue(allow) };
+  const s = lineGrammarSettingsFrom({ enabled, allow, ranges: null, generation: null });
+  return { enabled: s.enabled, allowUndeclaredTypes: s.allowUndeclaredTypes };
 }
 
 /** `line_grammar.effective_ranges` (default on; applies only while `line_grammar.enabled` is on): store relation-line ranges on edges (core/link-effective.ts). */
 export async function effectiveRangesEnabled(engine: { getConfig(key: string): Promise<string | null> }): Promise<boolean> {
   const read = (key: string) => engine.getConfig(key).catch(() => null);
   const [ranges, enabled] = await Promise.all([read('line_grammar.effective_ranges'), read('line_grammar.enabled')]);
-  return (ranges == null || !FALSY.has(ranges.trim().toLowerCase())) && isTrue(enabled);
+  return lineGrammarSettingsFrom({ enabled, allow: null, ranges, generation: null }).effectiveRanges;
 }
 
 /**

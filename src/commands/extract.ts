@@ -48,13 +48,15 @@ import type { PageType } from '../core/types.ts';
 import { parseMarkdown } from '../core/markdown.ts';
 import { resolveCandidateSources, resolveLinkFallbackDefault, loadLinkPageMetadata, capturedLinkEndpoints, fileLinkOwnership, replaceFileLinks, replacePageFileLinks, type LinkPageMetadata } from '../core/link-reconciliation.ts';
 import { collectWantedLinks, isWantedPagesEnabled } from '../core/wanted-links.ts';
-import { lineGrammarOptions, statedRelationTypes } from '../core/line-grammar.ts';
+import { readLineGrammarSettings, statedRelationTypes } from '../core/line-grammar.ts';
+import { effectiveLinkExtractorWatermark, linkExtractorWatermarkFor } from '../core/link-extraction-watermark.ts';
+import { DerivedLinkSettingsChangedError } from '../core/derived-links.ts';
 export { reconcileSourceLinks, type SourceLinkReconciliationResult } from '../core/link-reconciliation.ts';
 export { extractMarkdownLinks } from '../core/link-extraction.ts';
 import {
   extractPageLinks, parseTimelineEntries, deriveTimelineAnchor, inferLinkType, makeResolver,
   attendanceEvidenceRanges, hasAttendanceEvidence, resolvedLinkCandidate, orientCanonicalAttendance, extractMarkdownLinks,
-  extractFrontmatterLinks, isGlobalBasenameEnabled, isCrossSourceLinksEnabled, LINK_EXTRACTOR_VERSION_TS,
+  extractFrontmatterLinks, isGlobalBasenameEnabled, isCrossSourceLinksEnabled,
   WIKILINK_BASENAME_LINK_TYPE,
   buildBasenameIndex, queryBasenameIndex, stripCodeBlocks, normalizeBasename,
   parseInlineCitationTimelineEntries,
@@ -173,7 +175,7 @@ async function snapshotStampTimes(
   refs: Array<{ slug: string; source_id: string }>,
 ): Promise<Map<string, string>> {
   const out = new Map<string, string>();
-  const versionTs = LINK_EXTRACTOR_VERSION_TS;
+  const versionTs = await effectiveLinkExtractorWatermark(engine);
   const versionMs = Date.parse(versionTs);
   for (let i = 0; i < refs.length; i += BATCH_SIZE) {
     const batch = refs.slice(i, i + BATCH_SIZE);
@@ -1871,6 +1873,10 @@ async function extractLinksFromDB(
   // links_extraction_lag doctor signal. Non-dry-run only.
   const processedRefs: Array<{ slug: string; source_id: string }> = [];
 
+  // One line-grammar settings snapshot for the run; publication refuses a page if the settings move meanwhile.
+  const grammar = await readLineGrammarSettings(engine);
+  const lineGrammar = { enabled: grammar.enabled, allowUndeclaredTypes: grammar.allowUndeclaredTypes };
+  let skippedSettingsChanged = 0;
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('extract.links_db', walkRefs.length);
 
@@ -1897,7 +1903,7 @@ async function extractLinksFromDB(
     // basename lookup; off by default for back-compat.
     const extracted = await extractPageLinks(
       slug, fullContent, page.frontmatter, page.type, resolver,
-      { skipFrontmatter: !includeFrontmatter, globalBasename, pack, lineGrammar: await lineGrammarOptions(engine), targetType: (targetSlug, targetSourceId) => {
+      { skipFrontmatter: !includeFrontmatter, globalBasename, pack, lineGrammar, targetType: (targetSlug, targetSourceId) => {
         const resolved = resolveCandidateSources({ targetSlug, targetSourceId, linkType: '', context: '' }, slug,
           source_id, allSlugs, slugToSources, federatedSourceIds.has(source_id), { crossSource, defaultSourceId: linkDefaultSourceId });
         return resolved.ok ? targetMetadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type : undefined;
@@ -1950,11 +1956,17 @@ async function extractLinksFromDB(
           crossSourceAllowed: federatedSourceIds.has(source_id) || crossSource, resolve: c => resolveCandidateSources(c, slug, source_id,
             allSlugs, slugToSources, federatedSourceIds.has(source_id), { crossSource, defaultSourceId: linkDefaultSourceId }) }) : [];
         const written = await engine.replaceDerivedLinks({ slug, sourceId: source_id, expectedRevision: snapshot.revision,
-          sourceIncarnation: snapshot.sourceIncarnation }, batch, { includeFrontmatter,
+          sourceIncarnation: snapshot.sourceIncarnation }, batch, { includeFrontmatter, lineGrammar: grammar,
           wanted: { producers: includeFrontmatter ? ['body', 'frontmatter'] : ['body'], rows: wanted },
           expectedEndpoints: capturedLinkEndpoints(batch, targetMetadata) });
         created += written.created;
       } catch (error) {
+        if (error instanceof DerivedLinkSettingsChangedError) {
+          // The line-grammar settings changed mid-run: this page stays stale and the next extraction derives it.
+          skippedSettingsChanged++;
+          progress.tick(1);
+          continue;
+        }
         if (jsonMode) process.stderr.write(JSON.stringify({ event: 'batch_error', size: batch.length, code: 'graph_write_failed' }) + '\n');
         throw error;
       }
@@ -1980,6 +1992,7 @@ async function extractLinksFromDB(
     const label = dryRun ? '(dry run) would create' : 'created';
     console.log(`Links: ${label} ${created} from ${processed} pages (db source)`);
     if (skippedAttendanceIncomplete) console.log(`Skipped ${skippedAttendanceIncomplete} page(s) with unresolved attendance; prior links and extraction watermarks were preserved.`);
+    if (skippedSettingsChanged) console.log(`Skipped ${skippedSettingsChanged} page(s) because the line-grammar settings changed during this run; they stay stale. Run \`gbrain extract --stale\` to finish them.`);
     if (skippedMissingTarget > 0) {
       console.log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
     }
@@ -2004,7 +2017,8 @@ async function extractLinksFromDB(
   // #2589: the counters ride the return value so machine consumers (and the
   // --json path, which has no summary event on this path) can see the drops —
   // "counted, never silent" must hold beyond human-mode console lines.
-  return { created, pages: processed, unresolved, skippedMissingTarget, skippedCrossSource, skippedAttendanceIncomplete };
+  return { created, pages: processed, unresolved, skippedMissingTarget, skippedCrossSource, skippedAttendanceIncomplete,
+    ...(skippedSettingsChanged ? { skippedSettingsChanged } : {}) };
 }
 
 /**
@@ -2047,7 +2061,10 @@ export async function extractStaleFromDB(
   const includeFrontmatter = opts.includeFrontmatter ?? await resolveIncludeFrontmatter(engine);
   const log = opts.quiet ? (..._args: unknown[]) => {} : console.log;
   const timeBudgetMs = opts.timeBudgetMs ?? STALE_TIME_BUDGET_MS;
-  const versionTs = LINK_EXTRACTOR_VERSION_TS;
+  // One line-grammar settings snapshot for the run: it fixes the watermark and how relation lines are read.
+  const grammar = await readLineGrammarSettings(engine);
+  const lineGrammar = { enabled: grammar.enabled, allowUndeclaredTypes: grammar.allowUndeclaredTypes };
+  const versionTs = linkExtractorWatermarkFor(grammar.generation);
 
   // Pre-flight count — cheap indexed COUNT. dry-run reports and returns.
   const totalStale = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs });
@@ -2129,6 +2146,7 @@ export async function extractStaleFromDB(
   // design (source isolation) unless the #3908 flag is on, but distinct
   // from a genuinely missing target.
   let skippedCrossSource = 0;
+  let skippedChanged = 0;
 
   const wantedEnabled = await isWantedPagesEnabled(engine);
   for (;;) {
@@ -2157,7 +2175,7 @@ export async function extractStaleFromDB(
       const resolver = resolvers.get(page.source_id)!;
       const extracted = await extractPageLinks(
         page.slug, fullContent, snapshot.page.frontmatter, snapshot.page.type, resolver,
-        { skipFrontmatter: !includeFrontmatter, globalBasename, pack, lineGrammar: await lineGrammarOptions(engine), targetType: (targetSlug, targetSourceId) => {
+        { skipFrontmatter: !includeFrontmatter, globalBasename, pack, lineGrammar, targetType: (targetSlug, targetSourceId) => {
           const resolved = resolveCandidateSources({ targetSlug, targetSourceId, linkType: '', context: '' }, page.slug,
             page.source_id, allSlugs, slugToSources, federatedSourceIds.has(page.source_id), { crossSource, defaultSourceId: linkDefaultSourceId });
           return resolved.ok ? targetMetadata.get(`${resolved.toSourceId}\0${targetSlug}`)?.type : undefined;
@@ -2186,10 +2204,17 @@ export async function extractStaleFromDB(
         frontmatterUnresolved: includeFrontmatter ? extracted.unresolved : [], originSourceId: page.source_id,
         crossSourceAllowed: federatedSourceIds.has(page.source_id) || crossSource, resolve: c => resolveCandidateSources(c, page.slug,
           page.source_id, allSlugs, slugToSources, federatedSourceIds.has(page.source_id), { crossSource, defaultSourceId: linkDefaultSourceId }) }) : [];
-      const linkOpts = { includeFrontmatter, expectedEndpoints: capturedLinkEndpoints(linkRows, targetMetadata),
+      const linkOpts = { includeFrontmatter, lineGrammar: grammar, expectedEndpoints: capturedLinkEndpoints(linkRows, targetMetadata),
         wanted: { producers: includeFrontmatter ? ['body', 'frontmatter'] as const : ['body'] as const, rows: wanted } };
       const stampIso = page.updated_at.getTime() >= Date.parse(versionTs) ? page.updated_at_iso : versionTs;
-      const written = await engine.replaceDerivedLinks(origin, linkRows, linkOpts);
+      let written: { created: number; removed: number };
+      try {
+        written = await engine.replaceDerivedLinks(origin, linkRows, linkOpts);
+      } catch (error) {
+        // The line-grammar settings changed mid-run: the page stays stale (not stamped) and the next run derives it.
+        if (error instanceof DerivedLinkSettingsChangedError) { skippedChanged++; continue; }
+        throw error;
+      }
       linksCreated += written.created;
       await retractRemovedTimelineEntries(engine, page.slug, page.source_id, fullContent);
       for (const entry of parseTimelineEntries(fullContent)) {
@@ -2246,6 +2271,7 @@ export async function extractStaleFromDB(
     else log(`Extract --stale: ${linksCreated} link(s) + ${timelineCreated} timeline entr(ies) from ${pagesProcessed} page(s).`);
     if (mentionLine) log(mentionLine);
     if (skippedAttendanceIncomplete) log(`Skipped ${skippedAttendanceIncomplete} page(s) with unresolved attendance; prior links and extraction watermarks were preserved.`);
+    if (skippedChanged) log(`Skipped ${skippedChanged} page(s) because the line-grammar settings changed during this run; they stay stale. Re-run \`gbrain extract --stale\` to finish them.`);
     if (skippedMissingTarget > 0) {
       log(`Skipped ${skippedMissingTarget} candidate(s) whose target page doesn't exist (references to non-pages are never persisted).`);
     }
@@ -2260,11 +2286,12 @@ export async function extractStaleFromDB(
       action: 'extract_stale_done', links_created: linksCreated, timeline_created: timelineCreated,
       pages_processed: pagesProcessed, stale_remaining: staleRemaining, budget_hit: budgetHit,
       skipped_missing_target: skippedMissingTarget, skipped_cross_source: skippedCrossSource,
-      ...(skippedAttendanceIncomplete ? { skipped_attendance_incomplete: skippedAttendanceIncomplete } : {}), ...mentionJsonFields(mentions),
+      ...(skippedAttendanceIncomplete ? { skipped_attendance_incomplete: skippedAttendanceIncomplete } : {}),
+      ...(skippedChanged ? { skipped_changed: skippedChanged } : {}), ...mentionJsonFields(mentions),
     }) + '\n');
   }
   return { linksCreated, timelineCreated, pagesProcessed, staleRemaining, skippedMissingTarget, skippedCrossSource,
-    ...(skippedAttendanceIncomplete ? { skippedAttendanceIncomplete } : {}), mentions };
+    ...(skippedAttendanceIncomplete ? { skippedAttendanceIncomplete } : {}), ...(skippedChanged ? { skippedChanged } : {}), mentions };
 }
 
 /**

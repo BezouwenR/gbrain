@@ -88,6 +88,7 @@ const get_page: Operation = {
     content_only: { type: 'boolean', description: 'Round-trip fields only.' },
     include_deleted: { type: 'boolean', description: 'Include soft-deleted pages.' },
     include_timeline_entries: { type: 'boolean', description: 'Also return timeline rows.' },
+    grammar_diagnostics: { type: 'boolean', description: 'Also return every line-grammar finding for the page.', fullSurfaceOnly: true },
     source_id: { type: 'string', description: "One source, or '__all__'." },
   },
   handler: async (ctx, p) => {
@@ -203,11 +204,16 @@ const get_page: Operation = {
     // it would double every reader's payload for the round-trip minority.
     const timelineEntries = includeTimelineEntries
       ? await ctx.engine.getTimeline(page.slug, await readPolicyOpts(ctx, { sourceId: page.source_id })) : undefined;
-    return projectGetPage(visibleBody, {
+    // Read-only, over the same visibility-filtered body the reader gets (core/line-grammar-report.ts).
+    const lineGrammar = (p.grammar_diagnostics as boolean) === true
+      ? await (await import('../line-grammar-report.ts')).lineGrammarReport(ctx.engine, { slug: page.slug, sourceId: page.source_id, body: visibleBody.compiled_truth })
+      : undefined;
+    const projected = projectGetPage(visibleBody, {
       revision: snapshot!.revision, tags, includeContent, contentOnly: (p.content_only as boolean) === true, resolved_slug, content_flag,
       ...(timelineEntries ? { timeline_entries: timelineEntries } : {}),
       ...(held ? { file_held: fileHeldField(held, isUntrustedReader) } : {}),
     });
+    return lineGrammar ? { ...projected, line_grammar: lineGrammar } : projected;
   },
   scope: 'read', mutating: false,
   cliHints: { name: 'get', positional: ['slug'] },

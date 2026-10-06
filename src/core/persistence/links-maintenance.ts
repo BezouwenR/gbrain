@@ -1,5 +1,5 @@
 import type { BrainEngine } from '../engine.ts';
-import { LINK_EXTRACTOR_VERSION_TS } from '../link-extraction.ts';
+import { effectiveLinkExtractorWatermark, laterInstant, linkExtractorWatermarkFor } from '../link-extraction-watermark.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { maintenanceAttribution } from './attribution.ts';
@@ -14,7 +14,7 @@ export interface ManagedLinkExtraction { pages: number; created: number; removed
 /** `gbrain extract --stale` on a managed brain, locally or inside the PGLite owner. */
 export async function runManagedStaleExtraction(engine: BrainEngine, opts: { sourceId?: string; dryRun?: boolean }): Promise<ManagedLinkExtraction> {
   if (!opts.dryRun) return extractManagedStaleLinks(engine, { sourceId: opts.sourceId });
-  const remaining = await engine.countStalePagesForExtraction({ sourceId: opts.sourceId, versionTs: LINK_EXTRACTOR_VERSION_TS });
+  const remaining = await engine.countStalePagesForExtraction({ sourceId: opts.sourceId, versionTs: await effectiveLinkExtractorWatermark(engine) });
   const m = await previewMentionPass(engine, opts.sourceId);
   return { pages: 0, created: 0, removed: 0, timeline: 0, skipped: 0, remaining, mention_due: m.due, mention_last_pass_at: m.last_pass_at };
 }
@@ -66,11 +66,11 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
   const withMentions = opts.mentions !== false;
   const deadline = withMentions ? await linkPhaseDeadline(engine, opts.sourceId, startMs, opts.timeBudgetMs)
     : opts.timeBudgetMs === undefined ? Infinity : startMs + opts.timeBudgetMs;
-  const versionTs = LINK_EXTRACTOR_VERSION_TS;
+  const versionTs = await effectiveLinkExtractorWatermark(engine);
   const maxPages = opts.maxPages ?? Infinity;
   const done = new Set<string>();
   const attribution = await maintenanceAttribution(engine);
-  const derive = async (slug: string, sourceId: string, stamp?: string) => {
+  const derive = async (slug: string, sourceId: string) => {
     opts.signal?.throwIfAborted();
     done.add(`${sourceId}\0${slug}`);
     const snapshot = await engine.readPageSnapshot(slug, { sourceId });
@@ -89,7 +89,12 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
       const timeline = (await unrecordedCanonicalTimeline(tx, current.page.id, current.page, slug)).map(entry => ({ slug, date: entry.date,
         source: entry.source, summary: entry.summary, detail: entry.detail || '', source_id: sourceId }));
       const added = timeline.length ? await tx.addTimelineEntriesBatch(timeline, { auditSite: 'extract.stale' }) : 0;
-      const at = stamp ?? new Date().toISOString();
+      // Never stamp now(): a page prepared under settings older than the watermark must stay stale. The stamp is
+      // the later of the page's updated_at and the watermark of the settings it was prepared under.
+      const [{ updated_at_iso: updatedIso }] = await tx.executeRaw<{ updated_at_iso: string }>(
+        `SELECT to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso FROM pages WHERE id = $1`, [current.page.id]);
+      const preparedWatermark = linkExtractorWatermarkFor(prepared.settings?.generation);
+      const at = laterInstant(preparedWatermark, updatedIso);
       await tx.markPagesExtractedBatch([{ slug, source_id: sourceId, extractedAt: at }], at);
       return { ...written, timeline: added };
     }, attribution));
@@ -111,7 +116,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
       if (!budget()) break;
       afterPageId = row.id;
       if (done.has(`${row.source_id}\0${row.slug}`)) continue;
-      await derive(row.slug, row.source_id, row.updated_at.getTime() >= Date.parse(versionTs) ? row.updated_at_iso : versionTs);
+      await derive(row.slug, row.source_id);
     }
   }
   result.remaining = await engine.countStalePagesForExtraction({ sourceId: opts.sourceId, versionTs });

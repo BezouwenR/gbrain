@@ -5,7 +5,7 @@ import { sanitizeForJsonb } from './batch-rows.ts';
 import { replaceWantedLinks, type WantedLinksReplacement } from './wanted-links-store.ts';
 import { applyTemporalEvidence, relationshipKeysForOrigin } from './link-temporal-apply.ts';
 import { primeRelationSemantics } from './link-semantics-pack.ts';
-import { effectiveRangesEnabled } from './line-grammar.ts';
+import { effectiveRangesEnabled, LINK_EXTRACTION_GENERATION_KEY, type LineGrammarSettings } from './line-grammar.ts';
 
 export interface DerivedLinkOrigin {
   slug: string;
@@ -21,6 +21,13 @@ export interface DerivedLinkReplacementOptions {
   expectedEndpoints?: Array<{ slug: string; sourceId: string; revision: string }>;
   /** The origin's unresolved authored references, replaced in the same transaction (wanted pages). */
   wanted?: WantedLinksReplacement;
+  /**
+   * The line-grammar settings the links were prepared under. Publication uses
+   * them for validity ranges (never a second read) and refuses with
+   * DerivedLinkSettingsChangedError when the extraction generation moved since,
+   * so a page is never published from one setting and ranged from another.
+   */
+  lineGrammar?: LineGrammarSettings;
 }
 
 export class DerivedLinkRepairRequiredError extends Error {
@@ -33,6 +40,11 @@ export class DerivedLinkRepairRequiredError extends Error {
 
 export class DerivedLinkEndpointChangedError extends Error {
   readonly code = 'revision_conflict';
+}
+
+/** The line-grammar settings changed between preparation and publication; the page stays stale and re-extracts. */
+export class DerivedLinkSettingsChangedError extends DerivedLinkEndpointChangedError {
+  constructor() { super('Line-grammar settings changed after these links were prepared'); this.name = 'DerivedLinkSettingsChangedError'; }
 }
 
 export async function applyAttendanceDelta(tx: Pick<BrainEngine, 'executeRaw' | 'addLinksBatch'>,
@@ -88,6 +100,11 @@ export async function replaceDerivedLinks(
     await tx.lockPageKeys([{ sourceId: origin.sourceId, slug: origin.slug }, ...rows.flatMap(row => [
       { sourceId: row.from_source_id!, slug: row.from_slug }, { sourceId: row.to_source_id!, slug: row.to_slug },
     ])]);
+    if (opts.lineGrammar) {
+      // FOR SHARE: a concurrent setting change (which updates this row) waits for this publication, or this one sees it.
+      const [gen] = await tx.executeRaw<{ value: string }>('SELECT value FROM config WHERE key = $1 FOR SHARE', [LINK_EXTRACTION_GENERATION_KEY]);
+      if ((gen?.value ?? null) !== opts.lineGrammar.generation) throw new DerivedLinkSettingsChangedError();
+    }
     const snapshot = await tx.readPageSnapshot(origin.slug, { sourceId: origin.sourceId });
     assertPageRevision(snapshot, { expectedRevision: origin.expectedRevision });
     if (!snapshot || snapshot.sourceIncarnation !== origin.sourceIncarnation || snapshot.page.deleted_at) {
@@ -99,7 +116,8 @@ export async function replaceDerivedLinks(
     // of the same derived projection: captured before, replaced after.
     const temporalKeysBefore = await relationshipKeysForOrigin(tx, Number(id));
     const withTemporal = async (result: { created: number; removed: number }) => {
-      await applyTemporalEvidence(tx, snapshot.page, rows, temporalKeysBefore, { inlineRanges: await effectiveRangesEnabled(tx) });
+      await applyTemporalEvidence(tx, snapshot.page, rows, temporalKeysBefore,
+        { inlineRanges: opts.lineGrammar ? opts.lineGrammar.effectiveRanges : await effectiveRangesEnabled(tx) });
       return result;
     };
     if (opts.includeFrontmatter !== false && !opts.preserveExisting) {
