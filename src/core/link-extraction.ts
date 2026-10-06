@@ -1217,7 +1217,9 @@ const WORKS_AT_RE = /\b(?:joined\b[^.\n]{0,80}?\bas (?:an? |the )?(?:senior |sta
 // Series A"), narrative verbs ("invests in", "investing in"), historical
 // ("early investor in", "first check"), and portfolio framing ("portfolio
 // company", "portfolio includes").
-const INVESTED_RE = /\b(?:invested in|invests in|investing in|invest in|investment in|investments in|backed by|funding from|funded by|raised from|led the (?:seed|Series|round|investment|round)|led .{0,30}(?:Series [A-Z]|seed|round|investment)|participated in (?:the )?(?:seed|Series|round)|wrote (?:a |the )?check|first check|early investor|portfolio (?:company|includes)|board seat (?:at|in|on)|term sheet for)\b/i;
+const INVESTED_RE = /\b(?:invested in|invests in|investing in|invest in|investment in|investments in|backed by|funding from|funded by|raised from|led the (?:seed|Series|round|investment|round)|led .{0,30}(?:Series [A-Z]|seed|round|investment)|participated in (?:the )?(?:seed|Series|round)|wrote (?:a |the )?check|first check|early investor|portfolio (?:company|includes)|term sheet for)\b/i;
+// "board seat at/in/on": its own rule (same verb, same precedence) so U3 can require an investor prior for it.
+const BOARD_SEAT_RE = /\bboard seat (?:at|in|on)\b/i;
 
 // Founded patterns. Includes the noun-form "founder of" / "founders include"
 // because that's how real prose identifies founders ("Carol Wilson is the
@@ -1278,6 +1280,7 @@ interface VerbRule { id: string; re: RegExp; verb: string; unit?: TypingUnit }
 const CORE_VERB_RULES: ReadonlyArray<VerbRule> = [
   { id: 'verb.founded', re: FOUNDED_RE, verb: 'founded' },
   { id: 'verb.invested_in', re: INVESTED_RE, verb: 'invested_in' },
+  { id: 'verb.invested_in.board_seat', re: BOARD_SEAT_RE, verb: 'invested_in' },
   { id: 'verb.advises', re: ADVISES_RE, verb: 'advises' },
   { id: 'verb.works_at', re: WORKS_AT_RE, verb: 'works_at' },
   { id: 'verb.zh.founded', re: ZH_FOUNDED_RE, verb: 'founded' },
@@ -1308,7 +1311,7 @@ const coordinated = (between: string) => {
 };
 const GLOBAL_VERB_RULES = VERB_RULES.map(r => ({ ...r, re: new RegExp(r.re.source, `${r.re.flags.replace('g', '')}g`) }));
 interface Attachment { rule: VerbRule | null; suppressed: string[]; otherLink: boolean }
-function attachedVerb(context: string, targetSlug?: string, anchor?: number, explain = false): Attachment | undefined {
+function attachedVerb(context: string, targetSlug?: string, anchor?: number, explain = false, investorPrior: () => boolean = () => false): Attachment | undefined {
   const fromAnchor = targetSlug && anchor !== undefined ? context.indexOf(targetSlug, anchor) : -1;
   const at = fromAnchor >= 0 ? fromAnchor : targetSlug ? context.indexOf(targetSlug) : -1;
   if (at < 0) return undefined;
@@ -1329,7 +1332,7 @@ function attachedVerb(context: string, targetSlug?: string, anchor?: number, exp
         if (explain) suppressed.push(`${r.id}:other-link`);
         continue;
       }
-      const veto = unitVerbVeto({ rule: r, context, start, end });
+      const veto = unitVerbVeto({ rule: r, context, start, end, investorPrior, linkStart, linkEnd });
       if (veto) { suppressed.push(veto); continue; }
       if (rule) { suppressed.push(`${r.id}:outranked`); break; }
       rule = r;
@@ -1395,14 +1398,15 @@ export function traceLinkType(pageType: PageType, context: string, globalContext
   // Per-edge verb rules, precedence founded > invested_in > advises > works_at
   // (then the Chinese rules), over the verbs that belong to this link: in
   // "works at [A] and also advises [B]", A is works_at and B advises.
-  const attached = attachedVerb(context, targetSlug, anchor, explain);
+  const investorPrior = () => pageType === 'person' && PARTNER_ROLE_RE.test(pageText ?? globalContext ?? '');
+  const attached = attachedVerb(context, targetSlug, anchor, explain, investorPrior);
   if (attached?.rule) return out(attached.rule.verb, attached.rule.id, 'attached', attached.suppressed);
   const suppressed = attached?.suppressed ?? [];
   if (attached === undefined) {
     for (const r of GLOBAL_VERB_RULES) {
       if (!ruleOn(r)) continue;
       for (const m of context.matchAll(r.re)) {
-        const veto = unitVerbVeto({ rule: r, context, start: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+        const veto = unitVerbVeto({ rule: r, context, start: m.index ?? 0, end: (m.index ?? 0) + m[0].length, investorPrior });
         if (!veto) return out(r.verb, r.id, 'window', suppressed);
         suppressed.push(veto);
       }

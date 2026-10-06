@@ -98,4 +98,53 @@ const U1: TypingExample[] = [
     off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2019-01-02'], live: { type: 'works_at', at: { today: true } } } },
 ];
 
-export const EXAMPLES: TypingExample[] = [...U1];
+// ─── U3: board, observer and investor wording never types works_at ─────
+const INVESTOR_PAGE = 'Alice is a partner at a venture capital fund and a seed investor.';
+const U3: TypingExample[] = [
+  { id: 'u3-board-director-at', unit: 'U3', target: ACME, content: page(`Alice is a board director at ${L(ACME)}.`),
+    off: { types: ['works_at'], tense: { works_at: 'present' }, live: { type: 'works_at', at: { today: true } } }, on: { types: ['mentions'] } },
+  { id: 'u3-independent-director-of', unit: 'U3', target: ACME, content: page(`Alice is an independent director of ${L(ACME)}.`),
+    off: { types: ['works_at'] }, on: { types: ['mentions'] } },
+  { id: 'u3-joined-as-investor', unit: 'U3', target: ACME, content: page(`Alice joined as an investor in ${L(ACME)}.`),
+    off: { types: ['works_at'] }, on: { types: ['invested_in'] } },
+  { id: 'u3-joined-as-observer', unit: 'U3', target: ACME, content: page(`Alice joined as an observer at ${L(ACME)}.`),
+    off: { types: ['works_at'] }, on: { types: ['mentions'] } },
+  { id: 'u3-board-seat-without-investor-prior', unit: 'U3', target: ACME, content: page(`Alice holds a board seat at ${L(ACME)}.`),
+    off: { types: ['invested_in'] }, on: { types: ['mentions'] } },
+  { id: 'u3-board-seat-with-investor-prior', unit: 'U3', target: ACME, content: page(`${INVESTOR_PAGE} She holds a board seat at ${L(ACME)}.`),
+    off: { types: ['invested_in'] }, on: { types: ['invested_in'] } },
+  { id: 'u3-board-seat-as-investor', unit: 'U3', target: ACME, content: page(`Alice A.`, [`**2021-02-03** | note — Took a board seat at ${L(ACME)} as an investor`]),
+    off: { types: ['invested_in'] }, on: { types: ['invested_in'] } },
+  { id: 'u3-cross-entry-board-wording-not-read', unit: null, target: BETA,
+    content: page(`Alice A.`, [`**2019-06-22** | linkedin — Joined ${L(BETA)} as VP engineering`, `**2020-07-15** | note — Became a board director at ${L(ACME)}`]),
+    off: { types: ['works_at'] } },
+  { id: 'u3-cross-sentence-job-verb-not-borrowed', unit: 'U3', target: ACME,
+    content: page(`Alice works at ${L(BETA)} as head of sales. Alice is also a board director at ${L(ACME)}.`),
+    off: { types: ['works_at'] }, on: { types: ['mentions'] } },
+  { id: 'u3-board-mentioned-after-employer', unit: null, target: ACME,
+    content: page(`Alice works at ${L(ACME)}, whose board she joined in 2020.`), off: { types: ['works_at'] } },
+  { id: 'u3-board-member-who-works-at', unit: null, target: ACME,
+    content: page(`Alice, a board observer elsewhere, works at ${L(ACME)}.`), off: { types: ['works_at'] } },
+  { id: 'u3-observer-stays-mentions', unit: 'U3', target: ACME, content: page(`Alice is the board observer at ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u3-negated-board-director', unit: 'U3', target: ACME, content: page(`Alice is not a board director at ${L(ACME)}.`),
+    off: { types: ['works_at'] }, on: { types: ['mentions'] } },
+  { id: 'u3-third-party-board-director', unit: 'U3', target: ACME, content: page(`Alice's sister is a board director at ${L(ACME)}.`),
+    off: { types: ['works_at'] }, on: { types: ['mentions'] } },
+  { id: 'u3-on-board-is-not-a-board', unit: null, target: ACME, content: page(`Alice came on board as a senior engineer at ${L(ACME)}.`),
+    off: { types: ['works_at'] } },
+  { id: 'u3-employer-kept', unit: null, target: ACME, content: page(`Alice works at ${L(ACME)} as head of sales.`),
+    off: { types: ['works_at'] } },
+  { id: 'u3-concurrent-employer-and-board', unit: null, target: BETA,
+    content: page(`Alice is VP engineering at ${L(BETA)} and a board director at ${L(ACME)}.`), off: { types: ['works_at'] } },
+  { id: 'u3-concurrent-board-target', unit: 'U3', target: ACME,
+    content: page(`Alice is VP engineering at ${L(BETA)} and a board director at ${L(ACME)}.`), off: { types: ['works_at'] }, on: { types: ['mentions'] } },
+  // The set-F interaction: a board line is the only statement about the company. Master reads a job that starts on
+  // the board date; U4 alone keeps the job but drops its start (live on every date); U3 removes the job.
+  { id: 'u34-board-only-target', unit: 'U3', target: ACME,
+    content: page(`Alice works at ${L(BETA)} as engineer.`, [`**2022-03-04** | note — Became a board director at ${L(ACME)}`]),
+    off: { types: ['works_at'], transitions: ['works_at start 2022-03-04'], live: { type: 'works_at', at: { '2020-01-01': false, today: true } } },
+    on: { types: ['mentions'], transitions: [] } },
+];
+
+export const EXAMPLES: TypingExample[] = [...U1, ...U3];

@@ -91,7 +91,36 @@ export interface VetoInput {
   /** Match offsets in `context`. */
   start: number;
   end: number;
+  /** Whether the page states the subject is an investor (link-extraction.ts PARTNER_ROLE_RE on the whole page). */
+  investorPrior?: () => boolean;
+  /** The link's markup in `context`, when located. */
+  linkStart?: number;
+  linkEnd?: number;
 }
+
+/** A sentence, clause, line or timeline-entry break. */
+const BREAK = /\.\s|;\s|\n|\s[-*]\s+\*\*\d{4}-\d{2}-\d{2}\*\*|\s#{2,6}\s/;
+/** Is the verb match in the same sentence or timeline entry as the link (always true when the link was not located)? */
+const sameClauseAsLink = (v: VetoInput) => v.linkStart === undefined || v.linkEnd === undefined
+  || !BREAK.test(v.end <= v.linkStart ? v.context.slice(v.end, v.linkStart) : v.context.slice(v.linkEnd, v.start));
+
+/** U3: board, observer and investor wording ("board director at", "independent director of", "joined as an investor"). "On board" is not a board. */
+const U3_BOARD_WORDING = /(?<!\bon[\s-])\bboards?\b|\b(?:observer|investor|investing|angel|non-executive|trustee)\b|\bindependent\s+director\b/i;
+/** Board positions (not investments): what may sit right before a link as the link's own role. */
+const U3_BOARD_POSITION = /(?<!\bon[\s-])\bboards?\b|\b(?:observer|non-executive|trustee)\b|\bindependent\s+director\b/gi;
+/** The words right around a verb match: board wording ending at most 20 word characters before the match end, or starting at most 20 after it (no punctuation in between). */
+const boardNearMatch = (context: string, start: number, end: number) =>
+  new RegExp(`(?:${U3_BOARD_WORDING.source})[\\w\\s-]{0,20}$`, 'i').test(`${clauseBefore(context, start)}${context.slice(start, end)}`)
+  || new RegExp(`^[\\w\\s-]{0,20}?(?:${U3_BOARD_WORDING.source})`, 'i').test(context.slice(end, end + 60));
+/** The link's own role is a board position right before it ("is also a board director at [X]", "joined the board of [X]"). */
+function boardRoleBeforeLink(v: VetoInput): boolean {
+  if (v.linkStart === undefined) return false;
+  const clause = clauseBefore(v.context, v.linkStart);
+  const last = [...clause.matchAll(U3_BOARD_POSITION)].pop();
+  return !!last && /^[\w\s-]{0,30}?\b(?:at|of|for|with|on|to|in)\s+(?:the\s+)?$/i.test(clause.slice((last.index ?? 0) + last[0].length));
+}
+/** "board seat at [X] as an investor": the board phrase's own clause states the investment. */
+const U3_INVESTMENT_STATED = /\b(?:investor|invested|investing|investment|led\s+(?:the|its)\s+(?:seed|round|series)|on\s+behalf\s+of\s+(?:the|its|our|her|his|their)\s+fund)\b/i;
 
 /**
  * A unit's veto of one verb match, or null. A vetoed match does not decide the type; inference moves on to the next
@@ -101,6 +130,12 @@ export function unitVerbVeto(v: VetoInput): string | null {
   if (v.rule.verb === 'advises' && typingUnitEnabled('U1')) {
     if (U1_NEGATED_BEFORE.test(v.context.slice(Math.max(0, v.start - 40), v.start))) return 'unit.u1.negated';
     if (v.rule.id === 'unit.u1.adviser' && thirdPartyBefore(v.context, v.start)) return 'unit.u1.third_party';
+  }
+  if (typingUnitEnabled('U3')) {
+    if (v.rule.id === 'verb.invested_in.board_seat' && !v.investorPrior?.()
+      && !U3_INVESTMENT_STATED.test(`${clauseBefore(v.context, v.start)}${v.context.slice(v.start, v.end + 100).split(BREAK)[0]}`)) return 'unit.u3.board_seat_without_investment';
+    if (v.rule.verb === 'works_at' && (boardRoleBeforeLink(v)
+      || (sameClauseAsLink(v) && boardNearMatch(v.context, v.start, v.end)))) return 'unit.u3.board_wording';
   }
   return null;
 }

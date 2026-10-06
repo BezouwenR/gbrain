@@ -15,7 +15,8 @@
  * ENABLED_TYPING_UNITS.
  *
  * `compare` prints the type-steal and transition tables by identity (subject, target, type, kind, date) against the
- * generator ledger: edges whose type moved away from (or toward) the ledger, new wrong transitions, fixed and missing
+ * generator ledger: edges that lost a ledger type or gained more unsupported types than they shed (steals), edges that
+ * gained a ledger type (gains), new wrong transitions, fixed and missing
  * correct transitions, and current employers lost from or added to the live read.
  *
  * `world-v1` types gbrain-evals' world-v1 corpus (eval/data/world-v1, rendered as the P5 H1 runner renders it) with
@@ -189,8 +190,9 @@ export function compareDumps(base: Dump, arm: Dump) {
       const lost = [...tb].filter(t => g.has(t) && !ta.has(t));
       const spurious = [...ta].filter(t => !g.has(t) && !tb.has(t));
       const won = [...ta].filter(t => g.has(t) && !tb.has(t));
+      const dropped = [...tb].filter(t => !g.has(t) && !ta.has(t));
       const row = { seed: b.seed, subject: b.slug, target: to, ledger: role(b.ledger, to), gold: show(g), base: show(tb), arm: show(ta) };
-      if (lost.length || spurious.length) steals.push(row);
+      if (lost.length || spurious.length > dropped.length) steals.push(row);
       else if (won.length) gains.push(row);
       else moves.push(row);
     }
