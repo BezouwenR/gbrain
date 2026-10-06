@@ -86,6 +86,11 @@ const U1: TypingExample[] = [
     off: { types: ['mentions'] }, on: { types: ['mentions'] } },
   { id: 'u1-third-party-friend-advising', unit: 'U1', target: ACME, content: page(`Alice introduced a friend who is now advising ${L(ACME)}.`),
     off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  // An adviser phrase on the next timeline entry, whose own link the 240-character window cuts off, is not this link's.
+  { id: 'u1-next-entry-adviser-not-borrowed', unit: 'U1', target: ACME,
+    content: page(`Alice signed on with ${L(ACME)} as product manager and remains on the team. She also works at ${L(BETA)}.`,
+      [`**2014-11-27** | linkedin — Signed on with ${L(ACME)} as product manager (EU platform)`, `**2023-03-27** | note — Signed on as an adviser to ${L(BETA)}`]),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
   { id: 'u1-concurrent-role', unit: 'U1', target: ACME, content: page(`Alice works at ${L(BETA)} and is an adviser to ${L(ACME)}.`),
     off: { types: ['mentions'] }, on: { types: ['advises'] } },
   { id: 'u1-concurrent-role-employer-kept', unit: null, target: BETA, content: page(`Alice works at ${L(BETA)} and is an adviser to ${L(ACME)}.`),

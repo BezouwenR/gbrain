@@ -138,6 +138,7 @@ export function unitVerbVeto(v: VetoInput): string | null {
   if (v.rule.verb === 'advises' && typingUnitEnabled('U1')) {
     if (U1_NEGATED_BEFORE.test(v.context.slice(Math.max(0, v.start - 40), v.start))) return 'unit.u1.negated';
     if (v.rule.id === 'unit.u1.adviser' && thirdPartyBefore(v.context, v.start)) return 'unit.u1.third_party';
+    if (v.rule.id === 'unit.u1.adviser' && !sameClauseAsLink(v)) return 'unit.u1.other_entry';
   }
   if (typingUnitEnabled('U3')) {
     if (v.rule.id === 'verb.invested_in.board_seat' && !v.investorPrior?.()
