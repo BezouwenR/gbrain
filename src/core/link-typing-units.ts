@@ -183,7 +183,7 @@ function inDatedEntry(context: string, linkStart: number): boolean {
 /** The page names some organization in an advisory, board or investor role ("Took an advisory role with [X]"). */
 const ROLE_ELSEWHERE = /\b(?:advis\w*|board|observer|investor|investing|invested|angel|non-executive|trustee)\b/i;
 const LINK_OPEN = /\[\[|\[[^\]\n]*\]\(/g;
-function nonEmploymentRoleOnPage(pageText: string): boolean {
+export function nonEmploymentRoleOnPage(pageText: string): boolean {
   for (const m of pageText.matchAll(LINK_OPEN)) if (ROLE_ELSEWHERE.test(clauseBefore(pageText, m.index ?? 0))) return true;
   return false;
 }
@@ -236,6 +236,10 @@ export const U5_EXCHANGE_AFTER = /^\s+for\s+(?:\[|the\s+\[|an?\s+\[)/i;
  * U6: start framings: a first day, week or month at, day one at, kicking off a role, job, position, chapter or stint
  * at, onboarding, "began working at/for", a new chapter at. Only dates a works_at relationship the page already
  * asserts (natural cues never create one). "First day of the [X] summit" and an event line never start a job.
+ * Development rework (dev-units.md), the same two guards as U2/U5: a U6 start is dropped when a later dated entry names
+ * the organization in words no cue reads (an unread leave would keep a former job open for good), and U6 does not fire
+ * on a page that names any organization in an advisory, board or investor role (a newly dated employer then meets
+ * master's advisory-line start: wrong single-value closures on the E5 probe). U4 removes that cause.
  */
 const START_ROLE = String.raw`(?:[\w&./-]+\s+){0,4}?`;
 export const U6_START = new RegExp(String.raw`\b(?:(?:(?:her|his|their|my|a|the)\s+)?(?:first\s+(?:day|week|month)|day\s+one)\s+(?:as\s+${START_ROLE})?(?:at|with)|kick(?:ed|s|ing)?[\s-]?off\s+(?:(?:a|her|his|their|my)\s+)?(?:new\s+)?(?:role|job|position|chapter|stint)\s+(?:at|with)|(?:was\s+|got\s+|been\s+)?onboarded\s+(?:at|with|to|into|by)|onboarding\s+(?:week|day|period)\s+(?:at|with)|began\s+(?:work(?:ing)?\s+)?(?:at|for)|start(?:ed|ing|s)?\s+(?:a\s+|her\s+|his\s+|their\s+|my\s+)?new\s+chapter\s+(?:at|with)|(?:a\s+)?new\s+chapter\s+(?:at|with))\s*$`, 'i');

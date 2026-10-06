@@ -332,6 +332,18 @@ const U6: TypingExample[] = [
     off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
   { id: 'u6-began-working-with-collaboration', unit: 'U6', target: ACME, content: NOW_AT('note — Began working with {X} on a pilot'),
     off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
+  // Leave guard: an unread leave after the start drops the U6 start (the former job would stay open for good); U5 reads
+  // this leave, so with U5 the start and the end both date the stint.
+  { id: 'u56-former-job-leave-guard', unit: ['U5', 'U6'], target: ACME,
+    content: page(`Alice worked at ${L(ACME)}. She works at ${L(BETA)} now.`, [`**2015-01-02** | linkedin — First day at ${L(ACME)} as engineer`, `**2019-03-04** | linkedin — Parted company with ${L(ACME)}`]),
+    off: { types: ['mentions', 'works_at'], transitions: [], live: { type: 'works_at', at: { '2016-01-01': false, today: false } } },
+    on: units => units.has('U5') && units.has('U6')
+      ? { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'], live: { type: 'works_at', at: { '2016-01-01': true, today: false } } }
+      : units.has('U5') ? { types: ['mentions', 'works_at'], transitions: ['works_at end 2019-03-04'], live: { type: 'works_at', at: { '2016-01-01': true, today: false } } }
+      : { types: ['mentions', 'works_at'], transitions: [], live: { type: 'works_at', at: { '2016-01-01': false, today: false } } } },
+  { id: 'u6-advisory-page-not-started', unit: 'U6', target: ACME,
+    content: page(`Alice works at ${L(ACME)} as designer. She also works at ${L(BETA)}.`, [`**2021-09-01** | linkedin — First day at ${L(ACME)} as designer`, `**2023-02-03** | note — Became an advisor at ${L(BETA)}`]),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
   { id: 'u6-untyped-target-not-started', unit: 'U6', target: BETA,
     content: page(`Alice works at ${L(ACME)}.`, [`**2021-09-01** | linkedin — First day at ${L(BETA)}`]),
     off: { types: ['mentions'], transitions: [] }, on: { types: ['mentions'], transitions: [] } },

@@ -25,7 +25,7 @@ import {
   type TransitionKind, type TransitionProducer,
 } from './link-validity.ts';
 import { KNOWN_LINK_TYPES } from './search/relational-intent.ts';
-import { U4_NOT_EMPLOYMENT_ROLE, U5_EXCHANGE_AFTER, U5_EXCHANGE_BEFORE, U5_LEAVE, U6_START, typingUnitEnabled } from './link-typing-units.ts';
+import { U4_NOT_EMPLOYMENT_ROLE, U5_EXCHANGE_AFTER, U5_EXCHANGE_BEFORE, U5_LEAVE, U6_START, nonEmploymentRoleOnPage, typingUnitEnabled } from './link-typing-units.ts';
 
 export interface OwnedRow {
   from_slug: string;
@@ -232,9 +232,10 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
     }
   }
 
-  // U5 ends and the uncued plain references to works_at targets, for the restart guard after the loop.
+  // U5 ends, U6 starts and the uncued plain references to works_at targets, for the guards after the loop.
   const u5 = typingUnitEnabled('U5');
-  const u5Ends: Array<{ target: string; date: string; key: string }> = [];
+  const u6 = typingUnitEnabled('U6') && !nonEmploymentRoleOnPage(content);
+  const unitTransitions: Array<{ target: string; date: string; key: string }> = [];
   const uncued: Array<{ target: string; date: string }> = [];
 
   // 2. Natural cues on dated lines, for relationships this page asserts.
@@ -271,14 +272,16 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
           else if (u5 && r.link_type === 'works_at' && U5_LEAVE.test(window)) { kind = 'end'; rule = 'unit.u5.leave'; }
           else if (u5 && r.link_type === 'works_at' && U5_EXCHANGE_BEFORE.test(window) && U5_EXCHANGE_AFTER.test(line.text.slice(ref.end))) { kind = 'end'; rule = 'unit.u5.exchange'; }
           else if (cues.start.test(window)) { kind = 'start'; rule = `cue.${family}.start`; }
-          else if (r.link_type === 'works_at' && typingUnitEnabled('U6') && U6_START.test(window)) { kind = 'start'; rule = 'unit.u6.start_framing'; }
+          else if (u6 && r.link_type === 'works_at' && U6_START.test(window)) { kind = 'start'; rule = 'unit.u6.start_framing'; }
           else if (prevEnded.has(r.link_type) && /^\s*(?:to|for)\s*$/i.test(between)) { kind = 'start'; rule = 'cue.after_end.to_for'; }
         } else if (EVENT_START[r.link_type]?.test(window)) { kind = 'start'; rule = `cue.event.${r.link_type}`; }
         if (!kind) {
           if (cues && !qualified && r.link_type === 'works_at') uncued.push({ target: other(r), date: line.date });
           continue;
         }
-        if (rule.startsWith('unit.u5.')) u5Ends.push({ target: other(r), date: line.date, key: `${r.from_slug}\0${r.to_slug}\0${r.link_type}\0end\0${line.date}` });
+        if (rule.startsWith('unit.u5.') || rule.startsWith('unit.u6.')) {
+          unitTransitions.push({ target: other(r), date: line.date, key: `${r.from_slug}\0${r.to_slug}\0${r.link_type}\0${kind}\0${line.date}` });
+        }
         if (kind === 'end') endedHere.add(r.link_type);
         push({ from_slug: r.from_slug, to_slug: r.to_slug, link_type: r.link_type, kind, occurred_on: line.date,
           date_precision: 'day', producer: line.dream ? 'dream' : 'timeline', line_hash: lineHash(line.text) }, rule);
@@ -287,9 +290,10 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
     }
   }
 
-  // U5 restart guard: an idiomatic leave is dropped when a later dated line names the same organization in plain words
-  // that no cue reads (a rejoin the lexicon cannot see); otherwise it would close a current stint for good.
-  for (const e of u5Ends) {
+  // U5 restart guard and U6 leave guard: a leave or start a unit adds is dropped when a later dated line names the same
+  // organization in plain words that no cue reads: for U5 a rejoin the lexicon cannot see (the leave would close a
+  // current stint for good), for U6 a leave it cannot see (the start would open a former job for good).
+  for (const e of unitTransitions) {
     if (!uncued.some(u => u.target === e.target && u.date > e.date)) continue;
     const at = transitions.findIndex(t => `${t.from_slug}\0${t.to_slug}\0${t.link_type}\0${t.kind}\0${t.occurred_on}` === e.key);
     if (at >= 0) transitions.splice(at, 1);
