@@ -29,7 +29,7 @@ import { isIdentityEntity, sameEntityName } from './entities/resolve.ts';
 import type { SchemaPackManifest } from './schema-pack/manifest-v1.ts';
 import { inferLinkTypeFromPack, frontmatterLinkTypeFromPack, ownsAttendanceInference } from './schema-pack/link-inference.ts';
 import { PageRegexBudget } from './schema-pack/redos-guard.ts';
-import { UNIT_VERB_RULES, typingUnitEnabled, unitOfRule, unitVerbVeto, type TypingUnit } from './link-typing-units.ts';
+import { UNIT_VERB_RULES, typingUnitEnabled, u2RoleRule, unitOfRule, unitVerbVeto, type TypingUnit } from './link-typing-units.ts';
 import { deriveTemporalEvidence, rowKey, type DerivedTransition } from './link-temporal-evidence.ts';
 import { buildRelationshipState, relationSemantics, type AssertionTense, type Stint } from './link-validity.ts';
 
@@ -1311,14 +1311,21 @@ const coordinated = (between: string) => {
 };
 const GLOBAL_VERB_RULES = VERB_RULES.map(r => ({ ...r, re: new RegExp(r.re.source, `${r.re.flags.replace('g', '')}g`) }));
 interface Attachment { rule: VerbRule | null; suppressed: string[]; otherLink: boolean }
-function attachedVerb(context: string, targetSlug?: string, anchor?: number, explain = false, investorPrior: () => boolean = () => false): Attachment | undefined {
+/** The link to `targetSlug` in the window: [linkStart, linkEnd) of its markup, or undefined when it is not there. */
+function locateLink(context: string, targetSlug?: string, anchor?: number): { linkStart: number; linkEnd: number } | undefined {
   const fromAnchor = targetSlug && anchor !== undefined ? context.indexOf(targetSlug, anchor) : -1;
   const at = fromAnchor >= 0 ? fromAnchor : targetSlug ? context.indexOf(targetSlug) : -1;
   if (at < 0) return undefined;
   const open = context.lastIndexOf('[', at);
   const linkStart = open >= 0 && at - open <= 120 ? (context[open - 1] === '[' ? open - 1 : open) : at;
   const close = context.slice(at).search(/\)|\]\]/);
-  const linkEnd = close >= 0 ? at + close + (context[at + close] === ')' ? 1 : 2) : at + targetSlug!.length;
+  return { linkStart, linkEnd: close >= 0 ? at + close + (context[at + close] === ')' ? 1 : 2) : at + targetSlug!.length };
+}
+
+function attachedVerb(context: string, targetSlug?: string, anchor?: number, explain = false, investorPrior: () => boolean = () => false): Attachment | undefined {
+  const located = locateLink(context, targetSlug, anchor);
+  if (!located) return undefined;
+  const { linkStart, linkEnd } = located;
   const suppressed: string[] = [];
   let rule: VerbRule | null = null;
   let otherLink = false;
@@ -1427,6 +1434,10 @@ export function traceLinkType(pageType: PageType, context: string, globalContext
     if (ADVISOR_ROLE_RE.test(globalContext)) return out('advises', 'prior.advisor', attachment, suppressed, 'prior.advisor');
     if (EMPLOYEE_ROLE_RE.test(globalContext)) return out('works_at', 'prior.employee', attachment, suppressed, 'prior.employee');
   }
+  // U2 post-pass: an ordinary job title on the link's own clause, only where everything above returned mentions.
+  const located = pageType === 'person' && !targetSlug?.startsWith('people/') && targetType !== 'person' ? locateLink(context, targetSlug, anchor) : undefined;
+  const u2 = located ? u2RoleRule(context, located.linkStart, located.linkEnd, targetSlug!, pageText ?? globalContext ?? context) : null;
+  if (u2) return out('works_at', u2, attachment, suppressed);
   return out('mentions', null, attachment, suppressed);
 }
 

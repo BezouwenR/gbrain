@@ -146,6 +146,67 @@ export function unitOfRule(id: string | null | undefined): TypingUnit | null {
   return m ? (`U${m[1]}` as TypingUnit) : null;
 }
 
+// ─── U2: ordinary job roles (post-pass where inference returned `mentions`) ──
+
+/** Ordinary job titles. Board, advisory, investor and observer roles are deliberately absent. */
+const EMPLOYMENT_ROLE = String.raw`(?:(?:senior|staff|principal|lead|junior|associate|founding|chief|executive|managing|general|deputy|interim|acting) )*(?:software engineer|engineer|developer|designer|programmer|architect|scientist|data scientist|researcher|analyst|product manager|engineering manager|program manager|project manager|manager|director|officer|counsel|marketer|recruiter|strategist|editor|producer|accountant|controller|specialist|coordinator|administrator|technician|intern|president|chief of staff|cto|ceo|coo|cfo|cmo|cro|cpo|vp|svp|evp|vp (?:of )?[a-z]+|vice president of [a-z]+|head of [a-z]+(?: [a-z]+)?|(?:product|design|engineering|tech|team|growth|sales|marketing|data|research) lead)`;
+const EMPLOYMENT_AREA = String.raw`(?:engineering|product|design|sales|marketing|growth|operations|ops|finance|people|hr|recruiting|platform|infrastructure|infra|data|security|research|partnerships|business development|customer success|support|legal|strategy|the [a-z]+ team)`;
+/** "<role> for/at/with [X]" introduced as the subject's own role: "is CTO for", "now designer for", "New role: CTO for". */
+const U2_ROLE_BEFORE = new RegExp(String.raw`(?:^\s*|\b(?:is|was|as|now|currently|became|becomes|serves as|served as|serving as|works as|worked as|working as)\s+|[:—–-]\s*)(?:an?\s+|the\s+)?${EMPLOYMENT_ROLE}\s+(?:at|for|with)\s+(?:the\s+)?$`, 'i');
+/** "led engineering at [X]". */
+const U2_LED_AREA = new RegExp(String.raw`\b(?:led|leads|leading|ran|runs|running|managed|manages|managing|headed|heads|heading|oversaw|oversees|overseeing|owned|owns)\s+${EMPLOYMENT_AREA}\s+(?:at|for)\s+(?:the\s+)?$`, 'i');
+/** A join, move or start right before the link: "signed on with [X]", "moved to [X]", "a new chapter at [X]". */
+const U2_JOIN_BEFORE = /\b(?:re-?joined|joined|joins|joining|signed\s+(?:back\s+)?on\s+(?:with|at)|moved(?:\s+over)?\s+to|moves\s+to|switched\s+to|went\s+to|returned\s+to|came\s+back\s+to|(?:was\s+)?hired\s+(?:by|at|on\s+at)|started\s+(?:at|with)|start(?:ed|ing|s)?\s+(?:a\s+|her\s+|his\s+|their\s+|my\s+)?new\s+chapter\s+(?:at|with)|new\s+chapter\s+(?:at|with)|began\s+(?:working\s+)?(?:at|with|for)|onboarded\s+(?:at|with)|first\s+day\s+at|now\s+at|came\s+(?:on\s+board|aboard)\s+(?:at|with))\s+(?:the\s+)?$/i;
+/** "… [X] as <role>" right after the link (with a join, move or start before it). */
+const U2_AS_ROLE_AFTER = new RegExp(String.raw`^\s*,?\s*as\s+(?:an?\s+|the\s+|its\s+|their\s+)?${EMPLOYMENT_ROLE}\b`, 'i');
+/** "[X] (<role>)": the whole parenthetical is an ordinary job title. */
+const U2_PAREN_ROLE_AFTER = new RegExp(String.raw`^\s*\((?:as\s+)?(?:an?\s+|the\s+)?${EMPLOYMENT_ROLE}(?:\s+(?:for|of|at|in)\s+[^()]{1,40})?\)`, 'i');
+/** Clauses that do not state the subject's own current or past job. */
+const U2_NOT_A_JOB = /\b(?:not|never|no\s+longer|declined|turned\s+down|rejected|passed\s+on|didn't|did\s+not|isn't|wasn't|won't|nor|will|would|could|might|may|plans?\s+to|planning\s+to|hopes?\s+to|wants?\s+to|considering|considered|interview(?:ed|ing|s)?|offered|offer|candidate|applied|applying|in\s+talks|rumou?red|expected\s+to|set\s+to|about\s+to|if|board|observer|investor|investing|angel|advis\w*|non-executive|independent\s+director|trustee|chair(?:man|woman|person)?)\b/i;
+
+/** Inside a dated timeline entry ("- **2021-03-04** | …"): the entry marker comes after the last line break or heading. */
+function inDatedEntry(context: string, linkStart: number): boolean {
+  const before = context.slice(Math.max(0, linkStart - 240), linkStart);
+  const entry = [...before.matchAll(/(?:^|\s)[-*]\s+\*\*\d{4}-\d{2}-\d{2}\*\*|(?:^|\s)#{3}\s+\d{4}-\d{2}-\d{2}/g)].pop();
+  if (!entry) return false;
+  return !/\n|\s#{1,6}\s/.test(before.slice((entry.index ?? 0) + entry[0].length));
+}
+
+/** The page names some organization in an advisory, board or investor role ("Took an advisory role with [X]"). */
+const ROLE_ELSEWHERE = /\b(?:advis\w*|board|observer|investor|investing|invested|angel|non-executive|trustee)\b/i;
+const LINK_OPEN = /\[\[|\[[^\]\n]*\]\(/g;
+function nonEmploymentRoleOnPage(pageText: string): boolean {
+  for (const m of pageText.matchAll(LINK_OPEN)) if (ROLE_ELSEWHERE.test(clauseBefore(pageText, m.index ?? 0))) return true;
+  return false;
+}
+
+/** How many dated timeline entries on the page mention `target`. */
+const DATED_ENTRY_LINE = /^\s*(?:[-*]\s*\*\*\d{4}-\d{2}-\d{2}\*\*|#{3}\s+\d{4}-\d{2}-\d{2})/;
+const datedMentions = (pageText: string, target: string) => pageText.split('\n').filter(l => DATED_ENTRY_LINE.test(l) && l.includes(target)).length;
+
+/**
+ * U2's rule id for a link at [linkStart, linkEnd) in `context`, or null. Reads only the link's own clause; runs after
+ * the full existing inference returned `mentions` (traceLinkType), so it never overrides a verb, a stated type, a
+ * pack rule or a role prior. Development rework (docs/eval/decisions/q2-parser-gaps/dev-units.md): it reads undated
+ * lines only (a role on a dated join line with an unread leave kept former employers live), and it does not fire on a
+ * page that names any organization in an advisory, board or investor role: there master's "became … at" / "took … role"
+ * start cues read the advisory line as a new job, and a newly typed employer then meets that false start (E5 probe:
+ * extra starts and wrong single-value closures). U4 removes that cause; U2 does not depend on it. Nor does it type an
+ * organization that two or more dated entries mention: a later entry no cue reads may be the leave, and typing the
+ * earlier role would keep a former employer live (stale summaries) and feed the single-value pass.
+ */
+export function u2RoleRule(context: string, linkStart: number, linkEnd: number, target: string, pageText: string): string | null {
+  if (!typingUnitEnabled('U2')) return null;
+  const before = clauseBefore(context, linkStart);
+  const after = context.slice(linkEnd, linkEnd + 80);
+  if (U2_NOT_A_JOB.test(before) || THIRD_PARTY.test(before) || inDatedEntry(context, linkStart)) return null;
+  const rule = U2_ROLE_BEFORE.test(before) ? 'unit.u2.role_before'
+    : U2_LED_AREA.test(before) ? 'unit.u2.led_area'
+    : U2_PAREN_ROLE_AFTER.test(after) ? 'unit.u2.paren_role'
+    : U2_JOIN_BEFORE.test(before) && U2_AS_ROLE_AFTER.test(after) ? 'unit.u2.join_as_role' : null;
+  return rule && !nonEmploymentRoleOnPage(pageText) && datedMentions(pageText, target) < 2 ? rule : null;
+}
+
 // ─── Temporal cue hooks (link-temporal-evidence.ts) ─────────────────────
 
 /**

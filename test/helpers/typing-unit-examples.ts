@@ -99,6 +99,84 @@ const U1: TypingExample[] = [
     off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2019-01-02'], live: { type: 'works_at', at: { today: true } } } },
 ];
 
+// ─── U2: ordinary job roles, post-pass on `mentions` (undated lines only) ─
+const LONG_NAME = `[Acme ${'Holdings '.repeat(14)}](../${ACME}.md)`;
+const U2: TypingExample[] = [
+  { id: 'u2-role-for', unit: 'U2', target: ACME, content: page(`Alice is CTO for ${L(ACME)} these days.`),
+    off: { types: ['mentions'] }, on: { types: ['works_at'], tense: { works_at: 'present' }, live: { type: 'works_at', at: { today: true } } } },
+  { id: 'u2-works-as-role-for', unit: 'U2', target: ACME, content: page(`Alice works as a designer for ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
+  { id: 'u2-led-area-at', unit: 'U2', target: ACME, content: page(`Alice led design at ${L(ACME)} for three years.`),
+    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
+  { id: 'u2-now-at-paren', unit: 'U2', target: ACME, content: page(`Alice is now at ${L(ACME)} (product manager).`),
+    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
+  { id: 'u2-signed-on-as', unit: 'U2', target: ACME, content: page(`Alice signed on with ${L(ACME)} as CTO and remains on the team.`),
+    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
+  { id: 'u2-new-chapter-as', unit: 'U2', target: ACME, content: page(`Alice started a new chapter at ${L(ACME)} as designer and is still there.`),
+    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
+  { id: 'u2-prose-typed-timeline-dates-it', unit: 'U2', target: ACME,
+    content: page(`Alice signed on with ${L(ACME)} as data scientist.`, [`**2022-07-08** | linkedin — Signed on with ${L(ACME)} as data scientist`]),
+    off: { types: ['mentions'], transitions: [] },
+    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2022-07-08'], live: { type: 'works_at', at: { '2022-01-01': false, today: true } } } },
+  // Two or more dated entries about the organization: U2 does not type it (the later one may be a leave no cue reads).
+  { id: 'u2-stale-summary-not-typed', unit: 'U2', target: ACME,
+    content: page(`Alice works as a designer for ${L(ACME)}.`, [`**2014-01-02** | linkedin — Joined ${L(ACME)} (designer)`, `**2017-03-04** | linkedin — Closed the chapter at ${L(ACME)}`]),
+    off: { types: ['mentions'], transitions: [] }, on: { types: ['mentions'], transitions: [] } },
+  // Its cost: a rejoin the timeline dates is not typed from the prose role either.
+  { id: 'u2-rejoin-not-typed', unit: 'U2', target: ACME,
+    content: page(`Alice is designer for ${L(ACME)} again.`, [`**2014-01-02** | linkedin — Joined ${L(ACME)} as engineer`, `**2017-03-04** | linkedin — Left ${L(ACME)}`, `**2020-05-06** | linkedin — Returned to ${L(ACME)} as designer`]),
+    off: { types: ['mentions'], transitions: [] }, on: { types: ['mentions'], transitions: [] } },
+  // Dated entries are not read by U2: a former employer named only on a join line with an unread leave stays untyped.
+  { id: 'u2-dated-join-not-read', unit: 'U2', target: ACME, content: page(`Alice A.`, [`**2022-07-08** | linkedin — Signed on with ${L(ACME)} as data scientist`]),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-dated-paren-move-not-read', unit: 'U2', target: ACME,
+    content: page(`Alice A.`, [`**2016-02-03** | linkedin — Joined ${L(BETA)} as engineer`, `**2020-05-06** | linkedin — Moved from ${L(BETA)} to ${L(ACME)} (CTO)`]),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  // A page that names any organization in an advisory role is left alone (E5: the advisory line would start a job, and a
+  // newly typed employer would then be closed by the single-value pass).
+  { id: 'u2-employer-with-advisory-line-left-alone', unit: 'U2', target: ACME,
+    content: page(`Alice is CTO for ${L(ACME)}.`, [`**2021-06-07** | linkedin — Took an advisory role with ${L(ACME)}`]),
+    off: { types: ['advises', 'mentions'], transitions: [] }, on: { types: ['advises', 'mentions'], transitions: [] } },
+  { id: 'u2-page-with-advisory-line-elsewhere-left-alone', unit: 'U2', target: ACME,
+    content: page(`Alice is now at ${L(ACME)} (CTO). She also works at ${L(BETA)}.`, [`**2021-06-07** | note — Became an advisor at ${L(BETA)}`]),
+    off: { types: ['mentions'], transitions: [] }, on: { types: ['mentions'], transitions: [] } },
+  { id: 'u2-verb-typed-unchanged', unit: null, target: ACME, content: page(`Alice invested in ${L(ACME)} (CTO).`),
+    off: { types: ['invested_in'] } },
+  { id: 'u2-prior-unchanged', unit: null, target: ACME, content: page(`Alice is a seed investor. She met ${L(ACME)} (CTO).`),
+    off: { types: ['invested_in'] } },
+  { id: 'u2-third-party', unit: 'U2', target: ACME, content: page(`Alice's husband is CTO for ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-third-party-friend-joined', unit: 'U2', target: ACME, content: page(`Alice's friend joined ${L(ACME)} as CTO.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-appositive-other-person', unit: 'U2', target: ACME, content: page(`Alice met Bob, CTO for ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-negation', unit: 'U2', target: ACME, content: page(`Alice was never CTO for ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-hypothetical', unit: 'U2', target: ACME, content: page(`Alice will join ${L(ACME)} as CTO next spring.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-interview', unit: 'U2', target: ACME, content: page(`Alice interviewed for CTO at ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-board-director', unit: 'U2', target: ACME, content: page(`Alice is an independent director for ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-observer-paren', unit: 'U2', target: ACME, content: page(`Alice joined ${L(ACME)} (board observer).`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-event-lookalike-speaker', unit: 'U2', target: ACME, content: page(`Alice spoke at ${L(ACME)} as keynote speaker.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-window-truncation', unit: 'U2', target: ACME, content: page(`Alice signed on with ${LONG_NAME} as CTO.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-repeated-target', unit: 'U2', target: ACME, content: page(`Alice is CTO for ${L(ACME)}. She first met ${L(ACME)} founders at a dinner in 2019.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions', 'works_at'] } },
+  { id: 'u2-concurrent-roles-adviser-not-employment', unit: 'U1', target: BETA, content: page(`Alice is CTO for ${L(ACME)} and an adviser to ${L(BETA)}.`),
+    off: { types: ['mentions'] }, on: { types: ['advises'] } },
+  // Known cost of the advisory-page guard: a concurrent employer on a page with an advisory role stays untyped.
+  { id: 'u2-concurrent-roles-employer', unit: 'U2', target: ACME, content: page(`Alice is CTO for ${L(ACME)} and an adviser to ${L(BETA)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u2-concurrent-employers', unit: 'U2', target: ACME, content: page(`Alice is CTO for ${L(ACME)} and works at ${L(BETA)} on weekends.`),
+    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
+  { id: 'u2-company-page', unit: 'U2', target: ACME, pageType: 'company', content: page(`Beta Corp is CTO for ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+];
+
 // ─── U3: board, observer and investor wording never types works_at ─────
 const INVESTOR_PAGE = 'Alice is a partner at a venture capital fund and a seed investor.';
 const U3: TypingExample[] = [
@@ -183,4 +261,4 @@ const U4: TypingExample[] = [
     off: { types: ['advises'], transitions: ['advises start 2021-06-07'] } },
 ];
 
-export const EXAMPLES: TypingExample[] = [...U1, ...U3, ...U4];
+export const EXAMPLES: TypingExample[] = [...U1, ...U2, ...U3, ...U4];
