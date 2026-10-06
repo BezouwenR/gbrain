@@ -25,7 +25,7 @@ import {
   type TransitionKind, type TransitionProducer,
 } from './link-validity.ts';
 import { KNOWN_LINK_TYPES } from './search/relational-intent.ts';
-import { U4_NOT_EMPLOYMENT_ROLE, U5_EXCHANGE_AFTER, U5_EXCHANGE_BEFORE, U5_LEAVE, U6_START, nonEmploymentRoleOnPage, typingUnitEnabled } from './link-typing-units.ts';
+import { GUARD_IGNORED_LINE, U4_NOT_EMPLOYMENT_ROLE, U5_EXCHANGE_AFTER, U5_EXCHANGE_BEFORE, U5_LEAVE, U6_START, nonEmploymentRoleOnPage, typingUnitEnabled } from './link-typing-units.ts';
 
 export interface OwnedRow {
   from_slug: string;
@@ -247,6 +247,7 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
     if (hasExplicit(line.text)) continue;
     const refs = referencesIn(line.text);
     const eventLine = EVENT_CONTEXT.test(line.text.replace(/\[[^\]\n]*\]\([^)\s]*\)|\[\[[^\]\n]*\]\]/g, ' '));
+    const tradeLine = GUARD_IGNORED_LINE.test(line.text.replace(/\[[^\]\n]*\]\([^)\s]*\)|\[\[[^\]\n]*\]\]/g, ' '));
     let prevEnd = 0;
     let prevEnded = new Set<string>();
     for (const ref of refs) {
@@ -276,7 +277,7 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
           else if (prevEnded.has(r.link_type) && /^\s*(?:to|for)\s*$/i.test(between)) { kind = 'start'; rule = 'cue.after_end.to_for'; }
         } else if (EVENT_START[r.link_type]?.test(window)) { kind = 'start'; rule = `cue.event.${r.link_type}`; }
         if (!kind) {
-          if (cues && !qualified && r.link_type === 'works_at') uncued.push({ target: other(r), date: line.date });
+          if (cues && !qualified && r.link_type === 'works_at' && !tradeLine) uncued.push({ target: other(r), date: line.date });
           continue;
         }
         if (rule.startsWith('unit.u5.') || rule.startsWith('unit.u6.')) {
