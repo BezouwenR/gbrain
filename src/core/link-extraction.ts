@@ -29,9 +29,9 @@ import { isIdentityEntity, sameEntityName } from './entities/resolve.ts';
 import type { SchemaPackManifest } from './schema-pack/manifest-v1.ts';
 import { inferLinkTypeFromPack, frontmatterLinkTypeFromPack, ownsAttendanceInference } from './schema-pack/link-inference.ts';
 import { PageRegexBudget } from './schema-pack/redos-guard.ts';
-import type { TypingUnit } from './link-typing-units.ts';
+import { UNIT_VERB_RULES, typingUnitEnabled, unitOfRule, unitVerbVeto, type TypingUnit } from './link-typing-units.ts';
 import { deriveTemporalEvidence, rowKey, type DerivedTransition } from './link-temporal-evidence.ts';
-import type { AssertionTense } from './link-validity.ts';
+import { buildRelationshipState, relationSemantics, type AssertionTense, type Stint } from './link-validity.ts';
 
 /**
  * #3190: the slice of a schema-pack manifest link extraction consumes.
@@ -1274,8 +1274,8 @@ const EMPLOYEE_ROLE_RE = /\b(?:is an? (?:senior|staff|principal|lead|backend|fro
 
 
 /** A per-edge verb rule. `id` is stable: tests, explainLinkType and development reports name rules by it. */
-interface VerbRule { id: string; re: RegExp; verb: string }
-const VERB_RULES: ReadonlyArray<VerbRule> = [
+interface VerbRule { id: string; re: RegExp; verb: string; unit?: TypingUnit }
+const CORE_VERB_RULES: ReadonlyArray<VerbRule> = [
   { id: 'verb.founded', re: FOUNDED_RE, verb: 'founded' },
   { id: 'verb.invested_in', re: INVESTED_RE, verb: 'invested_in' },
   { id: 'verb.advises', re: ADVISES_RE, verb: 'advises' },
@@ -1286,6 +1286,9 @@ const VERB_RULES: ReadonlyArray<VerbRule> = [
   { id: 'verb.zh.works_at', re: ZH_WORKS_AT_RE, verb: 'works_at' },
   { id: 'verb.zh.cited', re: ZH_CITED_RE, verb: 'cited' },
 ];
+/** Core rules with each typing unit's rules right after the core rule they extend (skipped unless the unit is on). */
+const VERB_RULES: ReadonlyArray<VerbRule> = CORE_VERB_RULES.flatMap(r => [r, ...UNIT_VERB_RULES.filter(u => u.after === r.id)]);
+const ruleOn = (r: VerbRule) => !r.unit || typingUnitEnabled(r.unit);
 
 /**
  * The per-edge verb for one link when its context window holds several links.
@@ -1317,6 +1320,7 @@ function attachedVerb(context: string, targetSlug?: string, anchor?: number, exp
   let rule: VerbRule | null = null;
   let otherLink = false;
   for (const r of GLOBAL_VERB_RULES) {
+    if (!ruleOn(r)) continue;
     for (const m of context.matchAll(r.re)) {
       const start = m.index ?? 0; const end = start + m[0].length;
       if ((end <= linkStart && LINK_MARK_RE.test(context.slice(end, linkStart)) && !coordinated(context.slice(end, linkStart)))
@@ -1325,6 +1329,8 @@ function attachedVerb(context: string, targetSlug?: string, anchor?: number, exp
         if (explain) suppressed.push(`${r.id}:other-link`);
         continue;
       }
+      const veto = unitVerbVeto({ rule: r, context, start, end });
+      if (veto) { suppressed.push(veto); continue; }
       if (rule) { suppressed.push(`${r.id}:outranked`); break; }
       rule = r;
       if (!explain) return { rule, suppressed, otherLink };
@@ -1373,7 +1379,7 @@ export function inferLinkType(pageType: PageType, context: string, globalContext
 /** inferLinkType with its reasons. `pageText` is the whole page (role priors read `globalContext`, which timeline links do not get). */
 export function traceLinkType(pageType: PageType, context: string, globalContext?: string, targetSlug?: string, targetType?: string | null, anchor?: number, pageText?: string, explain = false): LinkTypeTrace {
   const out = (type: string, rule: string | null, attachment: LinkTypeTrace['attachment'] = 'none', suppressed: string[] = [], prior: string | null = null): LinkTypeTrace =>
-    ({ type, rule, attachment, suppressed, prior, unit: null });
+    ({ type, rule, attachment, suppressed, prior, unit: unitOfRule(rule) ?? unitOfRule(suppressed.find(id => id.startsWith('unit.'))) });
   if (pageType === 'media') {
     return out('mentions', 'page.media');
   }
@@ -1391,9 +1397,18 @@ export function traceLinkType(pageType: PageType, context: string, globalContext
   // "works at [A] and also advises [B]", A is works_at and B advises.
   const attached = attachedVerb(context, targetSlug, anchor, explain);
   if (attached?.rule) return out(attached.rule.verb, attached.rule.id, 'attached', attached.suppressed);
-  if (attached === undefined) for (const r of VERB_RULES) if (r.re.test(context)) return out(r.verb, r.id, 'window');
-  const attachment = attached?.otherLink ? 'other-links' : 'none';
   const suppressed = attached?.suppressed ?? [];
+  if (attached === undefined) {
+    for (const r of GLOBAL_VERB_RULES) {
+      if (!ruleOn(r)) continue;
+      for (const m of context.matchAll(r.re)) {
+        const veto = unitVerbVeto({ rule: r, context, start: m.index ?? 0, end: (m.index ?? 0) + m[0].length });
+        if (!veto) return out(r.verb, r.id, 'window', suppressed);
+        suppressed.push(veto);
+      }
+    }
+  }
+  const attachment = attached?.otherLink ? 'other-links' : 'none';
   // Page-role prior: only fires for person -> company links. Concept pages
   // about VC topics naturally contain "venture capital" in their text, but
   // their company refs are mentions, not investments. Partner pages mentioning
@@ -1421,6 +1436,8 @@ export interface LinkExplanation {
   tense: Record<string, AssertionTense>;
   /** Dated transitions for the kept types, each with the id of the cue that produced it. */
   transitions: Array<DerivedTransition & { rule: string }>;
+  /** Validity stints per temporal type, from this page's tense and transitions alone (link-validity.ts buildRelationshipState). */
+  stints: Record<string, Stint[]>;
 }
 
 /**
@@ -1444,8 +1461,16 @@ export async function explainLinkType(input: {
     candidates.map(c => ({ from_slug: c.fromSlug ?? input.slug, to_slug: c.targetSlug, link_type: c.linkType, link_source: c.linkSource ?? 'markdown', origin_field: c.originField ?? null })),
     (t, rule) => { if (t.to_slug === input.target || t.from_slug === input.target) transitions.push({ ...t, rule }); });
   const tense: Record<string, AssertionTense> = {};
-  for (const t of types) { const v = evidence.tense.get(rowKey({ from_slug: input.slug, to_slug: input.target, link_type: t })); if (v) tense[t] = v; }
-  return { target: input.target, occurrences, types, tense, transitions };
+  const stints: Record<string, Stint[]> = {};
+  for (const t of types) {
+    const v = evidence.tense.get(rowKey({ from_slug: input.slug, to_slug: input.target, link_type: t }));
+    if (v) tense[t] = v;
+    const semantics = relationSemantics(t);
+    if (semantics === 'reference') continue;
+    stints[t] = buildRelationshipState(semantics, v ? [{ tense: v, originPageId: 1 }] : [],
+      transitions.filter(x => x.link_type === t).map(x => ({ kind: x.kind, occurredOn: x.occurred_on, producer: x.producer, originPageId: 1 }))).stints;
+  }
+  return { target: input.target, occurrences, types, tense, transitions, stints };
 }
 
 // ─── Frontmatter link extraction (v0.13) ────────────────────────

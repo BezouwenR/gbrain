@@ -55,3 +55,44 @@ export async function withTypingUnits<T>(units: Iterable<string>, fn: () => T | 
     override = previous;
   }
 }
+
+// ─── Typing hooks (link-extraction.ts) ──────────────────────────────────
+
+/** A verb rule a unit adds. `id` is stable (`unit.u<N>.*`); it sits right after the core rule for the same verb. */
+export interface UnitVerbRule { id: string; re: RegExp; verb: string; unit: TypingUnit; after: string }
+
+export const UNIT_VERB_RULES: readonly UnitVerbRule[] = [
+];
+
+/** The clause before `index`: back to a sentence, clause or timeline-entry break (at most 100 chars). */
+export function clauseBefore(text: string, index: number): string {
+  const w = text.slice(Math.max(0, index - 100), index);
+  const cut = Math.max(...['. ', '; ', '! ', '? ', '\n', ' | ', ' — ', ' - **'].map(b => { const i = w.lastIndexOf(b); return i < 0 ? -1 : i + b.length; }));
+  return cut >= 0 ? w.slice(cut) : w;
+}
+
+/** Someone other than the page's subject holds the role ("her husband is …", "a friend who …"). */
+const THIRD_PARTY = /\b(?:husband|wife|spouse|boyfriend|girlfriend|fianc[eé]e?|brother|sister|mother|father|mom|dad|son|daughter|parent|friend|colleague|co-?worker|manager|boss|mentor|mentee|roommate|neighbou?r|cousin|uncle|aunt|classmate|former\s+colleague|whose|who|someone|somebody)\b/i;
+export const thirdPartyBefore = (text: string, index: number) => THIRD_PARTY.test(clauseBefore(text, index));
+
+export interface VetoInput {
+  rule: { id: string; verb: string };
+  context: string;
+  /** Match offsets in `context`. */
+  start: number;
+  end: number;
+}
+
+/**
+ * A unit's veto of one verb match, or null. A vetoed match does not decide the type; inference moves on to the next
+ * match or rule. Returns the stable id of the veto (`unit.u<N>.*`).
+ */
+export function unitVerbVeto(v: VetoInput): string | null {
+  return null;
+}
+
+/** The unit a rule or veto id belongs to (`unit.u3.board_wording` → U3). */
+export function unitOfRule(id: string | null | undefined): TypingUnit | null {
+  const m = /^unit\.u(\d)\./.exec(id ?? '');
+  return m ? (`U${m[1]}` as TypingUnit) : null;
+}
