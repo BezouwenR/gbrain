@@ -59,4 +59,43 @@ export async function observe(ex: TypingExample, want: Expectation): Promise<Exp
   return got;
 }
 
-export const EXAMPLES: TypingExample[] = [];
+// ─── U1: adviser wording, with local negation ───────────────────────────
+const U1: TypingExample[] = [
+  { id: 'u1-is-an-adviser-to', unit: 'U1', target: ACME, content: page(`Alice is an adviser to ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['advises'], tense: { advises: 'present' }, live: { type: 'advises', at: { today: true } } } },
+  { id: 'u1-serves-as-adviser', unit: 'U1', target: ACME, content: page(`Alice serves as an adviser to ${L(ACME)} on hiring.`),
+    off: { types: ['mentions'] }, on: { types: ['advises'] } },
+  { id: 'u1-now-advising', unit: 'U1', target: ACME, content: page(`Alice is now advising ${L(ACME)} on pricing.`),
+    off: { types: ['mentions'] }, on: { types: ['advises'] } },
+  { id: 'u1-advising-link', unit: 'U1', target: ACME, content: page(`Alice works at ${L(BETA)}.`, [`**2025-02-03** | note — Advising ${L(ACME)} on its launch`]),
+    off: { types: ['mentions'] }, on: { types: ['advises'] } },
+  { id: 'u1-technical-adviser-at', unit: 'U1', target: ACME, content: page(`Alice is a technical adviser at ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['advises'] } },
+  { id: 'u1-job-title-financial-adviser-at', unit: 'U1', target: ACME, content: page(`Alice is a financial adviser at ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u1-negated-not-an-advisor', unit: 'U1', target: ACME, content: page(`Alice is not an advisor to ${L(ACME)}.`),
+    off: { types: ['advises'], tense: { advises: 'present' } }, on: { types: ['mentions'] } },
+  { id: 'u1-negated-no-longer-advises', unit: 'U1', target: ACME, content: page(`Alice no longer advises ${L(ACME)}.`),
+    off: { types: ['advises'], tense: { advises: 'past' }, live: { type: 'advises', at: { today: false } } }, on: { types: ['mentions'] } },
+  { id: 'u1-negated-not-an-adviser', unit: 'U1', target: ACME, content: page(`Alice is not an adviser to ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u1-stopped-advising', unit: 'U1', target: ACME, content: page(`Alice stopped advising ${L(ACME)} last year.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u1-third-party-adviser', unit: 'U1', target: ACME, content: page(`Alice's husband is an adviser to ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u1-third-party-friend-advising', unit: 'U1', target: ACME, content: page(`Alice introduced a friend who is now advising ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
+  { id: 'u1-concurrent-role', unit: 'U1', target: ACME, content: page(`Alice works at ${L(BETA)} and is an adviser to ${L(ACME)}.`),
+    off: { types: ['mentions'] }, on: { types: ['advises'] } },
+  { id: 'u1-concurrent-role-employer-kept', unit: null, target: BETA, content: page(`Alice works at ${L(BETA)} and is an adviser to ${L(ACME)}.`),
+    off: { types: ['works_at'], tense: { works_at: 'present' } } },
+  { id: 'u1-dated-start', unit: 'U1', target: ACME,
+    content: page(`Alice works at ${L(BETA)}. She is an adviser to ${L(ACME)}.`, [`**2024-05-06** | note — Began advising ${L(ACME)}`]),
+    off: { types: ['mentions'], transitions: [] },
+    on: { types: ['advises'], transitions: ['advises start 2024-05-06'], live: { type: 'advises', at: { '2024-01-01': false, today: true } } } },
+  { id: 'u1-employer-not-closed-by-advising-line', unit: null, target: BETA,
+    content: page(`Alice works at ${L(BETA)} as CTO.`, [`**2019-01-02** | linkedin — Joined ${L(BETA)} as CTO`, `**2024-05-06** | note — Now advising ${L(ACME)}`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2019-01-02'], live: { type: 'works_at', at: { today: true } } } },
+];
+
+export const EXAMPLES: TypingExample[] = [...U1];

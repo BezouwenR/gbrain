@@ -61,8 +61,18 @@ export async function withTypingUnits<T>(units: Iterable<string>, fn: () => T | 
 /** A verb rule a unit adds. `id` is stable (`unit.u<N>.*`); it sits right after the core rule for the same verb. */
 export interface UnitVerbRule { id: string; re: RegExp; verb: string; unit: TypingUnit; after: string }
 
+/**
+ * U1: the British `adviser` spelling and "advising [X]". A bare "adviser at [X]" is a job title ("financial adviser
+ * at [Bank]") and stays employment; a qualified advisory title ("technical adviser at [X]") advises.
+ */
+const U1_ADVISER_RE = /\b(?:adviser (?:to|for|of)|(?:strategic|technical|security|product|industry|senior|board|startup|outside|special|go-to-market) adviser (?:to|at|for|of)|(?:is|was|as|became|becomes|serves as|served as|serving as|now|currently|signed on as|brought on as|joined as) an? (?:\w+ )?adviser\b(?! at)|board of advisers|(?:now|currently|is|was|been|started|began|begun|also|still) advising|advising (?=\[))/i;
+
 export const UNIT_VERB_RULES: readonly UnitVerbRule[] = [
+  { id: 'unit.u1.adviser', re: U1_ADVISER_RE, verb: 'advises', unit: 'U1', after: 'verb.advises' },
 ];
+
+/** Negation right before an advisory phrase ("not an advisor to", "no longer advises", "stopped advising"). */
+const U1_NEGATED_BEFORE = /\b(?:not|never|no\s+longer|nor|isn't|wasn't|aren't|hasn't|haven't|didn't|doesn't|stopped|ceased(?:\s+to\s+be)?|declined\s+to\s+(?:be|become)|turned\s+down\s+(?:being|becoming)?)\s+(?:(?:an?|the|her|his|their|any|longer|formally|officially|really|yet|be|been)\s+)*$/i;
 
 /** The clause before `index`: back to a sentence, clause or timeline-entry break (at most 100 chars). */
 export function clauseBefore(text: string, index: number): string {
@@ -88,6 +98,10 @@ export interface VetoInput {
  * match or rule. Returns the stable id of the veto (`unit.u<N>.*`).
  */
 export function unitVerbVeto(v: VetoInput): string | null {
+  if (v.rule.verb === 'advises' && typingUnitEnabled('U1')) {
+    if (U1_NEGATED_BEFORE.test(v.context.slice(Math.max(0, v.start - 40), v.start))) return 'unit.u1.negated';
+    if (v.rule.id === 'unit.u1.adviser' && thirdPartyBefore(v.context, v.start)) return 'unit.u1.third_party';
+  }
   return null;
 }
 
