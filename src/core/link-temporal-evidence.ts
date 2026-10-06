@@ -25,7 +25,7 @@ import {
   type TransitionKind, type TransitionProducer,
 } from './link-validity.ts';
 import { KNOWN_LINK_TYPES } from './search/relational-intent.ts';
-import { U4_NOT_EMPLOYMENT_ROLE, typingUnitEnabled } from './link-typing-units.ts';
+import { U4_NOT_EMPLOYMENT_ROLE, U5_EXCHANGE_AFTER, U5_EXCHANGE_BEFORE, U5_LEAVE, typingUnitEnabled } from './link-typing-units.ts';
 
 export interface OwnedRow {
   from_slug: string;
@@ -209,9 +209,10 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
   const temporalRows = rows.filter(r => relationSemantics(r.link_type) !== 'reference');
   const other = (r: OwnedRow) => (r.from_slug === page.slug ? r.to_slug : r.from_slug);
   const seen = new Set<string>();
+  const rules = new Map<DerivedTransition, string>();
   const push = (t: DerivedTransition, rule: string) => {
     const k = `${t.from_slug}\0${t.to_slug}\0${t.link_type}\0${t.kind}\0${t.occurred_on}\0${t.producer}`;
-    if (!seen.has(k)) { seen.add(k); transitions.push(t); explain?.(t, rule); }
+    if (!seen.has(k)) { seen.add(k); transitions.push(t); rules.set(t, rule); }
   };
 
   // 1. Explicit grammar inside dated timeline entries.
@@ -230,6 +231,11 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
         occurred_on: line.date, date_precision: 'day', producer: line.dream ? 'dream' : 'explicit', line_hash: lineHash(line.text) }, 'cue.explicit');
     }
   }
+
+  // U5 ends and the uncued plain references to works_at targets, for the restart guard after the loop.
+  const u5 = typingUnitEnabled('U5');
+  const u5Ends: Array<{ target: string; date: string; key: string }> = [];
+  const uncued: Array<{ target: string; date: string }> = [];
 
   // 2. Natural cues on dated lines, for relationships this page asserts.
   //    State relations take a cue only when it governs the reference itself:
@@ -262,16 +268,30 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
               : /\b(?:(?:re-?)?joined|was\s+(?:added|named|appointed)\s+to)\s*$/i.test(window) ? 'start' : null;
             rule = `cue.advisory_board.${kind}`;
           } else if (cues.end.test(window)) { kind = 'end'; rule = `cue.${family}.end`; }
+          else if (u5 && r.link_type === 'works_at' && U5_LEAVE.test(window)) { kind = 'end'; rule = 'unit.u5.leave'; }
+          else if (u5 && r.link_type === 'works_at' && U5_EXCHANGE_BEFORE.test(window) && U5_EXCHANGE_AFTER.test(line.text.slice(ref.end))) { kind = 'end'; rule = 'unit.u5.exchange'; }
           else if (cues.start.test(window)) { kind = 'start'; rule = `cue.${family}.start`; }
           else if (prevEnded.has(r.link_type) && /^\s*(?:to|for)\s*$/i.test(between)) { kind = 'start'; rule = 'cue.after_end.to_for'; }
         } else if (EVENT_START[r.link_type]?.test(window)) { kind = 'start'; rule = `cue.event.${r.link_type}`; }
-        if (!kind) continue;
+        if (!kind) {
+          if (cues && !qualified && r.link_type === 'works_at') uncued.push({ target: other(r), date: line.date });
+          continue;
+        }
+        if (rule.startsWith('unit.u5.')) u5Ends.push({ target: other(r), date: line.date, key: `${r.from_slug}\0${r.to_slug}\0${r.link_type}\0end\0${line.date}` });
         if (kind === 'end') endedHere.add(r.link_type);
         push({ from_slug: r.from_slug, to_slug: r.to_slug, link_type: r.link_type, kind, occurred_on: line.date,
           date_precision: 'day', producer: line.dream ? 'dream' : 'timeline', line_hash: lineHash(line.text) }, rule);
       }
       prevEnded = endedHere;
     }
+  }
+
+  // U5 restart guard: an idiomatic leave is dropped when a later dated line names the same organization in plain words
+  // that no cue reads (a rejoin the lexicon cannot see); otherwise it would close a current stint for good.
+  for (const e of u5Ends) {
+    if (!uncued.some(u => u.target === e.target && u.date > e.date)) continue;
+    const at = transitions.findIndex(t => `${t.from_slug}\0${t.to_slug}\0${t.link_type}\0${t.kind}\0${t.occurred_on}` === e.key);
+    if (at >= 0) transitions.splice(at, 1);
   }
 
   // 3. Frontmatter since/until on relationship objects ({name, since, until}).
@@ -309,6 +329,7 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
     }
     tense.set(rowKey(r), past > 0 && present === 0 && r.link_source !== 'frontmatter' ? 'past' : 'present');
   }
+  if (explain) for (const t of transitions) explain(t, rules.get(t)!);
   return { tense, transitions, unmatched };
 }
 

@@ -261,4 +261,45 @@ const U4: TypingExample[] = [
     off: { types: ['advises'], transitions: ['advises start 2021-06-07'] } },
 ];
 
-export const EXAMPLES: TypingExample[] = [...U1, ...U2, ...U3, ...U4];
+// ─── U5: leave idioms and exchange moves (dated ends), with a restart guard ─
+const JOB = (lines: string[]) => page(`Alice worked at ${L(ACME)}. She works at ${L(BETA)} now.`, [`**2015-01-02** | linkedin — Joined ${L(ACME)} as engineer`, ...lines]);
+const U5: TypingExample[] = [
+  { id: 'u5-handed-in-notice', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Handed in her notice at ${L(ACME)}`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] },
+    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'], live: { type: 'works_at', at: { '2016-01-01': true, '2020-01-01': false } } } },
+  { id: 'u5-wrapped-time-up', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Wrapped her time up at ${L(ACME)}`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
+  { id: 'u5-packed-it-in', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Called it a day at ${L(ACME)} and packed it in`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
+  { id: 'u5-stepped-back-from', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Stepped back from ${L(ACME)}`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
+  { id: 'u5-parted-company-with', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Parted company with ${L(ACME)}`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
+  { id: 'u5-farewell', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Said goodbye to ${L(ACME)} after four years`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
+  { id: 'u5-exchange-ends-first', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Swapped ${L(ACME)} for ${L(BETA)} (designer)`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
+  { id: 'u5-exchange-starts-second', unit: 'U5', target: BETA, content: JOB([`**2019-03-04** | linkedin — Swapped ${L(ACME)} for ${L(BETA)} (designer)`]),
+    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2019-03-04'], live: { type: 'works_at', at: { '2018-01-01': false, today: true } } } },
+  { id: 'u5-traded-shares-control', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | note — Traded shares of ${L(ACME)} for cash`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] } },
+  { id: 'u5-event-line-control', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | event — Said goodbye to ${L(ACME)} at the farewell dinner`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] } },
+  { id: 'u5-qualified-control', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | note — Said goodbye to ${L(ACME)}'s old office`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] } },
+  // Unsupported, frozen: U5 does not resolve the subject (a third party's leave on the page dates the subject's stint).
+  { id: 'u5-third-party-split-leave', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | note — Her manager handed in his notice at ${L(ACME)}`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
+  // Restart guard: a later plain mention no cue reads (an onboarding week) keeps the stint open; without the guard the
+  // leave would close the current job for good (the dev trace's onboarding losses).
+  { id: 'u5-rejoin-restart-guard', unit: 'U5', target: ACME,
+    content: page(`Alice works at ${L(ACME)} as head of sales.`, [`**2015-01-02** | linkedin — Joined ${L(ACME)} as engineer`, `**2018-03-04** | linkedin — Parted company with ${L(ACME)}`, `**2020-08-11** | linkedin — Onboarding week at ${L(ACME)} as head of sales`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'], live: { type: 'works_at', at: { '2019-01-01': true, today: true } } },
+    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'], live: { type: 'works_at', at: { '2019-01-01': true, today: true } } } },
+  { id: 'u5-leave-not-guarded-by-event-mention', unit: 'U5', target: ACME,
+    content: JOB([`**2019-03-04** | linkedin — Parted company with ${L(ACME)}`, `**2021-05-06** | event — Back at ${L(ACME)} for the alumni dinner`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] },
+    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'], live: { type: 'works_at', at: { today: false } } } },
+];
+
+export const EXAMPLES: TypingExample[] = [...U1, ...U2, ...U3, ...U4, ...U5];

@@ -214,3 +214,12 @@ export function u2RoleRule(context: string, linkStart: number, linkEnd: number, 
  * employment start cues, so "Became an advisor at [X]" or "Took an advisory role with [X]" never starts a works_at stint.
  */
 export const U4_NOT_EMPLOYMENT_ROLE = String.raw`(?!(?:\w+\s+){0,2}?(?:advis\w*|board|investor|investing|investment|angel|observer|non-executive|independent|trustee)\b)`;
+
+/** U5: leaves an object splits ("wrapped her time up at", "handed in her notice at") and quitting idioms. */
+const LEAVE_OBJECT = String.raw`(?:(?:her|his|their|my|a|the)\s+)?(?:time|stint|tenure|role|job|run|things|it|notice|resignation)\s+`;
+const SPLIT_LEAVE = String.raw`(?:wrapped|wound|finished)\s+${LEAVE_OBJECT}up\s+(?:at|with)|(?:handed|turned|put)\s+(?:in\s+${LEAVE_OBJECT}|${LEAVE_OBJECT}in\s+)(?:at|to|with)|(?:gave|submitted|tendered)\s+${LEAVE_OBJECT}(?:at|to)`;
+const IDIOM_LEAVE = String.raw`packed\s+(?:it|things)\s+in\s+(?:at|with)|call(?:ed|s|ing)?\s+(?:it\s+)?time\s+(?:on|at)|call(?:ed|s|ing)?\s+it\s+a\s+day\s+(?:at|with)|call(?:ed|s|ing)?\s+it\s+quits\s+(?:at|with)|bow(?:ed|s|ing)?\s+out\s+(?:of|from|at)|walk(?:ed|s|ing)?\s+(?:out\s+(?:of|on)|away\s+from)|thr(?:ew|ows|owing)\s+in\s+the\s+towel\s+(?:at|with)|hand(?:ed|s|ing)?\s+in\s+(?:(?:her|his|their|my)\s+)?(?:badge|keys|laptop)\s+(?:at|to)|clear(?:ed|s|ing)?\s+out\s+(?:(?:her|his|their|my)\s+)?desk\s+at|gave\s+up\s+(?:(?:her|his|their|my)\s+)?(?:job|role|post|position|seat)\s+at|left\s+(?:(?:her|his|their|my)\s+)?(?:job|role|post|position)\s+at|step(?:ped|s|ping)?\s+back\s+from|parted\s+company\s+with|said\s+(?:(?:her|his|their|my)\s+)?goodbyes?\s+to|bid(?:\s+a)?\s+farewell\s+to|exit\s+from`;
+export const U5_LEAVE = new RegExp(String.raw`\b(?:${SPLIT_LEAVE}|${IDIOM_LEAVE})\s*$`, 'i');
+/** U5: "traded [A] for [B]" ends A (the "for" then starts B). "Traded shares of [A]" is not an exchange. */
+export const U5_EXCHANGE_BEFORE = /\b(?:traded|swapped|exchanged|ditched|dropped)\s*$/i;
+export const U5_EXCHANGE_AFTER = /^\s+for\s+(?:\[|the\s+\[|an?\s+\[)/i;
