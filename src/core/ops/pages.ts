@@ -204,10 +204,8 @@ const get_page: Operation = {
     // it would double every reader's payload for the round-trip minority.
     const timelineEntries = includeTimelineEntries
       ? await ctx.engine.getTimeline(page.slug, await readPolicyOpts(ctx, { sourceId: page.source_id })) : undefined;
-    // Read-only, over the same visibility-filtered body the reader gets (core/line-grammar-report.ts).
-    const lineGrammar = (p.grammar_diagnostics as boolean) === true
-      ? await (await import('../line-grammar-report.ts')).lineGrammarReport(ctx.engine, { slug: page.slug, sourceId: page.source_id, body: visibleBody.compiled_truth })
-      : undefined;
+    // Read-only, over the same visibility-filtered body the reader gets.
+    const lineGrammar = p.grammar_diagnostics === true ? await (await import('../line-grammar-report.ts')).lineGrammarReport(ctx.engine, { slug: page.slug, sourceId: page.source_id, body: visibleBody.compiled_truth }) : undefined;
     const projected = projectGetPage(visibleBody, {
       revision: snapshot!.revision, tags, includeContent, contentOnly: (p.content_only as boolean) === true, resolved_slug, content_flag,
       ...(timelineEntries ? { timeline_entries: timelineEntries } : {}),

@@ -13,7 +13,7 @@ import { probeSourceGitState } from '../../../core/git-head.ts';
 import { lagFromContentMs, loadSyncFreshnessSources, resolveStalenessCeilingSeconds } from '../../../core/source-health.ts';
 import { resolveEnvNumber, resolveHoursEnv, warnOnceForEnv } from '../../../core/env-number.ts';
 import { CHUNKER_VERSION } from '../../../core/chunkers/code.ts';
-import { effectiveLinkExtractorWatermark } from '../../../core/link-extraction-watermark.ts';
+import { effectiveLinkExtractorWatermark, smallBrainBacklogNote } from '../../../core/link-extraction-watermark.ts';
 import { previewMentionPass } from '../../../core/mentions/stale.ts';
 import { isUndefinedColumnError } from '../../../core/utils.ts';
 import {
@@ -120,9 +120,7 @@ export async function checkLinksExtractionLag(
     // Vacuous-skip tiny brains unless explicitly source-scoped. Shared floor
     // const so the sync nudge (D6/C4) skips on the exact same predicate.
     if (total < EXTRACTION_LAG_MIN_PAGES && !sourceId) {
-      // Too few pages to grade a percentage, but the exact backlog still tells an operator whether a re-extraction finished.
-      const pending = await engine.countStalePagesForExtraction({ versionTs: await effectiveLinkExtractorWatermark(engine) }).catch(() => null);
-      return { name, status: 'ok', message: `Extraction lag not applicable (${total} pages — too few to assess)${pending ? `; ${pending} page(s) pending link extraction (gbrain extract --stale finishes them)` : ''}` };
+      return { name, status: 'ok', message: `Extraction lag not applicable (${total} pages — too few to assess)${await smallBrainBacklogNote(engine)}` };
     }
 
     // #5761: a page left stale only by an unresolved attendee, and not edited

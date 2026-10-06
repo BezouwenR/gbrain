@@ -47,6 +47,17 @@ export class DerivedLinkSettingsChangedError extends DerivedLinkEndpointChangedE
   constructor() { super('Line-grammar settings changed after these links were prepared'); this.name = 'DerivedLinkSettingsChangedError'; }
 }
 
+/** replaceDerivedLinks, or null when the line-grammar settings moved since preparation (the page stays stale). */
+export async function replaceDerivedLinksUnlessSettingsChanged(engine: Pick<BrainEngine, 'replaceDerivedLinks'>,
+  ...args: Parameters<BrainEngine['replaceDerivedLinks']>): Promise<{ created: number; removed: number } | null> {
+  try { return await engine.replaceDerivedLinks(...args); }
+  catch (error) { if (error instanceof DerivedLinkSettingsChangedError) return null; throw error; }
+}
+
+/** The operator line for pages a settings change left stale mid-run. */
+export const settingsChangedSkipLine = (n: number) =>
+  `Skipped ${n} page(s) because the line-grammar settings changed during this run; they stay stale. Run \`gbrain extract --stale\` to finish them.`;
+
 export async function applyAttendanceDelta(tx: Pick<BrainEngine, 'executeRaw' | 'addLinksBatch'>,
   origin: { id: string; slug: string; source_id: string; type: string }, remove: string[], additions: LinkBatchInput[]) {
   if (origin.type !== 'meeting' || remove.length > 512 || additions.length > 256

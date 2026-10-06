@@ -378,6 +378,23 @@ async function changeLineGrammarConfig(engine: BrainEngine, mutate: (tx: BrainEn
   for (const line of (await describeLineGrammarChange(engine, change)).lines) console.error(`[config] ${line}`);
 }
 
+/**
+ * Delete config rows; line-grammar keys commit with the extraction generation in one transaction.
+ * `_internal.*` keys are gbrain's own state: a single unset refuses one, a pattern unset skips them.
+ */
+async function unsetConfigKeys(engine: BrainEngine, keys: string[], opts: { single?: boolean } = {}): Promise<number> {
+  const { isInternalConfigKey, isLineGrammarKey } = await import('../core/line-grammar-config.ts');
+  if (opts.single && keys.some(isInternalConfigKey)) {
+    console.error(`[config] ${keys[0]} is internal state gbrain maintains itself; it cannot be unset.`);
+    process.exit(1);
+  }
+  let deleted = 0;
+  for (const k of keys.filter(k => !isLineGrammarKey(k) && !isInternalConfigKey(k))) deleted += Math.max(0, await engine.unsetConfig(k));
+  const grammarKeys = keys.filter(isLineGrammarKey);
+  if (grammarKeys.length) await changeLineGrammarConfig(engine, async tx => { for (const k of grammarKeys) deleted += await tx.unsetConfig(k); });
+  return deleted;
+}
+
 async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value: string, force = false): Promise<void> {
   const { isInternalConfigKey, isLineGrammarKey, invalidLineGrammarValue } = await import('../core/line-grammar-config.ts');
   if (isInternalConfigKey(key)) {
@@ -694,8 +711,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
         console.error('Usage: gbrain config unset --pattern <prefix>');
         process.exit(1);
       }
-      const { isInternalConfigKey, isLineGrammarKey } = await import('../core/line-grammar-config.ts');
-      const keys = (await engine.listConfigKeys(prefix)).filter(k => !isInternalConfigKey(k));
+      const keys = (await engine.listConfigKeys(prefix)).filter(k => !k.startsWith('_internal.'));
       // Dual-plane keys matching the prefix must ALSO leave the file mirror
       // (codex re-review, this wave): a DB-only pattern delete would report
       // success while the engine-free Stop hook keeps reading the mirror's
@@ -725,15 +741,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
         console.log(`No keys match prefix "${prefix}".`);
         return;
       }
-      let deleted = 0;
-      const grammarKeys = keys.filter(isLineGrammarKey);
-      for (const k of keys.filter(k => !isLineGrammarKey(k))) {
-        const n = await engine.unsetConfig(k);
-        if (n > 0) deleted += n;
-      }
-      if (grammarKeys.length) {
-        await changeLineGrammarConfig(engine, async tx => { for (const k of grammarKeys) deleted += await tx.unsetConfig(k); });
-      }
+      const deleted = await unsetConfigKeys(engine, keys);
       console.log(`Unset ${deleted} key(s) matching "${prefix}":`);
       for (const k of keys) console.log(`  - ${k}`);
       for (const k of fileSwept) {
@@ -849,14 +857,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       }
       return;
     }
-    const { isInternalConfigKey, isLineGrammarKey } = await import('../core/line-grammar-config.ts');
-    if (isInternalConfigKey(key)) {
-      console.error(`[config] ${key} is internal state gbrain maintains itself; it cannot be unset.`);
-      process.exit(1);
-    }
-    let n = 0;
-    if (isLineGrammarKey(key)) await changeLineGrammarConfig(engine, async tx => { n = await tx.unsetConfig(key); });
-    else n = await engine.unsetConfig(key);
+    const n = await unsetConfigKeys(engine, [key], { single: true });
     if (n > 0) {
       console.log(`Unset ${key}${key === 'auto_chronicle' ? AUTO_CHRONICLE_UNSET_NOTE : ''}`);
       if (key === 'facts.default_visibility') await restampVisibilityPosture(null);

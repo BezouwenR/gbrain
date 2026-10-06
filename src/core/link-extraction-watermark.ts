@@ -30,6 +30,12 @@ export function linkExtractorWatermarkFor(generation: string | null | undefined)
   return laterInstant(LINK_EXTRACTOR_VERSION_TS, generation);
 }
 
+/** Doctor's note for a brain too small to grade: the exact link-extraction backlog, or '' when there is none. */
+export async function smallBrainBacklogNote(engine: { getConfig(key: string): Promise<string | null>; countStalePagesForExtraction(o: { versionTs: string }): Promise<number> }): Promise<string> {
+  const pending = await engine.countStalePagesForExtraction({ versionTs: await effectiveLinkExtractorWatermark(engine) }).catch(() => 0);
+  return pending ? `; ${pending} page(s) pending link extraction (gbrain extract --stale finishes them)` : '';
+}
+
 export async function effectiveLinkExtractorWatermark(engine: { getConfig(key: string): Promise<string | null> }): Promise<string> {
   return linkExtractorWatermarkFor(await engine.getConfig(LINK_EXTRACTION_GENERATION_KEY));
 }
