@@ -3,8 +3,8 @@
  * Build a typing-unit package ref (Q2 Track C): a local branch whose single extra commit on top of `--base` sets
  * ENABLED_TYPING_UNITS in src/core/link-typing-units.ts to the given units, in the given order. Prints the commit SHA.
  *
- *   bun scripts/q2-typing-package.ts --base <ref> --units U2,U1,U5     # nested package arm (order = selection order)
- *   bun scripts/q2-typing-package.ts --base <ref> --arm U2             # one-unit arm (baseline + that unit; U34 = U3 with U4)
+ *   bun scripts/q2-typing-package.ts --base <ref> --units U25,U1,U34   # nested package arm (order = selection order)
+ *   bun scripts/q2-typing-package.ts --base <ref> --arm U2             # one-unit arm (baseline + that unit; joint units U25 = U2 with U5, U34 = U3 with U4)
  *   bun scripts/q2-typing-package.ts --base <ref> --units none         # the base with no unit (equivalence checks)
  *   options: --branch <name> (default q2-typing/<base-short>/<arm-U2 | U2-U1-U5 | none>), --json
  *

@@ -2,11 +2,11 @@
 
 All six units are implemented behind `ENABLED_TYPING_UNITS` (empty, so the build types exactly like master) and each
 was measured alone and together on development data only. After reworks, no unit has a development type steal or a
-new wrong transition by identity, and the all-unit package removes every E5 false start and every wrong single-value
-closure while adding 73 current employers to the live read. Two findings change the plan: **U4 depends on U3** (U4
-alone loses 0.163 as-of exact on board wording, so U3 and U4 are the joint unit **U34**), and **U2 and U6 depend on
-U4's guard** for the E5 probe, which I handled inside U2 and U6 with page-level guards instead of overlapping U4. One
-residual remains: U2 adds one general single-value closure on each of two phrasings (details below).
+new wrong transition by identity, no unit lowers a trap family, and the all-unit package removes every E5 false start
+and every wrong single-value closure while adding 73 current employers to the live read. The development data shows
+two dependencies, now recorded as joint units: **U34** (U4 needs U3) and **U25** (U2 needs U5); the family is U1, U25,
+U34, U6 (see "Dependency units"). U2 and U6 also depend on U4's guard for the E5 probe, which I handled inside U2 and
+U6 with page-level guards instead of overlapping U4.
 
 Development data only: temporal-edges dev seeds 3 and 5 with phrasing sets A, A2, A3 and the nine
 `test/fixtures/q2-dev-phrasings/` files; world-v1 (H1 runner); relation-line variants dev seeds 1-3 (H2 runner). No
@@ -20,7 +20,7 @@ custodian or sealed text was read. Mechanism background: `dev-trace.md`.
 | U2 ordinary roles | `1b5a8569` | post-pass where inference returned `mentions`: "<role> for", "led <area> at", "[X] (<role>)", "as <role>" after a join | undated lines only; not on a page that names an advisory/board/investor role; not for an organization two or more dated entries mention |
 | U3 board wording | `dd05898d` | board/observer/investor wording vetoes `works_at`; board seat keeps `invested_in` only with an investor prior or a stated investment | veto scoped to the link's own sentence/entry or a board position right before the link (first version stole jobs a neighboring entry's verb had typed) |
 | U4 not-employment starts | `0044223c` | `NOT_EMPLOYMENT_ROLE` in the "became … at/of" and "took … role" start cues | none; joint with U3 as U34 (`30717952`) |
-| U5 leave idioms | `fe4c334e` | split-object and quitting idioms, "exit from", exchange moves; dated ends only | restart guard (from the trace): an idiom end is dropped when a later dated entry names the organization in words no cue reads |
+| U5 leave idioms | `fe4c334e`, `5a9efd08` | split-object and quitting idioms, "exit from", exchange moves; dated ends only | restart guard (from the trace): an idiom end is dropped when a later dated entry names the organization in words no cue reads; share-trade lines ("Traded shares of [X]") no longer count, because they made the guard drop correct ends (investment traps 17/26 → 16/26 on leave-start-idioms before the fix, 26/26 after) |
 | U6 start framings | `fd0b1f55`, `c6655db2` | first day/week, day one, kick-off with a job noun, onboarded/onboarding week, began working at, new chapter at | leave guard (mirror of U5's) and the advisory-page guard: alone it had opened former jobs for good (6-8 wrong general single-value closures, 5-24 wrong E5 closures, lower traps) |
 
 Infrastructure: `efd1628e` (rule ids, `explainLinkType`), `192c0870` (unit plumbing, example harness), `30717952`
@@ -38,12 +38,46 @@ Infrastructure: `efd1628e` (rule ids, `explainLinkType`), `192c0870` (unit plumb
   target (E5 "other" form); the single-value pass then closes the real employer on the advisory date, a new wrong
   closure by identity. U4 removes the cause. I kept U2 and U6 independent of U4 with a page-level guard (they do not
   fire on a page that names any organization in an advisory, board or investor role); the cost is that a person with
-  an advisory role elsewhere gets no U2 typing or U6 dating. Alternatives for you: make U2 and U6 joint with U4, or
-  let them carry U4's guard (overlap: if U2 is ordered before U34 in the package sequence, U34's increment on E5 false
-  starts is zero and the fixed sequence stops there).
+  an advisory role elsewhere gets no U2 typing or U6 dating. Kept as built (decision of 2026-10-06).
 - **Count-based E5 metric hides wrong starts.** `e5_extra_works_at_starts` is zero-clamped and counts starts: on
   master a missed correct start masks a wrong advisory start, so a unit that recovers the correct start shows a "new"
   extra start without adding a wrong transition. The identity tables below are the faithful measure (plan §9.3).
+
+## Dependency units
+
+The preregistration amendment records two joint units, each measured with the primary metric of its first member.
+
+**U34 = U3 with U4** (U4's primary metric, false employment starts per E5 probe person). On board-director, U4 alone
+takes as-of exact from 0.946 to 0.783 and during-F1 from 0.931 to 0.890: board lines that master types `works_at` lose
+their start and read as a job on every date. U3 removes the `works_at` typing; U3 with U4 gives 0.950 and 0.940.
+
+**U25 = U2 with U5** (U2's primary metric, live-edge recall). U2 types the current employer in "[X] (<role>)" and
+"signed on with [X] as <role>" prose. When the former employer's leave is an idiom only U5 reads ("Exit from [Y]",
+"Handed in her notice at [Y]"), master keeps the former employer live, and with a dated start for the newly typed
+employer the general single-value pass closes the former employer at that start date instead of its real end: a new
+wrong closure by identity (by date). U5 dates the real leave, so the relationship is already closed and the pass has
+nothing to close.
+
+| Phrasing | Arm | live recall | as-of exact | now-precision | investment traps | alumni traps | general single-value wrong closures |
+|---|---|---|---|---|---|---|---|
+| paren-move | none | 0.597 | 0.640 | 0.793 | 22/26 | 18/20 | 3/160 |
+| paren-move | U2 | 0.734 | 0.727 | 0.858 | 22/26 | 18/20 | **4/160** |
+| paren-move | U5 | 0.597 | 0.671 | 0.958 | 26/26 | 20/20 | 0/160 |
+| paren-move | U25 | **0.741** | 0.760 | 1.000 | 26/26 | 20/20 | **0/160** |
+| signed-on | none | 0.583 | 0.579 | 0.737 | 22/26 | 18/20 | 3/160 |
+| signed-on | U2 | 0.727 | 0.673 | 0.806 | 22/26 | 18/20 | **4/160** |
+| signed-on | U5 | 0.583 | 0.612 | 0.874 | 26/26 | 20/20 | 0/160 |
+| signed-on | U25 | **0.734** | 0.708 | 0.933 | 26/26 | 20/20 | **0/160** |
+| role-for | none / U2 / U25 | 0.640 / 0.727 / 0.727 | 0.637 / 0.683 / 0.683 | 0.934 / 0.979 / 0.979 | 26/26 | 20/20 | 0/160 |
+| new-chapter | none / U2 / U25 | 0.597 / 0.741 / 0.741 | 0.535 / 0.623 / 0.623 | 0.755 / 0.816 / 0.816 | 19/26 | 16/20 | 0/160 |
+
+By identity, U25 against no unit: no steals, no new wrong transitions, 12-21 current employers added to the live read
+on role-for, new-chapter, paren-move and signed-on, and 44-165 correct transitions added (U5's ends). U25's live-edge
+recall equals or exceeds U2's on every phrasing (the extra 0.007 on paren-move and signed-on is an employer U5's
+end/start pair now keeps live), and on the eight phrasings without these role shapes it changes nothing U5 alone does
+not. The package of the amended family, {U1, U25, U34, U6} = all six units, is the "all" arm in the tables below and passes the
+frozen examples (`test/q2-typing-package.test.ts`); `bun scripts/q2-typing-package.ts --base <ref> --arm U25` and
+`--units U25,U1,U34,U6` build its refs.
 
 ## Identity tables (all phrasings, both seeds, arm vs no unit)
 
@@ -58,27 +92,28 @@ single-value pass (`scripts/q2-typing-dev.ts`).
 | U3 | 0 | 0 | 28 | 0 | 28 | 0 | 0 | 0 | 0 |
 | U4 | 0 | 0 | 0 | 0 | 570 | 0 | 0 | 0 | 0 |
 | U34 | 0 | 0 | 28 | 0 | 570 | 0 | 0 | 0 | 0 |
-| U5 | 0 | 0 | 0 | 0 | 0 | 312 | 0 | 0 | 0 |
+| U5 | 0 | 0 | 0 | 0 | 0 | 331 | 0 | 0 | 0 |
+| U25 | 0 | 73 | 0 | 0 | 0 | 358 | 0 | 0 | 73 |
 | U6 | 0 | 0 | 0 | 0 | 0 | 61 | 0 | 0 | 0 |
-| all | 0 | 249 | 49 | 0 | 570 | 692 | 0 | 0 | 73 |
+| all | 0 | 249 | 49 | 0 | 570 | 718 | 0 | 0 | 73 |
 
 Correct `works_at` transitions by identity, starts · ends · wrong transitions (all works_at starts and ends not in the
 ledger), per phrasing (seeds 3 and 5; 496 ledger starts, 285 ledger ends):
 
-| phrasing | none | U1 | U2 | U3 | U4 | U34 | U5 | U6 | all |
-|---|---|---|---|---|---|---|---|---|---|
-| A | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 0 |
-| A2 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 0 | 444/496 · 261/285 · 0 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 0 |
-| A3 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 0 | 338/496 · 219/285 · 0 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 0 |
-| role-for | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 0 | 231/496 · 241/285 · 0 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 0 |
-| new-chapter | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 0 | 231/496 · 157/285 · 0 | 231/496 · 157/285 · 33 | 243/496 · 157/285 · 33 | 257/496 · 157/285 · 0 |
-| paren-move | 330/496 · 186/285 · 33 | 330/496 · 186/285 · 33 | 342/496 · 186/285 · 33 | 330/496 · 186/285 · 33 | 330/496 · 186/285 · 0 | 330/496 · 186/285 · 0 | 330/496 · 218/285 · 33 | 330/496 · 186/285 · 33 | 342/496 · 218/285 · 0 |
-| signed-on | 339/496 · 186/285 · 33 | 339/496 · 186/285 · 33 | 354/496 · 186/285 · 33 | 339/496 · 186/285 · 33 | 339/496 · 186/285 · 0 | 339/496 · 186/285 · 0 | 339/496 · 221/285 · 33 | 339/496 · 186/285 · 33 | 354/496 · 221/285 · 0 |
-| adviser | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 0 |
-| board-investor | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 0 |
-| board-director | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 72 | 479/496 · 282/285 · 0 | 479/496 · 282/285 · 0 | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 0 |
-| leave-start-idioms | 231/496 · 157/285 · 48 | 231/496 · 157/285 · 48 | 231/496 · 157/285 · 48 | 231/496 · 157/285 · 48 | 231/496 · 157/285 · 0 | 231/496 · 157/285 · 0 | 282/496 · 252/285 · 48 | 258/496 · 157/285 · 48 | 376/496 · 261/285 · 0 |
-| onboarding | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 0 | 231/496 · 157/285 · 0 | 231/496 · 256/285 · 33 | 253/496 · 157/285 · 33 | 361/496 · 278/285 · 0 |
+| phrasing | none | U1 | U2 | U3 | U4 | U34 | U5 | U25 | U6 | all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 0 |
+| A2 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 0 | 444/496 · 261/285 · 0 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 48 | 444/496 · 261/285 · 0 |
+| A3 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 0 | 338/496 · 219/285 · 0 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 37 | 338/496 · 219/285 · 0 |
+| role-for | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 0 | 231/496 · 241/285 · 0 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 37 | 231/496 · 241/285 · 0 |
+| new-chapter | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 0 | 231/496 · 157/285 · 0 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 243/496 · 157/285 · 33 | 257/496 · 157/285 · 0 |
+| paren-move | 330/496 · 186/285 · 33 | 330/496 · 186/285 · 33 | 342/496 · 186/285 · 33 | 330/496 · 186/285 · 33 | 330/496 · 186/285 · 0 | 330/496 · 186/285 · 0 | 330/496 · 218/285 · 33 | 342/496 · 218/285 · 33 | 330/496 · 186/285 · 33 | 342/496 · 218/285 · 0 |
+| signed-on | 339/496 · 186/285 · 33 | 339/496 · 186/285 · 33 | 354/496 · 186/285 · 33 | 339/496 · 186/285 · 33 | 339/496 · 186/285 · 0 | 339/496 · 186/285 · 0 | 339/496 · 221/285 · 33 | 354/496 · 221/285 · 33 | 339/496 · 186/285 · 33 | 354/496 · 221/285 · 0 |
+| adviser | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 48 | 475/496 · 282/285 · 0 |
+| board-investor | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 0 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 72 | 475/496 · 282/285 · 0 |
+| board-director | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 72 | 479/496 · 282/285 · 0 | 479/496 · 282/285 · 0 | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 100 | 479/496 · 282/285 · 0 |
+| leave-start-idioms | 231/496 · 157/285 · 48 | 231/496 · 157/285 · 48 | 231/496 · 157/285 · 48 | 231/496 · 157/285 · 48 | 231/496 · 157/285 · 0 | 231/496 · 157/285 · 0 | 282/496 · 271/285 · 48 | 282/496 · 271/285 · 48 | 258/496 · 157/285 · 48 | 383/496 · 280/285 · 0 |
+| onboarding | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 33 | 231/496 · 157/285 · 0 | 231/496 · 157/285 · 0 | 231/496 · 256/285 · 33 | 231/496 · 256/285 · 33 | 253/496 · 157/285 · 33 | 361/496 · 278/285 · 0 |
 
 ## Runner metrics (temporal-edges, seeds 3 and 5, `--e5-probe --pack works-at-one-per-from --single-value-pass`)
 
@@ -87,28 +122,24 @@ Primary metrics on development data:
 | Unit | Primary metric | Development effect |
 |---|---|---|
 | U1 | advisor-trap accuracy | signed-on 0/28 → 28/28, adviser 0/28 → 28/28; flat elsewhere |
-| U2 | live-edge recall | role-for 0.640 → 0.727, new-chapter 0.597 → 0.741, paren-move 0.597 → 0.734, signed-on 0.583 → 0.727; flat elsewhere |
+| U2 (U25) | live-edge recall | role-for 0.640 → 0.727, new-chapter 0.597 → 0.741, paren-move 0.597 → 0.734, signed-on 0.583 → 0.727; flat elsewhere |
 | U3 (U34) | investment-trap accuracy | flat on every phrasing (no development investment line is typed `works_at` by board wording); board-director live recall 0.712 → 0.899, now-precision 0.766 → 1.000 |
 | U4 (U34) | false employment starts per E5 probe person | removes all 33-100 wrong starts per phrasing (identity); E5 extra starts and E5 wrong closures 0 on every phrasing |
-| U5 | correct end transitions | paren-move 186 → 218/285, signed-on 186 → 221, leave-start-idioms 157 → 252, onboarding 157 → 256 |
+| U5 | correct end transitions | paren-move 186 → 218/285, signed-on 186 → 221, leave-start-idioms 157 → 271, onboarding 157 → 256 |
 | U6 | correct start transitions | new-chapter 231 → 243/496, leave-start-idioms 231 → 258, onboarding 231 → 253 |
 
 Residuals the safety conditions may see:
 
-- **U2, general single-value pass:** +1 wrong closure on paren-move (3 → 4/160) and signed-on (3 → 4/160). A former
-  employer master already keeps live (its leave, "Exit from" / "Handed in her notice at", is unread without U5) is
-  closed at the date of the newly typed current employer's start, not at its true end. The closure is wrong by date
-  only, on a relationship master already had wrong. With U5 in the package it disappears (all-unit arm: 0/160). I left
-  it rather than drop U2; drop U2 if the preregistered "new wrong transitions = 0" bar should apply to it on
-  development data too.
+- **U2 alone, general single-value pass:** +1 wrong closure on paren-move and on signed-on. Resolved by the joint unit
+  U25 (next section); U2 is no longer measured alone.
 - **U6 alone:** as-of exact moves by -0.002 to -0.004 on three phrasings (new-chapter 0.535 → 0.531, onboarding
   0.598 → 0.596; leave-start-idioms during-F1 0.819 → 0.815): a correctly dated restart hides an earlier stint whose
   start no cue reads. No new wrong transition by identity.
-- Trap counts: no unit lowers any trap family on any phrasing; U5 raises investment and alumni traps where leaves were
-  unread.
+- Trap counts: after U5's share-trade rework no unit lowers any trap family on any phrasing; U5 raises investment and
+  alumni traps where leaves were unread (leave-start-idioms 17 → 26/26 and 14 → 20/20).
 
-Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c6655db2`; U1 and all-units arms on
-`61934b56`):
+Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts`; U2, U3, U4, U34 and U6 on `c6655db2`, U1 on
+`61934b56`, U5, U25 and all units ({U1, U25, U34, U6}) on `5a9efd08`):
 
 #### A
 
@@ -121,6 +152,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U5 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 48/72 | 24/72 | 0/160 |
+| U25 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 48/72 | 24/72 | 0/160 |
 | U6 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 48/72 | 24/72 | 0/160 |
 | all | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
@@ -135,6 +167,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.827 | 0.892 | 0.890 | 1.000 | 0.829 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.827 | 0.892 | 0.890 | 1.000 | 0.829 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U5 | 0.827 | 0.892 | 0.890 | 1.000 | 0.829 | 28/28 | 26/26 | 20/20 | 48/72 | 24/72 | 0/160 |
+| U25 | 0.827 | 0.892 | 0.890 | 1.000 | 0.829 | 28/28 | 26/26 | 20/20 | 48/72 | 24/72 | 0/160 |
 | U6 | 0.827 | 0.892 | 0.890 | 1.000 | 0.829 | 28/28 | 26/26 | 20/20 | 48/72 | 24/72 | 0/160 |
 | all | 0.827 | 0.892 | 0.890 | 1.000 | 0.829 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
@@ -149,6 +182,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.633 | 0.648 | 0.628 | 0.886 | 0.642 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.633 | 0.648 | 0.628 | 0.886 | 0.642 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U5 | 0.633 | 0.648 | 0.628 | 0.886 | 0.642 | 28/28 | 26/26 | 20/20 | 21/72 | 8/72 | 0/160 |
+| U25 | 0.633 | 0.648 | 0.628 | 0.886 | 0.642 | 28/28 | 26/26 | 20/20 | 21/72 | 8/72 | 0/160 |
 | U6 | 0.633 | 0.648 | 0.628 | 0.886 | 0.642 | 28/28 | 26/26 | 20/20 | 21/72 | 8/72 | 0/160 |
 | all | 0.633 | 0.692 | 0.642 | 0.958 | 0.642 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
@@ -163,6 +197,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.640 | 0.637 | 0.648 | 0.934 | 0.640 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.640 | 0.637 | 0.648 | 0.934 | 0.640 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U5 | 0.640 | 0.637 | 0.648 | 0.934 | 0.640 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
+| U25 | 0.727 | 0.683 | 0.715 | 0.979 | 0.724 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U6 | 0.640 | 0.637 | 0.648 | 0.934 | 0.640 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | all | 0.727 | 0.683 | 0.715 | 0.979 | 0.724 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
@@ -177,6 +212,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.597 | 0.535 | 0.552 | 0.755 | 0.602 | 28/28 | 19/26 | 16/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.597 | 0.535 | 0.552 | 0.755 | 0.602 | 28/28 | 19/26 | 16/20 | 0/72 | 0/72 | 0/160 |
 | U5 | 0.597 | 0.535 | 0.552 | 0.755 | 0.602 | 28/28 | 19/26 | 16/20 | 0/72 | 0/72 | 0/160 |
+| U25 | 0.741 | 0.623 | 0.656 | 0.816 | 0.753 | 28/28 | 19/26 | 16/20 | 0/72 | 0/72 | 0/160 |
 | U6 | 0.597 | 0.531 | 0.552 | 0.755 | 0.602 | 28/28 | 19/26 | 16/20 | 0/72 | 0/72 | 0/160 |
 | all | 0.741 | 0.660 | 0.669 | 0.869 | 0.753 | 28/28 | 19/26 | 16/20 | 0/72 | 0/72 | 0/160 |
 
@@ -191,6 +227,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.597 | 0.640 | 0.608 | 0.793 | 0.602 | 28/28 | 22/26 | 18/20 | 0/72 | 0/72 | 3/160 |
 | U34 | 0.597 | 0.640 | 0.608 | 0.793 | 0.602 | 28/28 | 22/26 | 18/20 | 0/72 | 0/72 | 3/160 |
 | U5 | 0.597 | 0.671 | 0.623 | 0.958 | 0.602 | 28/28 | 26/26 | 20/20 | 14/72 | 5/72 | 0/160 |
+| U25 | 0.741 | 0.760 | 0.727 | 1.000 | 0.753 | 28/28 | 26/26 | 20/20 | 14/72 | 5/72 | 0/160 |
 | U6 | 0.597 | 0.640 | 0.608 | 0.793 | 0.602 | 28/28 | 22/26 | 18/20 | 14/72 | 5/72 | 3/160 |
 | all | 0.741 | 0.760 | 0.727 | 1.000 | 0.753 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
@@ -205,6 +242,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.583 | 0.579 | 0.583 | 0.737 | 0.589 | 0/28 | 22/26 | 18/20 | 0/72 | 0/72 | 3/160 |
 | U34 | 0.583 | 0.579 | 0.583 | 0.737 | 0.589 | 0/28 | 22/26 | 18/20 | 0/72 | 0/72 | 3/160 |
 | U5 | 0.583 | 0.612 | 0.598 | 0.874 | 0.589 | 0/28 | 26/26 | 20/20 | 16/72 | 7/72 | 0/160 |
+| U25 | 0.734 | 0.708 | 0.708 | 0.933 | 0.747 | 0/28 | 26/26 | 20/20 | 16/72 | 7/72 | 0/160 |
 | U6 | 0.583 | 0.579 | 0.583 | 0.737 | 0.589 | 0/28 | 22/26 | 18/20 | 16/72 | 7/72 | 3/160 |
 | all | 0.734 | 0.758 | 0.723 | 1.000 | 0.747 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
@@ -219,6 +257,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.871 | 0.883 | 0.906 | 0.945 | 0.867 | 0/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.871 | 0.883 | 0.906 | 0.945 | 0.867 | 0/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U5 | 0.871 | 0.883 | 0.906 | 0.945 | 0.867 | 0/28 | 26/26 | 20/20 | 48/72 | 24/72 | 0/160 |
+| U25 | 0.871 | 0.883 | 0.906 | 0.945 | 0.867 | 0/28 | 26/26 | 20/20 | 48/72 | 24/72 | 0/160 |
 | U6 | 0.871 | 0.883 | 0.906 | 0.945 | 0.867 | 0/28 | 26/26 | 20/20 | 48/72 | 24/72 | 0/160 |
 | all | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
@@ -233,6 +272,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U5 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 72/72 | 36/72 | 0/160 |
+| U25 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 72/72 | 36/72 | 0/160 |
 | U6 | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 72/72 | 36/72 | 0/160 |
 | all | 0.871 | 0.933 | 0.921 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
@@ -247,6 +287,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.899 | 0.783 | 0.890 | 0.803 | 0.896 | 0/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.899 | 0.950 | 0.940 | 1.000 | 0.896 | 0/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U5 | 0.712 | 0.946 | 0.931 | 0.766 | 0.719 | 0/28 | 26/26 | 20/20 | 72/72 | 36/72 | 26/160 |
+| U25 | 0.712 | 0.946 | 0.931 | 0.766 | 0.719 | 0/28 | 26/26 | 20/20 | 72/72 | 36/72 | 26/160 |
 | U6 | 0.712 | 0.946 | 0.931 | 0.766 | 0.719 | 0/28 | 26/26 | 20/20 | 72/72 | 36/72 | 26/160 |
 | all | 0.899 | 0.950 | 0.940 | 1.000 | 0.896 | 0/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
@@ -260,9 +301,10 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U3 | 0.871 | 0.750 | 0.819 | 0.787 | 0.867 | 28/28 | 17/26 | 14/20 | 0/72 | 0/72 | 0/160 |
 | U4 | 0.871 | 0.750 | 0.819 | 0.787 | 0.867 | 28/28 | 17/26 | 14/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.871 | 0.750 | 0.819 | 0.787 | 0.867 | 28/28 | 17/26 | 14/20 | 0/72 | 0/72 | 0/160 |
-| U5 | 0.871 | 0.800 | 0.880 | 0.921 | 0.867 | 28/28 | 16/26 | 18/20 | 0/72 | 0/72 | 0/160 |
+| U5 | 0.871 | 0.821 | 0.897 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
+| U25 | 0.871 | 0.821 | 0.897 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U6 | 0.871 | 0.750 | 0.815 | 0.787 | 0.867 | 28/28 | 17/26 | 14/20 | 0/72 | 0/72 | 0/160 |
-| all | 0.871 | 0.883 | 0.903 | 0.940 | 0.867 | 28/28 | 18/26 | 18/20 | 0/72 | 0/72 | 0/160 |
+| all | 0.871 | 0.912 | 0.918 | 1.000 | 0.867 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 
 #### onboarding
 
@@ -275,6 +317,7 @@ Full per-arm runner tables (refs built by `scripts/q2-typing-package.ts` on `c66
 | U4 | 0.633 | 0.598 | 0.635 | 0.655 | 0.633 | 28/28 | 17/26 | 14/20 | 0/72 | 0/72 | 0/160 |
 | U34 | 0.633 | 0.598 | 0.635 | 0.655 | 0.633 | 28/28 | 17/26 | 14/20 | 0/72 | 0/72 | 0/160 |
 | U5 | 0.633 | 0.631 | 0.708 | 0.900 | 0.633 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
+| U25 | 0.633 | 0.631 | 0.708 | 0.900 | 0.633 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 | U6 | 0.633 | 0.596 | 0.631 | 0.655 | 0.633 | 28/28 | 17/26 | 14/20 | 0/72 | 0/72 | 0/160 |
 | all | 0.633 | 0.785 | 0.752 | 0.958 | 0.633 | 28/28 | 26/26 | 20/20 | 0/72 | 0/72 | 0/160 |
 

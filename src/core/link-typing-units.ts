@@ -28,11 +28,12 @@ export function activeTypingUnits(): TypingUnit[] {
 }
 
 /**
- * Joint units: ids that stand for several units measured together. U34 is U3 with U4: the development trace showed
- * U4 alone loses as-of accuracy wherever board wording still types works_at (the set-F interaction), which U3 removes
- * (docs/eval/decisions/q2-parser-gaps/dev-units.md).
+ * Joint units: ids that stand for several units measured together (docs/eval/decisions/q2-parser-gaps/dev-units.md,
+ * "Dependency units"). U34 is U3 with U4: U4 alone loses as-of accuracy wherever board wording still types works_at
+ * (the set-F interaction), which U3 removes. U25 is U2 with U5: U2 alone lets the single-value pass close a former
+ * employer whose leave only U5 reads at the new employer's start date (a wrong closure by date), which U5 removes.
  */
-export const JOINT_TYPING_UNITS: Readonly<Record<string, readonly TypingUnit[]>> = { U34: ['U3', 'U4'] };
+export const JOINT_TYPING_UNITS: Readonly<Record<string, readonly TypingUnit[]>> = { U25: ['U2', 'U5'], U34: ['U3', 'U4'] };
 
 export function parseTypingUnits(units: Iterable<string>): TypingUnit[] {
   const out: TypingUnit[] = [];
@@ -229,6 +230,8 @@ const LEAVE_OBJECT = String.raw`(?:(?:her|his|their|my|a|the)\s+)?(?:time|stint|
 const SPLIT_LEAVE = String.raw`(?:wrapped|wound|finished)\s+${LEAVE_OBJECT}up\s+(?:at|with)|(?:handed|turned|put)\s+(?:in\s+${LEAVE_OBJECT}|${LEAVE_OBJECT}in\s+)(?:at|to|with)|(?:gave|submitted|tendered)\s+${LEAVE_OBJECT}(?:at|to)`;
 const IDIOM_LEAVE = String.raw`packed\s+(?:it|things)\s+in\s+(?:at|with)|call(?:ed|s|ing)?\s+(?:it\s+)?time\s+(?:on|at)|call(?:ed|s|ing)?\s+it\s+a\s+day\s+(?:at|with)|call(?:ed|s|ing)?\s+it\s+quits\s+(?:at|with)|bow(?:ed|s|ing)?\s+out\s+(?:of|from|at)|walk(?:ed|s|ing)?\s+(?:out\s+(?:of|on)|away\s+from)|thr(?:ew|ows|owing)\s+in\s+the\s+towel\s+(?:at|with)|hand(?:ed|s|ing)?\s+in\s+(?:(?:her|his|their|my)\s+)?(?:badge|keys|laptop)\s+(?:at|to)|clear(?:ed|s|ing)?\s+out\s+(?:(?:her|his|their|my)\s+)?desk\s+at|gave\s+up\s+(?:(?:her|his|their|my)\s+)?(?:job|role|post|position|seat)\s+at|left\s+(?:(?:her|his|their|my)\s+)?(?:job|role|post|position)\s+at|step(?:ped|s|ping)?\s+back\s+from|parted\s+company\s+with|said\s+(?:(?:her|his|their|my)\s+)?goodbyes?\s+to|bid(?:\s+a)?\s+farewell\s+to|exit\s+from`;
 export const U5_LEAVE = new RegExp(String.raw`\b(?:${SPLIT_LEAVE}|${IDIOM_LEAVE})\s*$`, 'i');
+/** Lines about trading an organization's equity ("Traded shares of [X]") say nothing about a job: the U5 and U6 guards ignore them. */
+export const GUARD_IGNORED_LINE = /\b(?:shares?|stock|equity|stake|stock\s+options|secondary\s+market|bought|sold)\b/i;
 /** U5: "traded [A] for [B]" ends A (the "for" then starts B). "Traded shares of [A]" is not an exchange. */
 export const U5_EXCHANGE_BEFORE = /\b(?:traded|swapped|exchanged|ditched|dropped)\s*$/i;
 export const U5_EXCHANGE_AFTER = /^\s+for\s+(?:\[|the\s+\[|an?\s+\[)/i;
