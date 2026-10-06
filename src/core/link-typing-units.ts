@@ -27,13 +27,21 @@ export function activeTypingUnits(): TypingUnit[] {
   return TYPING_UNITS.filter(typingUnitEnabled);
 }
 
+/**
+ * Joint units: ids that stand for several units measured together. U34 is U3 with U4: the development trace showed
+ * U4 alone loses as-of accuracy wherever board wording still types works_at (the set-F interaction), which U3 removes
+ * (docs/eval/decisions/q2-parser-gaps/dev-units.md).
+ */
+export const JOINT_TYPING_UNITS: Readonly<Record<string, readonly TypingUnit[]>> = { U34: ['U3', 'U4'] };
+
 export function parseTypingUnits(units: Iterable<string>): TypingUnit[] {
   const out: TypingUnit[] = [];
   for (const raw of units) {
     const u = raw.trim().toUpperCase();
     if (!u) continue;
+    if (JOINT_TYPING_UNITS[u]) { for (const j of JOINT_TYPING_UNITS[u]!) if (!out.includes(j)) out.push(j); continue; }
     if (!(TYPING_UNITS as readonly string[]).includes(u)) {
-      throw new Error(`Unknown typing unit "${raw}". The units are ${TYPING_UNITS.join(', ')} (src/core/link-typing-units.ts); pass a comma-separated subset.`);
+      throw new Error(`Unknown typing unit "${raw}". The units are ${TYPING_UNITS.join(', ')} and the joint ${Object.keys(JOINT_TYPING_UNITS).join(', ')} (src/core/link-typing-units.ts); pass a comma-separated subset.`);
     }
     if (!out.includes(u as TypingUnit)) out.push(u as TypingUnit);
   }
