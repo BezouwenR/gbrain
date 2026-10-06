@@ -25,6 +25,7 @@ import {
   type TransitionKind, type TransitionProducer,
 } from './link-validity.ts';
 import { KNOWN_LINK_TYPES } from './search/relational-intent.ts';
+import { U4_NOT_EMPLOYMENT_ROLE, typingUnitEnabled } from './link-typing-units.ts';
 
 export interface OwnedRow {
   from_slug: string;
@@ -67,9 +68,12 @@ const NOT_PAST_ROLE = String.raw`(?!(?:promoted|hired|named|appointed|made|elect
 const NOT_PERFECT = String.raw`(?<!\b(?:has|have|'s|’s)\s+(?:\w+\s+)?)`;
 const OWNED = String.raw`(?:(?:her|his|their|my|the)\s+)?(?:time|stint|tenure|role|job|run)\s+`;
 
+/** Employment start cues; `notJob` guards the "became … at/of" and "took … role at" forms (U4). */
+const employmentStart = (notJob: string) => new RegExp(String.raw`\b(?:(?:re-?)?join(?:ed|s|ing)?(?:\s+${ROLE}(?:at|as))?|(?:was\s+)?hired\s+(?:by|at|as\s+${ROLE}at)|started\s+(?:at|with|working\s+(?:at|for)|(?:a\s+)?new\s+(?:role|job|position)\s+at)|became\s+${notJob}${ROLE}(?:at|of)|promoted\s+to\s+${ROLE}(?:at|of)|signed\s+on\s+(?:at|with)|named\s+${ROLE}(?:at|of)|accepted\s+(?:an?\s+)?(?:offer|role|position|job)\s+(?:at|with|from)|took\s+(?:an?\s+|the\s+)?${notJob}(?:\w+\s+){0,2}?(?:role|job|position)\s+(?:at|with)|came\s+(?:on\s+board|aboard)\s+(?:at|with)|went\s+to\s+work\s+(?:at|for)|returned\s+to)\s*$`, 'i');
+
 const EMPLOYMENT = {
   end: new RegExp(String.raw`\b(?:left|leaving|departed(?:\s+from)?|quit|resigned(?:\s+as\s+${ROLE})?(?:\s+from|\s+at)?|stepped\s+down(?:\s+as\s+${ROLE})?(?:\s+from|\s+at)?|stepped\s+away\s+from|moved\s+on\s+from|(?:moved|switched|transitioned|jumped)\s+(?:over\s+|out\s+)?from|(?:was\s+)?laid\s+off\s+(?:from|by|at)|(?:was\s+)?let\s+go\s+(?:from|by)|(?:was\s+)?fired\s+(?:from|by)|no\s+longer\s+(?:at|with|works\s+at|working\s+at)|exited|parted\s+ways\s+with|retired\s+from|(?:wrapped\s+up|finished|ended|concluded)\s+(?:${OWNED})?(?:at|with)|last\s+day\s+at|departure\s+from)\s*$`, 'i'),
-  start: new RegExp(String.raw`\b(?:(?:re-?)?join(?:ed|s|ing)?(?:\s+${ROLE}(?:at|as))?|(?:was\s+)?hired\s+(?:by|at|as\s+${ROLE}at)|started\s+(?:at|with|working\s+(?:at|for)|(?:a\s+)?new\s+(?:role|job|position)\s+at)|became\s+${ROLE}(?:at|of)|promoted\s+to\s+${ROLE}(?:at|of)|signed\s+on\s+(?:at|with)|named\s+${ROLE}(?:at|of)|accepted\s+(?:an?\s+)?(?:offer|role|position|job)\s+(?:at|with|from)|took\s+(?:an?\s+|the\s+)?(?:\w+\s+){0,2}?(?:role|job|position)\s+(?:at|with)|came\s+(?:on\s+board|aboard)\s+(?:at|with)|went\s+to\s+work\s+(?:at|for)|returned\s+to)\s*$`, 'i'),
+  start: employmentStart(''),
   past: new RegExp(String.raw`\b(?:previously(?:\s+worked)?\s+(?:at|with|for)|formerly(?:\s+${ROLE})?\s*(?:at|of|with)|former\s+${ROLE}(?:at|of|with)|ex-[\w-]+\s+(?:at|of)|used\s+to\s+work\s+(?:at|for)|${NOT_PERFECT}worked\s+(?:at|for|with)|${NOT_PERFECT}spent\s+(?:[\w-]+\s+){1,4}?(?:at|with)|(?:his|her|their|my)\s+(?:time|stint|tenure)\s+at|stint\s+at|was\s+${NOT_PAST_ROLE}${ROLE}(?:at|of)|alum(?:nus|na|ni)?\s+of)\s*$`, 'i'),
 };
 
@@ -105,9 +109,12 @@ const EVENT_START: Record<string, RegExp> = {
   founded: /\b(?:founded|co-?founded|started)\s*$/i,
 };
 
+/** U4 (src/core/link-typing-units.ts): the employment cues with advisory, board and investor roles kept out of the start cue. */
+const EMPLOYMENT_U4 = { ...EMPLOYMENT, start: employmentStart(U4_NOT_EMPLOYMENT_ROLE) };
+
 type CueSet = { end: RegExp; start: RegExp; past: RegExp };
 function cuesFor(linkType: string): CueSet | null {
-  if (linkType === 'works_at') return EMPLOYMENT;
+  if (linkType === 'works_at') return typingUnitEnabled('U4') ? EMPLOYMENT_U4 : EMPLOYMENT;
   if (linkType === 'advises') return ADVISORY;
   if (linkType === 'yc_partner') return PARTNER;
   return null;

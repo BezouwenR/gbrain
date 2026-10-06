@@ -145,3 +145,11 @@ export function unitOfRule(id: string | null | undefined): TypingUnit | null {
   const m = /^unit\.u(\d)\./.exec(id ?? '');
   return m ? (`U${m[1]}` as TypingUnit) : null;
 }
+
+// ─── Temporal cue hooks (link-temporal-evidence.ts) ─────────────────────
+
+/**
+ * U4: advisory, board and investor roles are not jobs. Inserted into the "became … at/of" and "took … role at"
+ * employment start cues, so "Became an advisor at [X]" or "Took an advisory role with [X]" never starts a works_at stint.
+ */
+export const U4_NOT_EMPLOYMENT_ROLE = String.raw`(?!(?:\w+\s+){0,2}?(?:advis\w*|board|investor|investing|investment|angel|observer|non-executive|independent|trustee)\b)`;

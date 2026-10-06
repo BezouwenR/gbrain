@@ -171,7 +171,7 @@ export function compareDumps(base: Dump, arm: Dump) {
   const key = (p: PersonDump) => `${p.seed}:${p.slug}`;
   const armBy = new Map(arm.people.map(p => [key(p), p]));
   const steals: Array<Row> = []; const gains: Array<Row> = []; const moves: Array<Row> = [];
-  const newWrong: string[] = []; const fixed: string[] = []; const missing: string[] = [];
+  const newWrong: string[] = []; const removedWrong: string[] = []; const fixed: string[] = []; const missing: string[] = [];
   const liveLost: string[] = []; const liveGained: string[] = [];
   for (const b of base.people) {
     const a = armBy.get(key(b));
@@ -182,6 +182,7 @@ export function compareDumps(base: Dump, arm: Dump) {
     for (const t of at) if (!bt.has(t) && !gold.has(t)) newWrong.push(`s${b.seed} ${t}`);
     for (const t of at) if (!bt.has(t) && gold.has(t)) fixed.push(`s${b.seed} ${t}`);
     for (const t of bt) if (!at.has(t) && gold.has(t)) missing.push(`s${b.seed} ${t}`);
+    for (const t of bt) if (!at.has(t) && !gold.has(t)) removedWrong.push(`s${b.seed} ${t}`);
     const targets = new Set([...b.links, ...a.links].map(x => x.to));
     for (const to of targets) {
       const tb = typesOf(b, to); const ta = typesOf(a, to);
@@ -204,7 +205,7 @@ export function compareDumps(base: Dump, arm: Dump) {
       if (!lb.has(c) && la.has(c)) liveGained.push(`s${b.seed} ${b.slug} -> ${c}`);
     }
   }
-  return { steals, gains, moves, newWrong, fixed, missing, liveLost, liveGained };
+  return { steals, gains, moves, newWrong, removedWrong, fixed, missing, liveLost, liveGained };
 }
 
 function printCompare(base: Dump, arm: Dump, json: boolean): void {
@@ -214,11 +215,12 @@ function printCompare(base: Dump, arm: Dump, json: boolean): void {
     ...rows.map(r => `| ${r.seed} | ${r.subject} | ${r.target} | ${r.ledger} | ${r.gold} | ${r.base} | ${r.arm} |`)].join('\n') : '(none)';
   const list = (xs: string[]) => xs.length ? xs.map(x => `- ${x}`).join('\n') : '(none)';
   console.log(`base ${base.root} units ${base.units?.join(',') ?? 'default'}; arm ${arm.root} units ${arm.units?.join(',') ?? 'default'}; phrasing ${arm.phrasing}`);
-  console.log(`steals ${c.steals.length}, gains ${c.gains.length}, other moves ${c.moves.length}, new wrong transitions ${c.newWrong.length}, fixed ${c.fixed.length}, missing correct ${c.missing.length}, live lost ${c.liveLost.length}, live gained ${c.liveGained.length}`);
+  console.log(`steals ${c.steals.length}, gains ${c.gains.length}, other moves ${c.moves.length}, new wrong transitions ${c.newWrong.length}, wrong removed ${c.removedWrong.length}, fixed ${c.fixed.length}, missing correct ${c.missing.length}, live lost ${c.liveLost.length}, live gained ${c.liveGained.length}`);
   console.log(`\n### Type steals (base matched the ledger, arm does not)\n${table(c.steals)}`);
   console.log(`\n### Type gains\n${table(c.gains)}`);
   console.log(`\n### Other type moves\n${table(c.moves)}`);
   console.log(`\n### New wrong transitions\n${list(c.newWrong)}`);
+  console.log(`\n### Wrong transitions removed\n${list(c.removedWrong)}`);
   console.log(`\n### Fixed transitions\n${list(c.fixed)}`);
   console.log(`\n### Missing correct transitions\n${list(c.missing)}`);
   console.log(`\n### Current employers lost from the live read\n${list(c.liveLost)}`);

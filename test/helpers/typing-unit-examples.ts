@@ -23,8 +23,8 @@ export interface Expectation {
 
 export interface TypingExample {
   id: string;
-  /** The unit this example measures, or null for a control that no unit may change. */
-  unit: TypingUnit | null;
+  /** The unit (or units, for a joint effect) this example measures, or null for a control that no unit may change. */
+  unit: TypingUnit | TypingUnit[] | null;
   target: string;
   content: string;
   pageType?: 'person' | 'company' | 'concept';
@@ -41,7 +41,8 @@ export const page = (prose: string, timeline: string[] = []) =>
   timeline.length ? `${prose}\n\n## Timeline\n\n${timeline.map(l => `- ${l}`).join('\n')}\n` : `${prose}\n`;
 
 export function expected(ex: TypingExample, units: ReadonlySet<TypingUnit>): Expectation {
-  if (!ex.unit || !ex.on || !units.has(ex.unit)) return ex.off;
+  const mine = ex.unit === null ? [] : Array.isArray(ex.unit) ? ex.unit : [ex.unit];
+  if (!ex.on || !mine.some(u => units.has(u))) return ex.off;
   return typeof ex.on === 'function' ? ex.on(units) : ex.on;
 }
 
@@ -141,10 +142,45 @@ const U3: TypingExample[] = [
     content: page(`Alice is VP engineering at ${L(BETA)} and a board director at ${L(ACME)}.`), off: { types: ['works_at'] }, on: { types: ['mentions'] } },
   // The set-F interaction: a board line is the only statement about the company. Master reads a job that starts on
   // the board date; U4 alone keeps the job but drops its start (live on every date); U3 removes the job.
-  { id: 'u34-board-only-target', unit: 'U3', target: ACME,
+  { id: 'u34-board-only-target', unit: ['U3', 'U4'], target: ACME,
     content: page(`Alice works at ${L(BETA)} as engineer.`, [`**2022-03-04** | note — Became a board director at ${L(ACME)}`]),
     off: { types: ['works_at'], transitions: ['works_at start 2022-03-04'], live: { type: 'works_at', at: { '2020-01-01': false, today: true } } },
-    on: { types: ['mentions'], transitions: [] } },
+    on: units => units.has('U3') ? { types: ['mentions'], transitions: [] }
+      : { types: ['works_at'], transitions: [], live: { type: 'works_at', at: { '2020-01-01': true, today: true } } } },
 ];
 
-export const EXAMPLES: TypingExample[] = [...U1, ...U3];
+// ─── U4: advisory, board and investor roles are not employment starts ──
+const E5_PAGE = (line: string, target = ACME) => page(`Alice works at ${L(ACME)} as CTO.`,
+  [`**2015-01-02** | linkedin — Joined ${L(ACME)} as CTO`, `**2021-06-07** | ${line.replace('{X}', L(target))}`]);
+const U4: TypingExample[] = [
+  { id: 'u4-became-advisor-at-employer', unit: 'U4', target: ACME, content: E5_PAGE('note — Became an advisor at {X}'),
+    off: { types: ['advises', 'mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at start 2021-06-07', 'advises start 2021-06-07'] },
+    on: { types: ['advises', 'mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'advises start 2021-06-07'],
+      live: { type: 'works_at', at: { '2016-01-01': true, today: true } } } },
+  { id: 'u4-took-advisory-role-with-employer', unit: 'U4', target: ACME, content: E5_PAGE('linkedin — Took an advisory role with {X}'),
+    off: { types: ['advises', 'mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at start 2021-06-07'] },
+    on: { types: ['advises', 'mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] } },
+  // U3 retypes the board line (mentions) but leaves its start cue; U4 drops the start (the job, stated in prose, stays undated).
+  { id: 'u4-took-board-role-at-other-employer', unit: ['U3', 'U4'], target: BETA,
+    content: page(`Alice works at ${L(ACME)} as CTO. She also works at ${L(BETA)}.`, [`**2021-06-07** | linkedin — Took a board role at ${L(BETA)}`]),
+    off: { types: ['works_at'], transitions: ['works_at start 2021-06-07'], live: { type: 'works_at', at: { '2020-01-01': false, today: true } } },
+    on: units => ({ types: units.has('U3') ? ['mentions', 'works_at'] : ['works_at'], transitions: units.has('U4') ? [] : ['works_at start 2021-06-07'],
+      live: { type: 'works_at', at: { '2020-01-01': units.has('U4'), today: true } } }) },
+  { id: 'u4-became-board-observer-of', unit: 'U4', target: BETA,
+    content: page(`Alice works at ${L(BETA)}.`, [`**2021-06-07** | note — Became a board observer of ${L(BETA)}`]),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2021-06-07'] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
+  { id: 'u4-became-cto-still-starts', unit: null, target: ACME, content: E5_PAGE('linkedin — Became CTO at {X}'),
+    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at start 2021-06-07'] } },
+  { id: 'u4-took-new-role-still-starts', unit: null, target: BETA,
+    content: page(`Alice works at ${L(BETA)}.`, [`**2021-06-07** | linkedin — Took a new engineering role at ${L(BETA)}`]),
+    off: { types: ['works_at'], transitions: ['works_at start 2021-06-07'] } },
+  // Unsupported, frozen: an advisory-services job title reads as an advisory role (no start with U4).
+  { id: 'u4-advisory-services-job-lookalike', unit: 'U4', target: BETA,
+    content: page(`Alice works at ${L(BETA)}.`, [`**2021-06-07** | linkedin — Became head of advisory services at ${L(BETA)}`]),
+    off: { types: ['works_at'], transitions: ['works_at start 2021-06-07'] }, on: { types: ['works_at'], transitions: [] } },
+  { id: 'u4-advisory-start-kept', unit: null, target: GLOBEX,
+    content: page(`Alice works at ${L(ACME)}. She advises ${L(GLOBEX)}.`, [`**2021-06-07** | note — Became an advisor to ${L(GLOBEX)}`]),
+    off: { types: ['advises'], transitions: ['advises start 2021-06-07'] } },
+];
+
+export const EXAMPLES: TypingExample[] = [...U1, ...U3, ...U4];
