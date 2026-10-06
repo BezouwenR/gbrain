@@ -82,6 +82,73 @@ the page states:
 Dated evidence beats undated evidence from any page: a closure on a person's timeline
 ends the relationship even if the company page still lists them under `key_people`.
 
+## Relationship phrasings: what each wording means
+
+Link typing reads what the sentence entails, nothing more. Each policy below is one
+rule family with a stable rule id; `explainLinkType` (`src/core/link-extraction.ts`)
+returns, for any page and target, the stated type, the pack rule, the deciding rule,
+how its verb attached to this link, the alternatives it suppressed, the role prior,
+and the cue behind every dated transition.
+
+Rows marked **U1–U6** are typing units under evaluation (decision
+`q2-parser-gaps-2026-10`; U3 and U4 are measured together as the joint unit U34). They are off by default: `ENABLED_TYPING_UNITS` in
+`src/core/link-typing-units.ts` is empty, so extraction behaves exactly as the
+unmarked rows describe. A unit ships only on its preregistered held-out verdict.
+
+| Policy | Supported examples | Type | Temporal evidence | Unsupported (stays as written) |
+|---|---|---|---|---|
+| Employment verbs (`verb.works_at`) | "works at [X]", "VP engineering at [X]", "joined as CTO", "head of sales" | `works_at` | "Joined/Left/Moved from [X]" date it (`cue.employment.*`) | a job title alone after the link ("Joined [X] as designer") |
+| Advisory verbs (`verb.advises`) | "advises [X]", "is an advisor to [X]", "joined the advisory board of [X]" | `advises` | "Became an advisor to", "Started advising", "stepped down as advisor to" (`cue.advisory.*`) | "advising [X]", the `adviser` spelling |
+| Investment verbs (`verb.invested_in`) | "invested in [X]", "led the seed", "wrote a check" | `invested_in` (event) | "Invested in", "led the … round" (`cue.event.invested_in`) | "as an angel investor" |
+| Board seat (`verb.invested_in.board_seat`) | "board seat at [X]" | `invested_in` | event start | — |
+| Role priors (`prior.investor` > `prior.advisor` > `prior.employee`) | a person page that says "partner at a venture fund", "is an advisor", "is a senior engineer at" | the prior's type, for person → company links no verb typed | none of its own | timeline and see-also links never get a prior |
+| **U1** adviser wording (`unit.u1.adviser`) | "is an adviser to [X]", "serves as an adviser to", "now advising [X]", "technical adviser at [X]" | `advises` | as advisory verbs | "financial adviser at [Bank]" (a job title); a third party's role ("her husband is an adviser to"); an adviser phrase in another sentence or timeline entry |
+| **U1** local negation (`unit.u1.negated`) | "not an advisor to [X]", "no longer advises [X]", "stopped advising [X]" | `mentions` for that occurrence | the dated "no longer advises" cue still ends an `advises` the page states elsewhere | negation more than a few words away |
+| **U2** ordinary roles (`unit.u2.*`), only where everything above gave `mentions` | "is CTO for [X]", "works as a designer for [X]", "led design at [X]", "now at [X] (product manager)", "signed on with [X] as CTO", "started a new chapter at [X] as designer" | `works_at` | dated by the employment cues of the timeline | dated timeline entries; an organization two or more dated entries mention; a page that names any organization in an advisory, board or investor role; negated, planned or interview clauses; third parties; board, observer, investor and advisory titles; company pages |
+| **U3** board wording (`unit.u3.board_wording`) | "board director at [X]", "independent director of [X]", "joined as an observer at [X]", "is also a board director at [X]" | `mentions` (a role prior may still apply) | none | board membership is not a type of its own |
+| **U3** board seat without investment (`unit.u3.board_seat_without_investment`) | "holds a board seat at [X]" on a page with no investor prior | `mentions`; `invested_in` with an investor prior or "… as an investor" in the clause | event start when typed | — |
+| **U4** not-employment starts | "Became an advisor at [X]", "Took an advisory role with [X]", "Took a board role at [X]" | unchanged | no `works_at` start (`cue.employment.start` skips advisory, board, investor, angel, observer roles) | "Joined the advisory board at [X]" still reads as a join; "head of advisory services" reads as advisory |
+| **U5** leave idioms (`unit.u5.leave`) and exchanges (`unit.u5.exchange`) | "handed in her notice at [X]", "wrapped her time up at", "packed it in", "called it a day at", "stepped back from", "parted company with", "said goodbye to", "exit from"; "swapped [A] for [B]" | unchanged | dated `works_at` end (and a start for B); dropped when a later dated entry names X in words no cue reads (a possible rejoin) | event lines ("…at the farewell dinner"), qualified references ("[X]'s old office"), "traded shares of [X]"; whose leave it is (a colleague's notice dates the subject's stint) |
+| **U6** start framings (`unit.u6.start_framing`) | "first day at [X]", "day one with", "kicked off a new role at", "onboarded at", "onboarding week at", "began working at", "a new chapter at" | unchanged (dates an existing `works_at` only) | dated `works_at` start; dropped when a later dated entry names X in words no cue reads (a possible leave) | "kick-off at [X]" without a job noun, "first day of the [X] summit", event lines, "began working with [X]"; a page that names any organization in an advisory, board or investor role |
+| Stays `mentions` | board membership with no investment or advisory statement; "started something new at [X]" with no role or employment verb; third-party subjects; negation; hypotheticals and plans | `mentions` | none | — |
+
+### Precedence
+
+For one link occurrence: a typed relation line (`core/line-grammar.ts`) wins, then the
+active pack's inference rules, then meeting attendance, then the verb rules in this
+order: `founded` > `invested_in` (with the board-seat rule) > `advises` (with U1) >
+`works_at`, then the Chinese rules. Among verb matches, only one that belongs to this
+link counts: a match with another link between it and this one, or written right
+before another link, belongs to that link. A unit veto (U1 negation, U3 board wording)
+drops one match and inference moves to the next. Then the role priors (investor >
+advisor > employee; person → company links only, never in timeline or see-also
+sections), then U2. A link may keep a `mentions` row beside a typed one.
+
+### Changing a spelling (contributor recipe)
+
+1. **Where.** A verb spelling is a regex in `src/core/link-extraction.ts`
+   (`WORKS_AT_RE`, `INVESTED_RE`, `ADVISES_RE`, …, listed in `CORE_VERB_RULES`). A cue
+   is in `src/core/link-temporal-evidence.ts` (`EMPLOYMENT`, `ADVISORY`, `EVENT_START`).
+   Unit rules, vetoes and cues live in `src/core/link-typing-units.ts`, each gated by
+   `typingUnitEnabled('U<N>')`.
+2. **Controls.** Add the spelling's look-alikes beside it as examples in
+   `test/helpers/typing-unit-examples.ts` (or `test/link-extraction.test.ts` for a
+   core rule): negation, a third party, a concurrent role, a rejoin, the same target
+   twice, a link at the edge of the 240-character window, and an event line that uses
+   the same words. Freeze the type, the tense, the transitions and the as-of result.
+3. **Smallest tests.** `bun test test/link-typing-units.test.ts
+   test/link-typing-explain.test.ts test/link-type-attachment.test.ts
+   test/link-temporal-evidence.test.ts`; for a unit,
+   `bun test test/link-typing-units-subsets.test.ts` (every unit subset, and world-v1
+   unchanged with no unit when a gbrain-evals checkout is beside this one).
+4. **Precedence effects.** Run `explainLinkType` on the example: `rule` is what
+   decided, `attachment` says whether the verb belonged to this link, and `suppressed`
+   lists the rules it beat (`:outranked`), the matches that belonged to another link
+   (`:other-link`) and unit vetoes. A new spelling for a higher-precedence verb steals
+   every link whose window it reaches, including a verb on the neighboring timeline
+   entry. Measure type steals and transitions by identity on development text with
+   `bun scripts/q2-typing-dev.ts dump` and `compare` before you propose it.
+
 ## Reading
 
 | Parameter | Meaning |

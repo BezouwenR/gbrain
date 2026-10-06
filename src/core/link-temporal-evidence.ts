@@ -25,6 +25,7 @@ import {
   type TransitionKind, type TransitionProducer,
 } from './link-validity.ts';
 import { KNOWN_LINK_TYPES } from './search/relational-intent.ts';
+import { U4_NOT_EMPLOYMENT_ROLE, U5_EXCHANGE_AFTER, U5_EXCHANGE_BEFORE, U5_LEAVE, U6_START, nonEmploymentRoleOnPage, typingUnitEnabled } from './link-typing-units.ts';
 
 export interface OwnedRow {
   from_slug: string;
@@ -67,9 +68,12 @@ const NOT_PAST_ROLE = String.raw`(?!(?:promoted|hired|named|appointed|made|elect
 const NOT_PERFECT = String.raw`(?<!\b(?:has|have|'s|’s)\s+(?:\w+\s+)?)`;
 const OWNED = String.raw`(?:(?:her|his|their|my|the)\s+)?(?:time|stint|tenure|role|job|run)\s+`;
 
+/** Employment start cues; `notJob` guards the "became … at/of" and "took … role at" forms (U4). */
+const employmentStart = (notJob: string) => new RegExp(String.raw`\b(?:(?:re-?)?join(?:ed|s|ing)?(?:\s+${ROLE}(?:at|as))?|(?:was\s+)?hired\s+(?:by|at|as\s+${ROLE}at)|started\s+(?:at|with|working\s+(?:at|for)|(?:a\s+)?new\s+(?:role|job|position)\s+at)|became\s+${notJob}${ROLE}(?:at|of)|promoted\s+to\s+${ROLE}(?:at|of)|signed\s+on\s+(?:at|with)|named\s+${ROLE}(?:at|of)|accepted\s+(?:an?\s+)?(?:offer|role|position|job)\s+(?:at|with|from)|took\s+(?:an?\s+|the\s+)?${notJob}(?:\w+\s+){0,2}?(?:role|job|position)\s+(?:at|with)|came\s+(?:on\s+board|aboard)\s+(?:at|with)|went\s+to\s+work\s+(?:at|for)|returned\s+to)\s*$`, 'i');
+
 const EMPLOYMENT = {
   end: new RegExp(String.raw`\b(?:left|leaving|departed(?:\s+from)?|quit|resigned(?:\s+as\s+${ROLE})?(?:\s+from|\s+at)?|stepped\s+down(?:\s+as\s+${ROLE})?(?:\s+from|\s+at)?|stepped\s+away\s+from|moved\s+on\s+from|(?:moved|switched|transitioned|jumped)\s+(?:over\s+|out\s+)?from|(?:was\s+)?laid\s+off\s+(?:from|by|at)|(?:was\s+)?let\s+go\s+(?:from|by)|(?:was\s+)?fired\s+(?:from|by)|no\s+longer\s+(?:at|with|works\s+at|working\s+at)|exited|parted\s+ways\s+with|retired\s+from|(?:wrapped\s+up|finished|ended|concluded)\s+(?:${OWNED})?(?:at|with)|last\s+day\s+at|departure\s+from)\s*$`, 'i'),
-  start: new RegExp(String.raw`\b(?:(?:re-?)?join(?:ed|s|ing)?(?:\s+${ROLE}(?:at|as))?|(?:was\s+)?hired\s+(?:by|at|as\s+${ROLE}at)|started\s+(?:at|with|working\s+(?:at|for)|(?:a\s+)?new\s+(?:role|job|position)\s+at)|became\s+${ROLE}(?:at|of)|promoted\s+to\s+${ROLE}(?:at|of)|signed\s+on\s+(?:at|with)|named\s+${ROLE}(?:at|of)|accepted\s+(?:an?\s+)?(?:offer|role|position|job)\s+(?:at|with|from)|took\s+(?:an?\s+|the\s+)?(?:\w+\s+){0,2}?(?:role|job|position)\s+(?:at|with)|came\s+(?:on\s+board|aboard)\s+(?:at|with)|went\s+to\s+work\s+(?:at|for)|returned\s+to)\s*$`, 'i'),
+  start: employmentStart(''),
   past: new RegExp(String.raw`\b(?:previously(?:\s+worked)?\s+(?:at|with|for)|formerly(?:\s+${ROLE})?\s*(?:at|of|with)|former\s+${ROLE}(?:at|of|with)|ex-[\w-]+\s+(?:at|of)|used\s+to\s+work\s+(?:at|for)|${NOT_PERFECT}worked\s+(?:at|for|with)|${NOT_PERFECT}spent\s+(?:[\w-]+\s+){1,4}?(?:at|with)|(?:his|her|their|my)\s+(?:time|stint|tenure)\s+at|stint\s+at|was\s+${NOT_PAST_ROLE}${ROLE}(?:at|of)|alum(?:nus|na|ni)?\s+of)\s*$`, 'i'),
 };
 
@@ -105,9 +109,12 @@ const EVENT_START: Record<string, RegExp> = {
   founded: /\b(?:founded|co-?founded|started)\s*$/i,
 };
 
+/** U4 (src/core/link-typing-units.ts): the employment cues with advisory, board and investor roles kept out of the start cue. */
+const EMPLOYMENT_U4 = { ...EMPLOYMENT, start: employmentStart(U4_NOT_EMPLOYMENT_ROLE) };
+
 type CueSet = { end: RegExp; start: RegExp; past: RegExp };
 function cuesFor(linkType: string): CueSet | null {
-  if (linkType === 'works_at') return EMPLOYMENT;
+  if (linkType === 'works_at') return typingUnitEnabled('U4') ? EMPLOYMENT_U4 : EMPLOYMENT;
   if (linkType === 'advises') return ADVISORY;
   if (linkType === 'yc_partner') return PARTNER;
   return null;
@@ -190,7 +197,10 @@ export interface PageForEvidence {
   frontmatter: Record<string, unknown> | null | undefined;
 }
 
-export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly OwnedRow[]): TemporalEvidence {
+/** Receives each derived transition with the stable id of the cue that produced it (`cue.*`, `unit.*`). */
+export type TransitionExplainer = (t: DerivedTransition, rule: string) => void;
+
+export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly OwnedRow[], explain?: TransitionExplainer): TemporalEvidence {
   const tense = new Map<string, AssertionTense>();
   const transitions: DerivedTransition[] = [];
   const unmatched: TemporalEvidence['unmatched'] = [];
@@ -199,9 +209,10 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
   const temporalRows = rows.filter(r => relationSemantics(r.link_type) !== 'reference');
   const other = (r: OwnedRow) => (r.from_slug === page.slug ? r.to_slug : r.from_slug);
   const seen = new Set<string>();
-  const push = (t: DerivedTransition) => {
+  const rules = new Map<DerivedTransition, string>();
+  const push = (t: DerivedTransition, rule: string) => {
     const k = `${t.from_slug}\0${t.to_slug}\0${t.link_type}\0${t.kind}\0${t.occurred_on}\0${t.producer}`;
-    if (!seen.has(k)) { seen.add(k); transitions.push(t); }
+    if (!seen.has(k)) { seen.add(k); transitions.push(t); rules.set(t, rule); }
   };
 
   // 1. Explicit grammar inside dated timeline entries.
@@ -217,9 +228,15 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
       const resolved = target.includes('/') ? target : temporalRows.map(other).find(slug => refersTo(target, slug)) ?? null;
       if (!resolved) { unmatched.push({ line: line.text, reason: 'no_target' }); continue; }
       push({ from_slug: page.slug, to_slug: resolved, link_type: linkType, kind: m[1] === 'Started' ? 'start' : 'end',
-        occurred_on: line.date, date_precision: 'day', producer: line.dream ? 'dream' : 'explicit', line_hash: lineHash(line.text) });
+        occurred_on: line.date, date_precision: 'day', producer: line.dream ? 'dream' : 'explicit', line_hash: lineHash(line.text) }, 'cue.explicit');
     }
   }
+
+  // U5 ends, U6 starts and the uncued plain references to works_at targets, for the guards after the loop.
+  const u5 = typingUnitEnabled('U5');
+  const u6 = typingUnitEnabled('U6') && !nonEmploymentRoleOnPage(content);
+  const unitTransitions: Array<{ target: string; date: string; key: string }> = [];
+  const uncued: Array<{ target: string; date: string }> = [];
 
   // 2. Natural cues on dated lines, for relationships this page asserts.
   //    State relations take a cue only when it governs the reference itself:
@@ -241,23 +258,45 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
       for (const r of temporalRows) {
         if (!refersTo(ref.target, other(r)) || !r.link_type) continue;
         const cues = cuesFor(r.link_type);
+        const family = r.link_type === 'works_at' ? 'employment' : r.link_type === 'advises' ? 'advisory' : 'partner';
         let kind: TransitionKind | null = null;
+        let rule = '';
         if (cues) {
           if (eventLine) continue;
           if (qualified) {
             if (r.link_type !== 'advises' || !ADVISORY_BOARD_AFTER.test(line.text.slice(ref.end))) continue;
             kind = /\b(?:left|stepped\s+(?:down|off|away)\s+from|resigned\s+from)\s*$/i.test(window) ? 'end'
               : /\b(?:(?:re-?)?joined|was\s+(?:added|named|appointed)\s+to)\s*$/i.test(window) ? 'start' : null;
-          } else kind = cues.end.test(window) ? 'end'
-            : cues.start.test(window) || (prevEnded.has(r.link_type) && /^\s*(?:to|for)\s*$/i.test(between)) ? 'start' : null;
-        } else if (EVENT_START[r.link_type]?.test(window)) kind = 'start';
-        if (!kind) continue;
+            rule = `cue.advisory_board.${kind}`;
+          } else if (cues.end.test(window)) { kind = 'end'; rule = `cue.${family}.end`; }
+          else if (u5 && r.link_type === 'works_at' && U5_LEAVE.test(window)) { kind = 'end'; rule = 'unit.u5.leave'; }
+          else if (u5 && r.link_type === 'works_at' && U5_EXCHANGE_BEFORE.test(window) && U5_EXCHANGE_AFTER.test(line.text.slice(ref.end))) { kind = 'end'; rule = 'unit.u5.exchange'; }
+          else if (cues.start.test(window)) { kind = 'start'; rule = `cue.${family}.start`; }
+          else if (u6 && r.link_type === 'works_at' && U6_START.test(window)) { kind = 'start'; rule = 'unit.u6.start_framing'; }
+          else if (prevEnded.has(r.link_type) && /^\s*(?:to|for)\s*$/i.test(between)) { kind = 'start'; rule = 'cue.after_end.to_for'; }
+        } else if (EVENT_START[r.link_type]?.test(window)) { kind = 'start'; rule = `cue.event.${r.link_type}`; }
+        if (!kind) {
+          if (cues && !qualified && r.link_type === 'works_at') uncued.push({ target: other(r), date: line.date });
+          continue;
+        }
+        if (rule.startsWith('unit.u5.') || rule.startsWith('unit.u6.')) {
+          unitTransitions.push({ target: other(r), date: line.date, key: `${r.from_slug}\0${r.to_slug}\0${r.link_type}\0${kind}\0${line.date}` });
+        }
         if (kind === 'end') endedHere.add(r.link_type);
         push({ from_slug: r.from_slug, to_slug: r.to_slug, link_type: r.link_type, kind, occurred_on: line.date,
-          date_precision: 'day', producer: line.dream ? 'dream' : 'timeline', line_hash: lineHash(line.text) });
+          date_precision: 'day', producer: line.dream ? 'dream' : 'timeline', line_hash: lineHash(line.text) }, rule);
       }
       prevEnded = endedHere;
     }
+  }
+
+  // U5 restart guard and U6 leave guard: a leave or start a unit adds is dropped when a later dated line names the same
+  // organization in plain words that no cue reads: for U5 a rejoin the lexicon cannot see (the leave would close a
+  // current stint for good), for U6 a leave it cannot see (the start would open a former job for good).
+  for (const e of unitTransitions) {
+    if (!uncued.some(u => u.target === e.target && u.date > e.date)) continue;
+    const at = transitions.findIndex(t => `${t.from_slug}\0${t.to_slug}\0${t.link_type}\0${t.kind}\0${t.occurred_on}` === e.key);
+    if (at >= 0) transitions.splice(at, 1);
   }
 
   // 3. Frontmatter since/until on relationship objects ({name, since, until}).
@@ -275,7 +314,7 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
         const d = normalizePartialDate(stringish(obj[key]));
         if (!d) continue;
         push({ from_slug: r.from_slug, to_slug: r.to_slug, link_type: r.link_type!, kind, occurred_on: d.date,
-          date_precision: d.precision, producer: 'frontmatter', line_hash: lineHash(`${r.origin_field}:${name}:${key}`) });
+          date_precision: d.precision, producer: 'frontmatter', line_hash: lineHash(`${r.origin_field}:${name}:${key}`) }, `cue.frontmatter.${key}`);
       }
     }
   }
@@ -295,6 +334,7 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
     }
     tense.set(rowKey(r), past > 0 && present === 0 && r.link_source !== 'frontmatter' ? 'past' : 'present');
   }
+  if (explain) for (const t of transitions) explain(t, rules.get(t)!);
   return { tense, transitions, unmatched };
 }
 
