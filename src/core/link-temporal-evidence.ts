@@ -190,7 +190,10 @@ export interface PageForEvidence {
   frontmatter: Record<string, unknown> | null | undefined;
 }
 
-export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly OwnedRow[]): TemporalEvidence {
+/** Receives each derived transition with the stable id of the cue that produced it (`cue.*`, `unit.*`). */
+export type TransitionExplainer = (t: DerivedTransition, rule: string) => void;
+
+export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly OwnedRow[], explain?: TransitionExplainer): TemporalEvidence {
   const tense = new Map<string, AssertionTense>();
   const transitions: DerivedTransition[] = [];
   const unmatched: TemporalEvidence['unmatched'] = [];
@@ -199,9 +202,9 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
   const temporalRows = rows.filter(r => relationSemantics(r.link_type) !== 'reference');
   const other = (r: OwnedRow) => (r.from_slug === page.slug ? r.to_slug : r.from_slug);
   const seen = new Set<string>();
-  const push = (t: DerivedTransition) => {
+  const push = (t: DerivedTransition, rule: string) => {
     const k = `${t.from_slug}\0${t.to_slug}\0${t.link_type}\0${t.kind}\0${t.occurred_on}\0${t.producer}`;
-    if (!seen.has(k)) { seen.add(k); transitions.push(t); }
+    if (!seen.has(k)) { seen.add(k); transitions.push(t); explain?.(t, rule); }
   };
 
   // 1. Explicit grammar inside dated timeline entries.
@@ -217,7 +220,7 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
       const resolved = target.includes('/') ? target : temporalRows.map(other).find(slug => refersTo(target, slug)) ?? null;
       if (!resolved) { unmatched.push({ line: line.text, reason: 'no_target' }); continue; }
       push({ from_slug: page.slug, to_slug: resolved, link_type: linkType, kind: m[1] === 'Started' ? 'start' : 'end',
-        occurred_on: line.date, date_precision: 'day', producer: line.dream ? 'dream' : 'explicit', line_hash: lineHash(line.text) });
+        occurred_on: line.date, date_precision: 'day', producer: line.dream ? 'dream' : 'explicit', line_hash: lineHash(line.text) }, 'cue.explicit');
     }
   }
 
@@ -241,20 +244,24 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
       for (const r of temporalRows) {
         if (!refersTo(ref.target, other(r)) || !r.link_type) continue;
         const cues = cuesFor(r.link_type);
+        const family = r.link_type === 'works_at' ? 'employment' : r.link_type === 'advises' ? 'advisory' : 'partner';
         let kind: TransitionKind | null = null;
+        let rule = '';
         if (cues) {
           if (eventLine) continue;
           if (qualified) {
             if (r.link_type !== 'advises' || !ADVISORY_BOARD_AFTER.test(line.text.slice(ref.end))) continue;
             kind = /\b(?:left|stepped\s+(?:down|off|away)\s+from|resigned\s+from)\s*$/i.test(window) ? 'end'
               : /\b(?:(?:re-?)?joined|was\s+(?:added|named|appointed)\s+to)\s*$/i.test(window) ? 'start' : null;
-          } else kind = cues.end.test(window) ? 'end'
-            : cues.start.test(window) || (prevEnded.has(r.link_type) && /^\s*(?:to|for)\s*$/i.test(between)) ? 'start' : null;
-        } else if (EVENT_START[r.link_type]?.test(window)) kind = 'start';
+            rule = `cue.advisory_board.${kind}`;
+          } else if (cues.end.test(window)) { kind = 'end'; rule = `cue.${family}.end`; }
+          else if (cues.start.test(window)) { kind = 'start'; rule = `cue.${family}.start`; }
+          else if (prevEnded.has(r.link_type) && /^\s*(?:to|for)\s*$/i.test(between)) { kind = 'start'; rule = 'cue.after_end.to_for'; }
+        } else if (EVENT_START[r.link_type]?.test(window)) { kind = 'start'; rule = `cue.event.${r.link_type}`; }
         if (!kind) continue;
         if (kind === 'end') endedHere.add(r.link_type);
         push({ from_slug: r.from_slug, to_slug: r.to_slug, link_type: r.link_type, kind, occurred_on: line.date,
-          date_precision: 'day', producer: line.dream ? 'dream' : 'timeline', line_hash: lineHash(line.text) });
+          date_precision: 'day', producer: line.dream ? 'dream' : 'timeline', line_hash: lineHash(line.text) }, rule);
       }
       prevEnded = endedHere;
     }
@@ -275,7 +282,7 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
         const d = normalizePartialDate(stringish(obj[key]));
         if (!d) continue;
         push({ from_slug: r.from_slug, to_slug: r.to_slug, link_type: r.link_type!, kind, occurred_on: d.date,
-          date_precision: d.precision, producer: 'frontmatter', line_hash: lineHash(`${r.origin_field}:${name}:${key}`) });
+          date_precision: d.precision, producer: 'frontmatter', line_hash: lineHash(`${r.origin_field}:${name}:${key}`) }, `cue.frontmatter.${key}`);
       }
     }
   }
