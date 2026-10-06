@@ -3,6 +3,7 @@ import type { ParsedPage } from '../import-file.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { writerLintForPutPage } from '../output/post-write.ts';
 import type { WriteRequest } from './model.ts';
+import type { PageSnapshot } from '../page-state/types.ts';
 import { prepareFactsBackstop } from './effect-facts.ts';
 import { parseLineGrammar } from '../line-grammar.ts';
 import { lineGrammarReport } from '../line-grammar-report.ts';
@@ -77,14 +78,14 @@ export function pageNoopAdvisories(row: WriteRequest): Record<string, unknown> {
   return { ...remoteLinkHint(row), ...(['put_page', 'capture', 'edit_page'].includes(row.operation) ? { facts_backstop: { skipped: 'not_imported' } } : {}) };
 }
 /** Optional lint reads are outside publication locks; its bounded result is retained in the receipt. */
-export async function preparePageAdvisories(engine: BrainEngine, row: WriteRequest, page: ParsedPage) {
+export async function preparePageAdvisories(engine: BrainEngine, row: WriteRequest, page: ParsedPage, before: PageSnapshot | null = null) {
   const visible = row.authority.remote ? { ...page, compiled_truth: sanitizeRemoteBody(page.compiled_truth),
     timeline: sanitizeRemoteBody(page.timeline ?? '') } : page;
   const lint = await writerLintForPutPage(engine, row.slug, { sourceId: row.source_id, noLog: true, page: visible });
   const sanitized = lint && 'top_findings' in lint ? { ...lint,
     top_findings: lint.top_findings.map(finding => ({ ...finding, message: LINT_MESSAGES[finding.validator] ?? `${finding.validator} validation finding.` })) } : lint;
   const facts = ['put_page', 'capture', 'edit_page'].includes(row.operation)
-    ? await prepareFactsBackstop(engine, row, page).catch(() => ({ skipped: 'backstop_error' })) : undefined;
+    ? await prepareFactsBackstop(engine, row, page, before).catch(() => ({ skipped: 'backstop_error' })) : undefined;
   const grammar = await lineGrammarAdvisory(engine, row, visible).catch((e: unknown): Record<string, unknown> => ({ state: 'diagnostics_failed',
     message: `Line-grammar diagnostics failed (${e instanceof Error ? e.message : String(e)}); the page was saved, but nothing is known about its typed lines.`,
     fix: readFix('Checks the brain configuration and schema pack, read-only.', { argv: ['gbrain', 'doctor', '--json'] }) }));

@@ -1,5 +1,6 @@
 import type { BrainEngine } from '../engine.ts';
 import { effectiveLinkExtractorWatermark, laterInstant, linkExtractorWatermarkFor } from '../link-extraction-watermark.ts';
+import { isQuarantined } from '../quarantine.ts';
 import { prepareAutomaticLinks } from './links-preparation.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { maintenanceAttribution } from './attribution.ts';
@@ -74,7 +75,7 @@ export async function extractManagedStaleLinks(engine: BrainEngine,
     opts.signal?.throwIfAborted();
     done.add(`${sourceId}\0${slug}`);
     const snapshot = await engine.readPageSnapshot(slug, { sourceId });
-    if (!snapshot) return;
+    if (!snapshot || isQuarantined(snapshot.page.frontmatter)) return;
     const prepared = await prepareAutomaticLinks(engine, slug, snapshot.page, sourceId);
     const outcome = await engine.transaction(async tx => withCoordinatedWrite(tx, [sourceId], async () => {
       await tx.lockPageKeys(prepared.pageKeys);
