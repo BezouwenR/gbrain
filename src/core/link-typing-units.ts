@@ -2,18 +2,19 @@
  * Relationship-phrasing typing units (Q2 Track C).
  *
  * Each unit is one entailment-limited change to link typing (link-extraction.ts) or to the temporal cue lexicon
- * (link-temporal-evidence.ts). A unit takes effect only when its id is in ENABLED_TYPING_UNITS; with the set empty,
- * extraction behaves exactly as before the units existed. Which units ship is decided by the preregistered held-out
- * verdict (docs/eval/decisions/q2-parser-gaps/, gbrain-evals docs/benchmarks/2026-10-06-q2-parser-gaps-preregistration.md);
+ * (link-temporal-evidence.ts), active when its id is in ENABLED_TYPING_UNITS. The shipped units are U1 (adviser
+ * wording) and the joint unit U34 (board wording never types works_at; advisory, board and investor roles are not
+ * employment starts), confirmed by the preregistered held-out verdict (decision q2-parser-gaps-2026-10). U2, U5 and U6
+ * were tested and not shipped, and their code was removed (docs/eval/decisions/q2-parser-gaps/dev-units.md).
  * scripts/q2-typing-package.ts builds a branch whose one extra commit sets this constant.
  *
  * Policy, examples and the contributor recipe: docs/guides/temporal-edges.md, "Relationship phrasings".
  */
 
-export const TYPING_UNITS = ['U1', 'U2', 'U3', 'U4', 'U5', 'U6'] as const;
+export const TYPING_UNITS = ['U1', 'U3', 'U4'] as const;
 export type TypingUnit = typeof TYPING_UNITS[number];
 
-/** The units this build applies. Changed only by the package script after the verdict. */
+/** The units this build applies (the confirmed package P2). */
 export const ENABLED_TYPING_UNITS: ReadonlySet<TypingUnit> = new Set<TypingUnit>(['U3', 'U4', 'U1']);
 
 let override: ReadonlySet<TypingUnit> | null = null;
@@ -28,12 +29,11 @@ export function activeTypingUnits(): TypingUnit[] {
 }
 
 /**
- * Joint units: ids that stand for several units measured together (docs/eval/decisions/q2-parser-gaps/dev-units.md,
- * "Dependency units"). U34 is U3 with U4: U4 alone loses as-of accuracy wherever board wording still types works_at
- * (the set-F interaction), which U3 removes. U25 is U2 with U5: U2 alone lets the single-value pass close a former
- * employer whose leave only U5 reads at the new employer's start date (a wrong closure by date), which U5 removes.
+ * Joint units: ids that stand for several units measured together. U34 is U3 with U4: U4 alone loses as-of accuracy
+ * wherever board wording still types works_at (the set-F interaction), which U3 removes
+ * (docs/eval/decisions/q2-parser-gaps/dev-units.md, "Dependency units").
  */
-export const JOINT_TYPING_UNITS: Readonly<Record<string, readonly TypingUnit[]>> = { U25: ['U2', 'U5'], U34: ['U3', 'U4'] };
+export const JOINT_TYPING_UNITS: Readonly<Record<string, readonly TypingUnit[]>> = { U34: ['U3', 'U4'] };
 
 export function parseTypingUnits(units: Iterable<string>): TypingUnit[] {
   const out: TypingUnit[] = [];
@@ -156,67 +156,6 @@ export function unitOfRule(id: string | null | undefined): TypingUnit | null {
   return m ? (`U${m[1]}` as TypingUnit) : null;
 }
 
-// ─── U2: ordinary job roles (post-pass where inference returned `mentions`) ──
-
-/** Ordinary job titles. Board, advisory, investor and observer roles are deliberately absent. */
-const EMPLOYMENT_ROLE = String.raw`(?:(?:senior|staff|principal|lead|junior|associate|founding|chief|executive|managing|general|deputy|interim|acting) )*(?:software engineer|engineer|developer|designer|programmer|architect|scientist|data scientist|researcher|analyst|product manager|engineering manager|program manager|project manager|manager|director|officer|counsel|marketer|recruiter|strategist|editor|producer|accountant|controller|specialist|coordinator|administrator|technician|intern|president|chief of staff|cto|ceo|coo|cfo|cmo|cro|cpo|vp|svp|evp|vp (?:of )?[a-z]+|vice president of [a-z]+|head of [a-z]+(?: [a-z]+)?|(?:product|design|engineering|tech|team|growth|sales|marketing|data|research) lead)`;
-const EMPLOYMENT_AREA = String.raw`(?:engineering|product|design|sales|marketing|growth|operations|ops|finance|people|hr|recruiting|platform|infrastructure|infra|data|security|research|partnerships|business development|customer success|support|legal|strategy|the [a-z]+ team)`;
-/** "<role> for/at/with [X]" introduced as the subject's own role: "is CTO for", "now designer for", "New role: CTO for". */
-const U2_ROLE_BEFORE = new RegExp(String.raw`(?:^\s*|\b(?:is|was|as|now|currently|became|becomes|serves as|served as|serving as|works as|worked as|working as)\s+|[:—–-]\s*)(?:an?\s+|the\s+)?${EMPLOYMENT_ROLE}\s+(?:at|for|with)\s+(?:the\s+)?$`, 'i');
-/** "led engineering at [X]". */
-const U2_LED_AREA = new RegExp(String.raw`\b(?:led|leads|leading|ran|runs|running|managed|manages|managing|headed|heads|heading|oversaw|oversees|overseeing|owned|owns)\s+${EMPLOYMENT_AREA}\s+(?:at|for)\s+(?:the\s+)?$`, 'i');
-/** A join, move or start right before the link: "signed on with [X]", "moved to [X]", "a new chapter at [X]". */
-const U2_JOIN_BEFORE = /\b(?:re-?joined|joined|joins|joining|signed\s+(?:back\s+)?on\s+(?:with|at)|moved(?:\s+over)?\s+to|moves\s+to|switched\s+to|went\s+to|returned\s+to|came\s+back\s+to|(?:was\s+)?hired\s+(?:by|at|on\s+at)|started\s+(?:at|with)|start(?:ed|ing|s)?\s+(?:a\s+|her\s+|his\s+|their\s+|my\s+)?new\s+chapter\s+(?:at|with)|new\s+chapter\s+(?:at|with)|began\s+(?:working\s+)?(?:at|with|for)|onboarded\s+(?:at|with)|first\s+day\s+at|now\s+at|came\s+(?:on\s+board|aboard)\s+(?:at|with))\s+(?:the\s+)?$/i;
-/** "… [X] as <role>" right after the link (with a join, move or start before it). */
-const U2_AS_ROLE_AFTER = new RegExp(String.raw`^\s*,?\s*as\s+(?:an?\s+|the\s+|its\s+|their\s+)?${EMPLOYMENT_ROLE}\b`, 'i');
-/** "[X] (<role>)": the whole parenthetical is an ordinary job title. */
-const U2_PAREN_ROLE_AFTER = new RegExp(String.raw`^\s*\((?:as\s+)?(?:an?\s+|the\s+)?${EMPLOYMENT_ROLE}(?:\s+(?:for|of|at|in)\s+[^()]{1,40})?\)`, 'i');
-/** Clauses that do not state the subject's own current or past job. */
-const U2_NOT_A_JOB = /\b(?:not|never|no\s+longer|declined|turned\s+down|rejected|passed\s+on|didn't|did\s+not|isn't|wasn't|won't|nor|will|would|could|might|may|plans?\s+to|planning\s+to|hopes?\s+to|wants?\s+to|considering|considered|interview(?:ed|ing|s)?|offered|offer|candidate|applied|applying|in\s+talks|rumou?red|expected\s+to|set\s+to|about\s+to|if|board|observer|investor|investing|angel|advis\w*|non-executive|independent\s+director|trustee|chair(?:man|woman|person)?)\b/i;
-
-/** Inside a dated timeline entry ("- **2021-03-04** | …"): the entry marker comes after the last line break or heading. */
-function inDatedEntry(context: string, linkStart: number): boolean {
-  const before = context.slice(Math.max(0, linkStart - 240), linkStart);
-  const entry = [...before.matchAll(/(?:^|\s)[-*]\s+\*\*\d{4}-\d{2}-\d{2}\*\*|(?:^|\s)#{3}\s+\d{4}-\d{2}-\d{2}/g)].pop();
-  if (!entry) return false;
-  return !/\n|\s#{1,6}\s/.test(before.slice((entry.index ?? 0) + entry[0].length));
-}
-
-/** The page names some organization in an advisory, board or investor role ("Took an advisory role with [X]"). */
-const ROLE_ELSEWHERE = /\b(?:advis\w*|board|observer|investor|investing|invested|angel|non-executive|trustee)\b/i;
-const LINK_OPEN = /\[\[|\[[^\]\n]*\]\(/g;
-export function nonEmploymentRoleOnPage(pageText: string): boolean {
-  for (const m of pageText.matchAll(LINK_OPEN)) if (ROLE_ELSEWHERE.test(clauseBefore(pageText, m.index ?? 0))) return true;
-  return false;
-}
-
-/** How many dated timeline entries on the page mention `target`. */
-const DATED_ENTRY_LINE = /^\s*(?:[-*]\s*\*\*\d{4}-\d{2}-\d{2}\*\*|#{3}\s+\d{4}-\d{2}-\d{2})/;
-const datedMentions = (pageText: string, target: string) => pageText.split('\n').filter(l => DATED_ENTRY_LINE.test(l) && l.includes(target)).length;
-
-/**
- * U2's rule id for a link at [linkStart, linkEnd) in `context`, or null. Reads only the link's own clause; runs after
- * the full existing inference returned `mentions` (traceLinkType), so it never overrides a verb, a stated type, a
- * pack rule or a role prior. Development rework (docs/eval/decisions/q2-parser-gaps/dev-units.md): it reads undated
- * lines only (a role on a dated join line with an unread leave kept former employers live), and it does not fire on a
- * page that names any organization in an advisory, board or investor role: there master's "became … at" / "took … role"
- * start cues read the advisory line as a new job, and a newly typed employer then meets that false start (E5 probe:
- * extra starts and wrong single-value closures). U4 removes that cause; U2 does not depend on it. Nor does it type an
- * organization that two or more dated entries mention: a later entry no cue reads may be the leave, and typing the
- * earlier role would keep a former employer live (stale summaries) and feed the single-value pass.
- */
-export function u2RoleRule(context: string, linkStart: number, linkEnd: number, target: string, pageText: string): string | null {
-  if (!typingUnitEnabled('U2')) return null;
-  const before = clauseBefore(context, linkStart);
-  const after = context.slice(linkEnd, linkEnd + 80);
-  if (U2_NOT_A_JOB.test(before) || THIRD_PARTY.test(before) || inDatedEntry(context, linkStart)) return null;
-  const rule = U2_ROLE_BEFORE.test(before) ? 'unit.u2.role_before'
-    : U2_LED_AREA.test(before) ? 'unit.u2.led_area'
-    : U2_PAREN_ROLE_AFTER.test(after) ? 'unit.u2.paren_role'
-    : U2_JOIN_BEFORE.test(before) && U2_AS_ROLE_AFTER.test(after) ? 'unit.u2.join_as_role' : null;
-  return rule && !nonEmploymentRoleOnPage(pageText) && datedMentions(pageText, target) < 2 ? rule : null;
-}
-
 // ─── Temporal cue hooks (link-temporal-evidence.ts) ─────────────────────
 
 /**
@@ -224,26 +163,3 @@ export function u2RoleRule(context: string, linkStart: number, linkEnd: number, 
  * employment start cues, so "Became an advisor at [X]" or "Took an advisory role with [X]" never starts a works_at stint.
  */
 export const U4_NOT_EMPLOYMENT_ROLE = String.raw`(?!(?:\w+\s+){0,2}?(?:advis\w*|board|investor|investing|investment|angel|observer|non-executive|independent|trustee)\b)`;
-
-/** U5: leaves an object splits ("wrapped her time up at", "handed in her notice at") and quitting idioms. */
-const LEAVE_OBJECT = String.raw`(?:(?:her|his|their|my|a|the)\s+)?(?:time|stint|tenure|role|job|run|things|it|notice|resignation)\s+`;
-const SPLIT_LEAVE = String.raw`(?:wrapped|wound|finished)\s+${LEAVE_OBJECT}up\s+(?:at|with)|(?:handed|turned|put)\s+(?:in\s+${LEAVE_OBJECT}|${LEAVE_OBJECT}in\s+)(?:at|to|with)|(?:gave|submitted|tendered)\s+${LEAVE_OBJECT}(?:at|to)`;
-const IDIOM_LEAVE = String.raw`packed\s+(?:it|things)\s+in\s+(?:at|with)|call(?:ed|s|ing)?\s+(?:it\s+)?time\s+(?:on|at)|call(?:ed|s|ing)?\s+it\s+a\s+day\s+(?:at|with)|call(?:ed|s|ing)?\s+it\s+quits\s+(?:at|with)|bow(?:ed|s|ing)?\s+out\s+(?:of|from|at)|walk(?:ed|s|ing)?\s+(?:out\s+(?:of|on)|away\s+from)|thr(?:ew|ows|owing)\s+in\s+the\s+towel\s+(?:at|with)|hand(?:ed|s|ing)?\s+in\s+(?:(?:her|his|their|my)\s+)?(?:badge|keys|laptop)\s+(?:at|to)|clear(?:ed|s|ing)?\s+out\s+(?:(?:her|his|their|my)\s+)?desk\s+at|gave\s+up\s+(?:(?:her|his|their|my)\s+)?(?:job|role|post|position|seat)\s+at|left\s+(?:(?:her|his|their|my)\s+)?(?:job|role|post|position)\s+at|step(?:ped|s|ping)?\s+back\s+from|parted\s+company\s+with|said\s+(?:(?:her|his|their|my)\s+)?goodbyes?\s+to|bid(?:\s+a)?\s+farewell\s+to|exit\s+from`;
-export const U5_LEAVE = new RegExp(String.raw`\b(?:${SPLIT_LEAVE}|${IDIOM_LEAVE})\s*$`, 'i');
-/** Lines about trading an organization's equity ("Traded shares of [X]") say nothing about a job: the U5 and U6 guards ignore them. */
-export const GUARD_IGNORED_LINE = /\b(?:shares?|stock|equity|stake|stock\s+options|secondary\s+market|bought|sold)\b/i;
-/** U5: "traded [A] for [B]" ends A (the "for" then starts B). "Traded shares of [A]" is not an exchange. */
-export const U5_EXCHANGE_BEFORE = /\b(?:traded|swapped|exchanged|ditched|dropped)\s*$/i;
-export const U5_EXCHANGE_AFTER = /^\s+for\s+(?:\[|the\s+\[|an?\s+\[)/i;
-
-/**
- * U6: start framings: a first day, week or month at, day one at, kicking off a role, job, position, chapter or stint
- * at, onboarding, "began working at/for", a new chapter at. Only dates a works_at relationship the page already
- * asserts (natural cues never create one). "First day of the [X] summit" and an event line never start a job.
- * Development rework (dev-units.md), the same two guards as U2/U5: a U6 start is dropped when a later dated entry names
- * the organization in words no cue reads (an unread leave would keep a former job open for good), and U6 does not fire
- * on a page that names any organization in an advisory, board or investor role (a newly dated employer then meets
- * master's advisory-line start: wrong single-value closures on the E5 probe). U4 removes that cause.
- */
-const START_ROLE = String.raw`(?:[\w&./-]+\s+){0,4}?`;
-export const U6_START = new RegExp(String.raw`\b(?:(?:(?:her|his|their|my|a|the)\s+)?(?:first\s+(?:day|week|month)|day\s+one)\s+(?:as\s+${START_ROLE})?(?:at|with)|kick(?:ed|s|ing)?[\s-]?off\s+(?:(?:a|her|his|their|my)\s+)?(?:new\s+)?(?:role|job|position|chapter|stint)\s+(?:at|with)|(?:was\s+|got\s+|been\s+)?onboarded\s+(?:at|with|to|into|by)|onboarding\s+(?:week|day|period)\s+(?:at|with)|began\s+(?:work(?:ing)?\s+)?(?:at|for)|start(?:ed|ing|s)?\s+(?:a\s+|her\s+|his\s+|their\s+|my\s+)?new\s+chapter\s+(?:at|with)|(?:a\s+)?new\s+chapter\s+(?:at|with))\s*$`, 'i');

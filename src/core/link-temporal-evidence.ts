@@ -25,7 +25,7 @@ import {
   type TransitionKind, type TransitionProducer,
 } from './link-validity.ts';
 import { KNOWN_LINK_TYPES } from './search/relational-intent.ts';
-import { GUARD_IGNORED_LINE, U4_NOT_EMPLOYMENT_ROLE, U5_EXCHANGE_AFTER, U5_EXCHANGE_BEFORE, U5_LEAVE, U6_START, nonEmploymentRoleOnPage, typingUnitEnabled } from './link-typing-units.ts';
+import { U4_NOT_EMPLOYMENT_ROLE, typingUnitEnabled } from './link-typing-units.ts';
 
 export interface OwnedRow {
   from_slug: string;
@@ -209,10 +209,9 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
   const temporalRows = rows.filter(r => relationSemantics(r.link_type) !== 'reference');
   const other = (r: OwnedRow) => (r.from_slug === page.slug ? r.to_slug : r.from_slug);
   const seen = new Set<string>();
-  const rules = new Map<DerivedTransition, string>();
   const push = (t: DerivedTransition, rule: string) => {
     const k = `${t.from_slug}\0${t.to_slug}\0${t.link_type}\0${t.kind}\0${t.occurred_on}\0${t.producer}`;
-    if (!seen.has(k)) { seen.add(k); transitions.push(t); rules.set(t, rule); }
+    if (!seen.has(k)) { seen.add(k); transitions.push(t); explain?.(t, rule); }
   };
 
   // 1. Explicit grammar inside dated timeline entries.
@@ -232,12 +231,6 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
     }
   }
 
-  // U5 ends, U6 starts and the uncued plain references to works_at targets, for the guards after the loop.
-  const u5 = typingUnitEnabled('U5');
-  const u6 = typingUnitEnabled('U6') && !nonEmploymentRoleOnPage(content);
-  const unitTransitions: Array<{ target: string; date: string; key: string }> = [];
-  const uncued: Array<{ target: string; date: string }> = [];
-
   // 2. Natural cues on dated lines, for relationships this page asserts.
   //    State relations take a cue only when it governs the reference itself:
   //    not on investing/meeting/event lines, not when the reference is
@@ -247,7 +240,6 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
     if (hasExplicit(line.text)) continue;
     const refs = referencesIn(line.text);
     const eventLine = EVENT_CONTEXT.test(line.text.replace(/\[[^\]\n]*\]\([^)\s]*\)|\[\[[^\]\n]*\]\]/g, ' '));
-    const tradeLine = GUARD_IGNORED_LINE.test(line.text.replace(/\[[^\]\n]*\]\([^)\s]*\)|\[\[[^\]\n]*\]\]/g, ' '));
     let prevEnd = 0;
     let prevEnded = new Set<string>();
     for (const ref of refs) {
@@ -270,34 +262,16 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
               : /\b(?:(?:re-?)?joined|was\s+(?:added|named|appointed)\s+to)\s*$/i.test(window) ? 'start' : null;
             rule = `cue.advisory_board.${kind}`;
           } else if (cues.end.test(window)) { kind = 'end'; rule = `cue.${family}.end`; }
-          else if (u5 && r.link_type === 'works_at' && U5_LEAVE.test(window)) { kind = 'end'; rule = 'unit.u5.leave'; }
-          else if (u5 && r.link_type === 'works_at' && U5_EXCHANGE_BEFORE.test(window) && U5_EXCHANGE_AFTER.test(line.text.slice(ref.end))) { kind = 'end'; rule = 'unit.u5.exchange'; }
           else if (cues.start.test(window)) { kind = 'start'; rule = `cue.${family}.start`; }
-          else if (u6 && r.link_type === 'works_at' && U6_START.test(window)) { kind = 'start'; rule = 'unit.u6.start_framing'; }
           else if (prevEnded.has(r.link_type) && /^\s*(?:to|for)\s*$/i.test(between)) { kind = 'start'; rule = 'cue.after_end.to_for'; }
         } else if (EVENT_START[r.link_type]?.test(window)) { kind = 'start'; rule = `cue.event.${r.link_type}`; }
-        if (!kind) {
-          if (cues && !qualified && r.link_type === 'works_at' && !tradeLine) uncued.push({ target: other(r), date: line.date });
-          continue;
-        }
-        if (rule.startsWith('unit.u5.') || rule.startsWith('unit.u6.')) {
-          unitTransitions.push({ target: other(r), date: line.date, key: `${r.from_slug}\0${r.to_slug}\0${r.link_type}\0${kind}\0${line.date}` });
-        }
+        if (!kind) continue;
         if (kind === 'end') endedHere.add(r.link_type);
         push({ from_slug: r.from_slug, to_slug: r.to_slug, link_type: r.link_type, kind, occurred_on: line.date,
           date_precision: 'day', producer: line.dream ? 'dream' : 'timeline', line_hash: lineHash(line.text) }, rule);
       }
       prevEnded = endedHere;
     }
-  }
-
-  // U5 restart guard and U6 leave guard: a leave or start a unit adds is dropped when a later dated line names the same
-  // organization in plain words that no cue reads: for U5 a rejoin the lexicon cannot see (the leave would close a
-  // current stint for good), for U6 a leave it cannot see (the start would open a former job for good).
-  for (const e of unitTransitions) {
-    if (!uncued.some(u => u.target === e.target && u.date > e.date)) continue;
-    const at = transitions.findIndex(t => `${t.from_slug}\0${t.to_slug}\0${t.link_type}\0${t.kind}\0${t.occurred_on}` === e.key);
-    if (at >= 0) transitions.splice(at, 1);
   }
 
   // 3. Frontmatter since/until on relationship objects ({name, since, until}).
@@ -335,7 +309,6 @@ export function deriveTemporalEvidence(page: PageForEvidence, rows: readonly Own
     }
     tense.set(rowKey(r), past > 0 && present === 0 && r.link_source !== 'frontmatter' ? 'past' : 'present');
   }
-  if (explain) for (const t of transitions) explain(t, rules.get(t)!);
   return { tense, transitions, unmatched };
 }
 

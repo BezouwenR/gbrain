@@ -3,10 +3,10 @@
  * Build a typing-unit package ref (Q2 Track C): a local branch whose single extra commit on top of `--base` sets
  * ENABLED_TYPING_UNITS in src/core/link-typing-units.ts to the given units, in the given order. Prints the commit SHA.
  *
- *   bun scripts/q2-typing-package.ts --base <ref> --units U25,U1,U34   # nested package arm (order = selection order)
- *   bun scripts/q2-typing-package.ts --base <ref> --arm U2             # one-unit arm (baseline + that unit; joint units U25 = U2 with U5, U34 = U3 with U4)
+ *   bun scripts/q2-typing-package.ts --base <ref> --units U34,U1       # nested package arm (order = selection order)
+ *   bun scripts/q2-typing-package.ts --base <ref> --arm U1             # one-unit arm (baseline + that unit; joint unit U34 = U3 with U4)
  *   bun scripts/q2-typing-package.ts --base <ref> --units none         # the base with no unit (equivalence checks)
- *   options: --branch <name> (default q2-typing/<base-short>/<arm-U2 | U2-U1-U5 | none>), --json
+ *   options: --branch <name> (default q2-typing/<base-short>/<arm-U1 | U3-U4-U1 | none>), --json
  *
  * The working tree, index and current branch are never touched (git plumbing on a temporary index). An existing
  * branch is reused only when it already points at a commit with the same parent and tree; otherwise the script
@@ -52,13 +52,13 @@ function main(argv: readonly string[]): void {
   const base = arg(argv, '--base');
   const unitsArg = arg(argv, '--units');
   const armArg = arg(argv, '--arm');
-  if (!base) fail('--base is required.', 'the package is one commit on top of a base ref (the frozen build).', 'bun scripts/q2-typing-package.ts --base <ref> --units U2,U1');
-  if ((unitsArg === undefined) === (armArg === undefined)) fail('Pass exactly one of --units and --arm.', '--units builds a nested package in the given order; --arm builds a one-unit arm.', 'bun scripts/q2-typing-package.ts --base <ref> --arm U2');
+  if (!base) fail('--base is required.', 'the package is one commit on top of a base ref (the frozen build).', 'bun scripts/q2-typing-package.ts --base <ref> --units U34,U1');
+  if ((unitsArg === undefined) === (armArg === undefined)) fail('Pass exactly one of --units and --arm.', '--units builds a nested package in the given order; --arm builds a one-unit arm.', 'bun scripts/q2-typing-package.ts --base <ref> --arm U1');
   let units: TypingUnit[];
   try {
     units = armArg !== undefined ? parseTypingUnits([armArg]) : unitsArg === 'none' ? [] : parseTypingUnits(unitsArg!.split(','));
   } catch (e) {
-    fail(e instanceof Error ? e.message : String(e), 'only the units declared in src/core/link-typing-units.ts exist.', 'pass a comma-separated subset of U1..U6, or --units none');
+    fail(e instanceof Error ? e.message : String(e), 'only the units declared in src/core/link-typing-units.ts exist.', 'pass a comma-separated subset of U1, U3, U4 (or U34), or --units none');
   }
   if (armArg !== undefined && armArg.includes(',')) fail(`--arm takes one unit (got "${armArg}").`, 'a unit arm is the baseline plus one unit (or one joint unit such as U34).', 'use --units for several units');
   const raw = (unitsArg ?? '').split(',').map(s => s.trim().toUpperCase()).filter(s => s && s !== 'NONE');

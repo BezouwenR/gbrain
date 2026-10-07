@@ -1,8 +1,9 @@
 /**
- * Every subset of the typing units (2^6 = 64) passes the frozen examples (test/helpers/typing-unit-examples.ts), so
- * any package the selection procedure orders is a tested build. With no unit, extraction types the world-v1 corpus
- * byte-identically to master (digest of master c5fb0201, scripts/q2-typing-dev.ts world-v1); that check needs a
- * gbrain-evals checkout (GBRAIN_TEST_TYPING_EVALS_DIR, else ../gbrain-evals) and is skipped without one.
+ * Every subset of the shipped typing units (U1, U3, U4: 2^3 = 8) passes the frozen examples
+ * (test/helpers/typing-unit-examples.ts). With no unit, extraction types the world-v1 corpus byte-identically to master
+ * (digest of master c5fb0201); with the shipped package it types it as the confirmed package afcec1ad did
+ * (scripts/q2-typing-dev.ts world-v1). Those checks need a gbrain-evals checkout (GBRAIN_TEST_TYPING_EVALS_DIR, else
+ * ../gbrain-evals) and are skipped without one.
  */
 import { describe, expect, test } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
@@ -15,7 +16,7 @@ import { EXAMPLES, expected, observe } from './helpers/typing-unit-examples.ts';
 
 const subsets: TypingUnit[][] = Array.from({ length: 1 << TYPING_UNITS.length }, (_, mask) => TYPING_UNITS.filter((_, i) => mask & (1 << i)));
 
-describe('typing units: all 64 subsets pass the frozen examples', () => {
+describe(`typing units: all ${subsets.length} subsets pass the frozen examples`, () => {
   for (const units of subsets) {
     test(`{${units.join(',')}}`, async () => {
       await withTypingUnits(units, async () => {
@@ -37,4 +38,10 @@ test.skipIf(!haveWorld)('no unit: world-v1 typing is byte-identical to master', 
   const master = readFileSync(join(import.meta.dir, 'fixtures/q2-typing-units/world-v1-master.sha256'), 'utf8').trim();
   const r = await withTypingUnits([], () => worldV1Edges(loadWorldV1(worldDir), extractPageLinks as never, deriveTemporalEvidence as never));
   expect(r.sha256).toBe(master);
+}, 60_000);
+
+test.skipIf(!haveWorld)('shipped package: world-v1 typing is byte-identical to the confirmed package afcec1ad', async () => {
+  const confirmed = readFileSync(join(import.meta.dir, 'fixtures/q2-typing-units/world-v1-confirmed-package.sha256'), 'utf8').trim();
+  const r = await worldV1Edges(loadWorldV1(worldDir), extractPageLinks as never, deriveTemporalEvidence as never);
+  expect(r.sha256).toBe(confirmed);
 }, 60_000);

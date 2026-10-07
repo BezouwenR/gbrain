@@ -93,6 +93,8 @@ const U1: TypingExample[] = [
     off: { types: ['mentions'] }, on: { types: ['mentions'] } },
   { id: 'u1-concurrent-role', unit: 'U1', target: ACME, content: page(`Alice works at ${L(BETA)} and is an adviser to ${L(ACME)}.`),
     off: { types: ['mentions'] }, on: { types: ['advises'] } },
+  { id: 'u1-concurrent-role-after-untyped-role', unit: 'U1', target: BETA, content: page(`Alice is CTO for ${L(ACME)} and an adviser to ${L(BETA)}.`),
+    off: { types: ['mentions'] }, on: { types: ['advises'] } },
   { id: 'u1-concurrent-role-employer-kept', unit: null, target: BETA, content: page(`Alice works at ${L(BETA)} and is an adviser to ${L(ACME)}.`),
     off: { types: ['works_at'], tense: { works_at: 'present' } } },
   { id: 'u1-dated-start', unit: 'U1', target: ACME,
@@ -102,84 +104,6 @@ const U1: TypingExample[] = [
   { id: 'u1-employer-not-closed-by-advising-line', unit: null, target: BETA,
     content: page(`Alice works at ${L(BETA)} as CTO.`, [`**2019-01-02** | linkedin — Joined ${L(BETA)} as CTO`, `**2024-05-06** | note — Now advising ${L(ACME)}`]),
     off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2019-01-02'], live: { type: 'works_at', at: { today: true } } } },
-];
-
-// ─── U2: ordinary job roles, post-pass on `mentions` (undated lines only) ─
-const LONG_NAME = `[Acme ${'Holdings '.repeat(14)}](../${ACME}.md)`;
-const U2: TypingExample[] = [
-  { id: 'u2-role-for', unit: 'U2', target: ACME, content: page(`Alice is CTO for ${L(ACME)} these days.`),
-    off: { types: ['mentions'] }, on: { types: ['works_at'], tense: { works_at: 'present' }, live: { type: 'works_at', at: { today: true } } } },
-  { id: 'u2-works-as-role-for', unit: 'U2', target: ACME, content: page(`Alice works as a designer for ${L(ACME)}.`),
-    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
-  { id: 'u2-led-area-at', unit: 'U2', target: ACME, content: page(`Alice led design at ${L(ACME)} for three years.`),
-    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
-  { id: 'u2-now-at-paren', unit: 'U2', target: ACME, content: page(`Alice is now at ${L(ACME)} (product manager).`),
-    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
-  { id: 'u2-signed-on-as', unit: 'U2', target: ACME, content: page(`Alice signed on with ${L(ACME)} as CTO and remains on the team.`),
-    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
-  { id: 'u2-new-chapter-as', unit: 'U2', target: ACME, content: page(`Alice started a new chapter at ${L(ACME)} as designer and is still there.`),
-    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
-  { id: 'u2-prose-typed-timeline-dates-it', unit: 'U2', target: ACME,
-    content: page(`Alice signed on with ${L(ACME)} as data scientist.`, [`**2022-07-08** | linkedin — Signed on with ${L(ACME)} as data scientist`]),
-    off: { types: ['mentions'], transitions: [] },
-    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2022-07-08'], live: { type: 'works_at', at: { '2022-01-01': false, today: true } } } },
-  // Two or more dated entries about the organization: U2 does not type it (the later one may be a leave no cue reads).
-  { id: 'u2-stale-summary-not-typed', unit: 'U2', target: ACME,
-    content: page(`Alice works as a designer for ${L(ACME)}.`, [`**2014-01-02** | linkedin — Joined ${L(ACME)} (designer)`, `**2017-03-04** | linkedin — Closed the chapter at ${L(ACME)}`]),
-    off: { types: ['mentions'], transitions: [] }, on: { types: ['mentions'], transitions: [] } },
-  // Its cost: a rejoin the timeline dates is not typed from the prose role either.
-  { id: 'u2-rejoin-not-typed', unit: 'U2', target: ACME,
-    content: page(`Alice is designer for ${L(ACME)} again.`, [`**2014-01-02** | linkedin — Joined ${L(ACME)} as engineer`, `**2017-03-04** | linkedin — Left ${L(ACME)}`, `**2020-05-06** | linkedin — Returned to ${L(ACME)} as designer`]),
-    off: { types: ['mentions'], transitions: [] }, on: { types: ['mentions'], transitions: [] } },
-  // Dated entries are not read by U2: a former employer named only on a join line with an unread leave stays untyped.
-  { id: 'u2-dated-join-not-read', unit: 'U2', target: ACME, content: page(`Alice A.`, [`**2022-07-08** | linkedin — Signed on with ${L(ACME)} as data scientist`]),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-dated-paren-move-not-read', unit: 'U2', target: ACME,
-    content: page(`Alice A.`, [`**2016-02-03** | linkedin — Joined ${L(BETA)} as engineer`, `**2020-05-06** | linkedin — Moved from ${L(BETA)} to ${L(ACME)} (CTO)`]),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  // A page that names any organization in an advisory role is left alone (E5: the advisory line would start a job, and a
-  // newly typed employer would then be closed by the single-value pass).
-  { id: 'u2-employer-with-advisory-line-left-alone', unit: 'U2', target: ACME,
-    content: page(`Alice is CTO for ${L(ACME)}.`, [`**2021-06-07** | linkedin — Took an advisory role with ${L(ACME)}`]),
-    off: { types: ['advises', 'mentions'], transitions: [] }, on: { types: ['advises', 'mentions'], transitions: [] } },
-  { id: 'u2-page-with-advisory-line-elsewhere-left-alone', unit: 'U2', target: ACME,
-    content: page(`Alice is now at ${L(ACME)} (CTO). She also works at ${L(BETA)}.`, [`**2021-06-07** | note — Became an advisor at ${L(BETA)}`]),
-    off: { types: ['mentions'], transitions: [] }, on: { types: ['mentions'], transitions: [] } },
-  { id: 'u2-verb-typed-unchanged', unit: null, target: ACME, content: page(`Alice invested in ${L(ACME)} (CTO).`),
-    off: { types: ['invested_in'] } },
-  { id: 'u2-prior-unchanged', unit: null, target: ACME, content: page(`Alice is a seed investor. She met ${L(ACME)} (CTO).`),
-    off: { types: ['invested_in'] } },
-  { id: 'u2-third-party', unit: 'U2', target: ACME, content: page(`Alice's husband is CTO for ${L(ACME)}.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-third-party-friend-joined', unit: 'U2', target: ACME, content: page(`Alice's friend joined ${L(ACME)} as CTO.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-appositive-other-person', unit: 'U2', target: ACME, content: page(`Alice met Bob, CTO for ${L(ACME)}.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-negation', unit: 'U2', target: ACME, content: page(`Alice was never CTO for ${L(ACME)}.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-hypothetical', unit: 'U2', target: ACME, content: page(`Alice will join ${L(ACME)} as CTO next spring.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-interview', unit: 'U2', target: ACME, content: page(`Alice interviewed for CTO at ${L(ACME)}.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-board-director', unit: 'U2', target: ACME, content: page(`Alice is an independent director for ${L(ACME)}.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-observer-paren', unit: 'U2', target: ACME, content: page(`Alice joined ${L(ACME)} (board observer).`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-event-lookalike-speaker', unit: 'U2', target: ACME, content: page(`Alice spoke at ${L(ACME)} as keynote speaker.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-window-truncation', unit: 'U2', target: ACME, content: page(`Alice signed on with ${LONG_NAME} as CTO.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-repeated-target', unit: 'U2', target: ACME, content: page(`Alice is CTO for ${L(ACME)}. She first met ${L(ACME)} founders at a dinner in 2019.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions', 'works_at'] } },
-  { id: 'u2-concurrent-roles-adviser-not-employment', unit: 'U1', target: BETA, content: page(`Alice is CTO for ${L(ACME)} and an adviser to ${L(BETA)}.`),
-    off: { types: ['mentions'] }, on: { types: ['advises'] } },
-  // Known cost of the advisory-page guard: a concurrent employer on a page with an advisory role stays untyped.
-  { id: 'u2-concurrent-roles-employer', unit: 'U2', target: ACME, content: page(`Alice is CTO for ${L(ACME)} and an adviser to ${L(BETA)}.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
-  { id: 'u2-concurrent-employers', unit: 'U2', target: ACME, content: page(`Alice is CTO for ${L(ACME)} and works at ${L(BETA)} on weekends.`),
-    off: { types: ['mentions'] }, on: { types: ['works_at'] } },
-  { id: 'u2-company-page', unit: 'U2', target: ACME, pageType: 'company', content: page(`Beta Corp is CTO for ${L(ACME)}.`),
-    off: { types: ['mentions'] }, on: { types: ['mentions'] } },
 ];
 
 // ─── U3: board, observer and investor wording never types works_at ─────
@@ -266,96 +190,4 @@ const U4: TypingExample[] = [
     off: { types: ['advises'], transitions: ['advises start 2021-06-07'] } },
 ];
 
-// ─── U5: leave idioms and exchange moves (dated ends), with a restart guard ─
-const JOB = (lines: string[]) => page(`Alice worked at ${L(ACME)}. She works at ${L(BETA)} now.`, [`**2015-01-02** | linkedin — Joined ${L(ACME)} as engineer`, ...lines]);
-const U5: TypingExample[] = [
-  { id: 'u5-handed-in-notice', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Handed in her notice at ${L(ACME)}`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] },
-    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'], live: { type: 'works_at', at: { '2016-01-01': true, '2020-01-01': false } } } },
-  { id: 'u5-wrapped-time-up', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Wrapped her time up at ${L(ACME)}`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
-  { id: 'u5-packed-it-in', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Called it a day at ${L(ACME)} and packed it in`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
-  { id: 'u5-stepped-back-from', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Stepped back from ${L(ACME)}`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
-  { id: 'u5-parted-company-with', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Parted company with ${L(ACME)}`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
-  { id: 'u5-farewell', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Said goodbye to ${L(ACME)} after four years`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
-  { id: 'u5-exchange-ends-first', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | linkedin — Swapped ${L(ACME)} for ${L(BETA)} (designer)`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
-  { id: 'u5-exchange-starts-second', unit: 'U5', target: BETA, content: JOB([`**2019-03-04** | linkedin — Swapped ${L(ACME)} for ${L(BETA)} (designer)`]),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2019-03-04'], live: { type: 'works_at', at: { '2018-01-01': false, today: true } } } },
-  { id: 'u5-traded-shares-control', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | note — Traded shares of ${L(ACME)} for cash`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] } },
-  { id: 'u5-event-line-control', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | event — Said goodbye to ${L(ACME)} at the farewell dinner`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] } },
-  { id: 'u5-qualified-control', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | note — Said goodbye to ${L(ACME)}'s old office`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] } },
-  // Unsupported, frozen: U5 does not resolve the subject (a third party's leave on the page dates the subject's stint).
-  { id: 'u5-third-party-split-leave', unit: 'U5', target: ACME, content: JOB([`**2019-03-04** | note — Her manager handed in his notice at ${L(ACME)}`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'] } },
-  // Restart guard: a later plain mention no cue reads (an onboarding week) keeps the stint open; without the guard the
-  // leave would close the current job for good (the dev trace's onboarding losses).
-  { id: 'u56-rejoin-restart-guard', unit: ['U5', 'U6'], target: ACME,
-    content: page(`Alice works at ${L(ACME)} as head of sales.`, [`**2015-01-02** | linkedin — Joined ${L(ACME)} as engineer`, `**2018-03-04** | linkedin — Parted company with ${L(ACME)}`, `**2020-08-11** | linkedin — Onboarding week at ${L(ACME)} as head of sales`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'], live: { type: 'works_at', at: { '2019-01-01': true, today: true } } },
-    on: units => !units.has('U6')
-      ? { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'], live: { type: 'works_at', at: { '2019-01-01': true, today: true } } }
-      : { types: ['mentions', 'works_at'],
-        transitions: units.has('U5') ? ['works_at start 2015-01-02', 'works_at end 2018-03-04', 'works_at start 2020-08-11'] : ['works_at start 2015-01-02', 'works_at start 2020-08-11'],
-        live: { type: 'works_at', at: { '2019-01-01': !units.has('U5'), today: true } } } },
-  { id: 'u5-leave-not-guarded-by-share-trade', unit: 'U5', target: ACME,
-    content: JOB([`**2019-03-04** | linkedin — Called it a day at ${L(ACME)} and packed it in`, `**2021-07-15** | note — Traded shares of ${L(ACME)} on the secondary market`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] },
-    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'], live: { type: 'works_at', at: { today: false } } } },
-  { id: 'u5-leave-not-guarded-by-event-mention', unit: 'U5', target: ACME,
-    content: JOB([`**2019-03-04** | linkedin — Parted company with ${L(ACME)}`, `**2021-05-06** | event — Back at ${L(ACME)} for the alumni dinner`]),
-    off: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02'] },
-    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'], live: { type: 'works_at', at: { today: false } } } },
-];
-
-// ─── U6: start framings (dated starts of an asserted works_at) ─────────
-const NOW_AT = (line: string) => page(`Alice works at ${L(ACME)} as designer.`, [`**2021-09-01** | ${line.replace('{X}', L(ACME))}`]);
-const U6: TypingExample[] = [
-  { id: 'u6-first-day-at', unit: 'U6', target: ACME, content: NOW_AT('linkedin — First day at {X} as designer'),
-    off: { types: ['mentions', 'works_at'], transitions: [] },
-    on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2021-09-01'], live: { type: 'works_at', at: { '2021-01-01': false, today: true } } } },
-  { id: 'u6-day-one', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Day one with {X}'),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2021-09-01'] } },
-  { id: 'u6-kicked-off-role', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Kicked off a new role at {X}'),
-    off: { types: ['works_at'], transitions: [] }, on: { types: ['works_at'], transitions: ['works_at start 2021-09-01'] } },
-  { id: 'u6-onboarded-at', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Onboarded at {X} this week'),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2021-09-01'] } },
-  { id: 'u6-began-working-at', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Began working at {X}'),
-    off: { types: ['works_at'], transitions: [] }, on: { types: ['works_at'], transitions: ['works_at start 2021-09-01'] } },
-  { id: 'u6-new-chapter-at', unit: 'U6', target: ACME, content: NOW_AT('linkedin — Starting a new chapter at {X} as designer'),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: ['works_at start 2021-09-01'] } },
-  { id: 'u6-kickoff-without-employment-noun', unit: 'U6', target: ACME, content: NOW_AT('note — Kick-off at {X} for the new project'),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
-  { id: 'u6-first-day-of-summit', unit: 'U6', target: ACME, content: NOW_AT('event — First day of the {X} summit'),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
-  { id: 'u6-event-line-first-day', unit: 'U6', target: ACME, content: NOW_AT('event — First day at the {X} hackathon'),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
-  { id: 'u6-onboarding-call-qualified', unit: 'U6', target: ACME, content: NOW_AT("meeting — Onboarding call with the {X} alumni mentors"),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
-  { id: 'u6-began-working-with-collaboration', unit: 'U6', target: ACME, content: NOW_AT('note — Began working with {X} on a pilot'),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
-  // Leave guard: an unread leave after the start drops the U6 start (the former job would stay open for good); U5 reads
-  // this leave, so with U5 the start and the end both date the stint.
-  { id: 'u56-former-job-leave-guard', unit: ['U5', 'U6'], target: ACME,
-    content: page(`Alice worked at ${L(ACME)}. She works at ${L(BETA)} now.`, [`**2015-01-02** | linkedin — First day at ${L(ACME)} as engineer`, `**2019-03-04** | linkedin — Parted company with ${L(ACME)}`]),
-    off: { types: ['mentions', 'works_at'], transitions: [], live: { type: 'works_at', at: { '2016-01-01': false, today: false } } },
-    on: units => units.has('U5') && units.has('U6')
-      ? { types: ['mentions', 'works_at'], transitions: ['works_at start 2015-01-02', 'works_at end 2019-03-04'], live: { type: 'works_at', at: { '2016-01-01': true, today: false } } }
-      : units.has('U5') ? { types: ['mentions', 'works_at'], transitions: ['works_at end 2019-03-04'], live: { type: 'works_at', at: { '2016-01-01': true, today: false } } }
-      : { types: ['mentions', 'works_at'], transitions: [], live: { type: 'works_at', at: { '2016-01-01': false, today: false } } } },
-  { id: 'u6-advisory-page-not-started', unit: 'U6', target: ACME,
-    content: page(`Alice works at ${L(ACME)} as designer. She also works at ${L(BETA)}.`, [`**2021-09-01** | linkedin — First day at ${L(ACME)} as designer`, `**2023-02-03** | note — Became an advisor at ${L(BETA)}`]),
-    off: { types: ['mentions', 'works_at'], transitions: [] }, on: { types: ['mentions', 'works_at'], transitions: [] } },
-  { id: 'u6-untyped-target-not-started', unit: 'U6', target: BETA,
-    content: page(`Alice works at ${L(ACME)}.`, [`**2021-09-01** | linkedin — First day at ${L(BETA)}`]),
-    off: { types: ['mentions'], transitions: [] }, on: { types: ['mentions'], transitions: [] } },
-];
-
-export const EXAMPLES: TypingExample[] = [...U1, ...U2, ...U3, ...U4, ...U5, ...U6];
+export const EXAMPLES: TypingExample[] = [...U1, ...U3, ...U4];

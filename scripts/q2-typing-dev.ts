@@ -3,9 +3,9 @@
  * Q2 typing units: development dumps and identity tables (development data only).
  *
  *   bun scripts/q2-typing-dev.ts dump --evals <gbrain-evals checkout> --root <gbrain tree> \
- *     --phrasing A|A2|A3|<dev phrasing JSON> [--seeds 3,5] [--units U1,U2|none] --out <dump.json>
+ *     --phrasing A|A2|A3|<dev phrasing JSON> [--seeds 3,5] [--units U1,U3|none] --out <dump.json>
  *   bun scripts/q2-typing-dev.ts compare --base <dump.json> --arm <dump.json> [--json]
- *   bun scripts/q2-typing-dev.ts world-v1 --evals <gbrain-evals checkout> --root <gbrain tree> [--units U1,U2|none] [--out <edges.json>]
+ *   bun scripts/q2-typing-dev.ts world-v1 --evals <gbrain-evals checkout> --root <gbrain tree> [--units U1,U3|none] [--out <edges.json>]
  *
  * `dump` renders the temporal-edges world (gbrain-evals eval/generators/temporal-edges-gen.ts, E5 probe people
  * included) for each development seed, writes every page through `put_page` on in-memory PGLite using the gbrain
