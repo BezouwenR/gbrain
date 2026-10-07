@@ -169,9 +169,9 @@ export async function writeDerivedAliases(tx: Pick<BrainEngine, 'executeRaw' | '
 export async function writePageAliases(tx: BrainEngine, slug: string, sourceId: string,
   page: { title: string; type: string; compiled_truth: string; timeline: string; frontmatter: Record<string, unknown> }, pack: unknown,
   policy: MentionPolicy | null): Promise<void> {
-  // Frontmatter and derived rows are disjoint (by origin): both replacements are sent together.
+  // #5984: the frontmatter and derived rows are independent; their statements are pipelined, in the caller's transaction.
   await pipelined(tx, [
-    () => tx.setPageAliases(slug, sourceId, normalizeAliasList(page.frontmatter.aliases)),
+    () => tx.setPageAliases(slug, sourceId, normalizeAliasList(page.frontmatter.aliases), { inline: true }),
     () => writeDerivedAliases(tx, sourceId, { slug, ...page }, { pack: (pack as PackTypes | undefined) ?? null, policy }),
   ]);
 }

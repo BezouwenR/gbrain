@@ -33,7 +33,7 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
-import { authorizeStoredRequest } from './authority.ts';
+import { authorizeStoredRequest, storedAuthorizationReads } from './authority.ts';
 import { localHostId } from './identity.ts';
 import { acquireWorktree, acquireWorktreeShared, getWorktreeBinding, guardOwnership } from './ownership.ts';
 import { awaitLaneBegin, awaitLaneTurn, LaneAbort, laneApplyBegin, laneClaimed, laneFinished, stepDownLanes, type LaneState } from './sync-lanes.ts';
@@ -121,6 +121,45 @@ function groupReads(tx: BrainEngine): BrainEngine {
   } });
 }
 
+/**
+ * #5984: reads a claimed group's preparation repeats for every member and that
+ * publication checks again inside the group transaction (the local writer, the
+ * source binding and root, the coordinator switch, the shared skill packs), plus
+ * the source's own row. Plain reads only; a locking read is never answered here.
+ */
+const STABLE_IN_PREPARATION = new Set([
+  'SELECT lane,revoked_at,grant_ceiling FROM persistence_local_writers WHERE id=$1::uuid',
+  'SELECT s.source_id,s.source_incarnation,s.worktree_id,s.relative_path, s.topology_generation::text AS topology_generation,w.owner_host_id,w.owner_epoch::text AS owner_epoch,w.state, h.local_path,h.coordination_path FROM persistence_source_bindings s JOIN persistence_worktrees w ON w.id=s.worktree_id LEFT JOIN persistence_host_bindings h ON h.worktree_id=w.id AND h.host_id=$2::uuid WHERE s.source_id=$1',
+  'SELECT local_path FROM sources WHERE id=$1',
+  'SELECT enabled FROM persistence_brain WHERE singleton=1',
+  "SELECT to_regclass('shared_skill_packs') IS NOT NULL AS present",
+  'SELECT p.source_id,p.source_incarnation,s.local_path AS source_root, h.local_path AS worktree_root,b.relative_path FROM shared_skill_packs p JOIN sources s ON s.id=p.source_id AND s.incarnation=p.source_incarnation LEFT JOIN persistence_source_bindings b ON b.source_id=p.source_id AND b.source_incarnation=p.source_incarnation LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid',
+  'SELECT id, name, local_path, last_commit, last_sync_at, config, created_at, contextual_retrieval_mode, trust_frontmatter_overrides FROM sources WHERE id = $1',
+]);
+/**
+ * #5984: the engine a claimed group's members are prepared with. The reads
+ * above and config values (`getConfig`, `getAllConfig`) are answered once for
+ * the whole preparation, as if every member were prepared at the same moment;
+ * publication re-checks what it relies on under its locks. It lives only for
+ * one group's preparation; a failed read is not kept.
+ */
+function preparationReads(engine: BrainEngine): BrainEngine {
+  const reads = new Map<string, Promise<unknown>>();
+  const once = <T>(id: string, read: () => Promise<T>): Promise<T> => {
+    let value = reads.get(id) as Promise<T> | undefined;
+    if (!value) { value = read(); reads.set(id, value); value.catch(() => reads.delete(id)); }
+    return value;
+  };
+  return new Proxy(engine, { get(target, key) {
+    if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) =>
+      STABLE_IN_PREPARATION.has(flat(sql)) && !opts?.signal ? once(JSON.stringify([flat(sql), params ?? null]), () => target.executeRaw(sql, params, opts)) : target.executeRaw(sql, params, opts);
+    if (key === 'getConfig') return (name: string) => once(`config:${name}`, () => target.getConfig(name));
+    if (key === 'getAllConfig') return () => once('config:*', () => target.getAllConfig()).then(all => ({ ...all }));
+    const value = Reflect.get(target, key, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+}
+
 /** Test seams around a group's commit and its rollback. */
 export interface GroupHooks {
   beforeCommit?(rows: WriteRequest[]): Promise<void>;
@@ -184,26 +223,36 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
       timed.apply?.end(rows.length);
       if (lane) timed.apply = laneApplyBegin(lane);
       const tx = groupReads(opened);
-      // The guards are sent together and judged in order; any failure rolls the whole transaction back.
+      // #5984: the transaction's guards, locks and the members' shared authorization reads (answered from the memo
+      // below) go out as one pipeline in the order they always took; they are judged in order, and any failure rolls
+      // the whole transaction back.
       const members = [...recorded.values()].map(member => member.row);
-      const [, live, started, readOnly] = await pipelined(tx, [
+      const keys = rows.flatMap((row, i) => [{ sourceId: row.source_id, slug: row.slug, incarnation: row.source_incarnation },
+        ...(prepared[i]!.additionalPageKeys ?? []).map(key => key.sourceId === row.source_id ? { ...key, incarnation: row.source_incarnation } : key)]);
+      const ready = pipelined(tx, [
         () => declareDurablePersistence(tx),
         () => guardOwnership(tx, head, hostId),
         // A published file needs recovery even if this transaction rolls back; claims are verified first.
         () => members.length ? tx.executeRaw(`UPDATE persistence_requests r SET publication_started=true FROM unnest($1::uuid[],$2::uuid[]) AS t(id,token)
           WHERE r.id=t.id AND r.execution_token=t.token AND r.state='running' RETURNING r.id`, [members.map(row => row.id), members.map(row => row.execution_token)]) : Promise.resolve([]),
         () => prepared.some(member => member.file) ? sourceMirrorReadOnly(tx, head.source_id, true) : Promise.resolve(false),
-        () => tx.lockPageKeys(rows.flatMap((row, i) => [{ sourceId: row.source_id, slug: row.slug }, ...(prepared[i]!.additionalPageKeys ?? [])])),
+        () => tx.lockPageKeys(keys),
         // The owner's host binding every file member's Git effect records (a STABLE_IN_GROUP read), fetched with the guards.
         () => prepared.some(member => member.file && !member.noop) ? tx.executeRaw(HOST_BINDING_SQL, [head.worktree_id]) : Promise.resolve([]),
-      ]) as [unknown, Awaited<ReturnType<typeof guardOwnership>>, unknown[], boolean, unknown, unknown];
-      if (String(live?.owner_epoch) !== String(binding.owner_epoch)) throw new OperationError('owner_unavailable', 'Owner epoch changed before publication.', 'Inspect the source owner with gbrain sources writer status; do not claim or transfer the source to push this write.');
-      if (started.length !== members.length) throw new OperationError('write_claim_lost', 'Execution claim changed before publication.', 'Another worker holds the request; inspect it rather than resubmitting.');
-      // A file target prepared before the source became a read-only mirror is never published (as in publishMutation, noop included).
-      if (readOnly) throw new OperationError('source_changed', 'The source became a read-only mirror after this write was prepared.', 'The members publish one at a time.');
+        ...storedAuthorizationReads(tx, rows, true),
+      ]).then(results => {
+        const [, live, started, readOnly] = results as [unknown, Awaited<ReturnType<typeof guardOwnership>>, unknown[], boolean];
+        if (String(live?.owner_epoch) !== String(binding.owner_epoch)) throw new OperationError('owner_unavailable', 'Owner epoch changed before publication.', 'Inspect the source owner with gbrain sources writer status; do not claim or transfer the source to push this write.');
+        if (started.length !== members.length) throw new OperationError('write_claim_lost', 'Execution claim changed before publication.', 'Another worker holds the request; inspect it rather than resubmitting.');
+        // A file target prepared before the source became a read-only mirror is never published (as in publishMutation, noop included).
+        if (readOnly) throw new OperationError('source_changed', 'The source became a read-only mirror after this write was prepared.', 'The members publish one at a time.');
+      });
+      // The coordinated write's settings statement follows that pipeline. When the pipeline fails first, the
+      // transaction reports that failure (postgres.js names the cause of a 25P02 abort), not the settings statement's abort.
+      ready.catch(() => undefined);
       const outcomes: Record<string, unknown>[] = [];
       // A member's lead (authorization, knowledge guard, its locked read) only reads; the first member's
-      // is sent ahead of the coordinated-write settings statement, the others in turn.
+      // is sent ahead of the coordinated-write settings statement, the others with the previous member's effects.
       const lead = (i: number) => pipelined(tx, [
         () => authorizeStoredRequest(tx, rows[i]!, true, { pageVisibility: false }),
         async () => { if (!syncMember(rows[i]!)) await assertKnowledgePublicationAllowed(tx, rows[i]!, prepared[i]!.file); },
@@ -213,32 +262,49 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
       first.catch(() => undefined);
       // One coordinated write for the group; each member is the attributed actor of what it writes.
       await withCoordinatedWrite(tx, [head.source_id], async () => {
+        await ready;
+        // The previous member's effects (rows no attribution or page check depends on) go out with the next member's checks.
+        let effects: (() => Promise<void>) | null = null;
         for (let i = 0; i < rows.length; i++) {
-          const row = rows[i]!, member = prepared[i]!, file = recorded.get(i);
-          const [, , snapshot] = await (i === 0 ? first : lead(i));
-          await authorizePageVisibility(tx, row.authority, row.slug);
-          if ((snapshot?.page.id ?? null) !== row.page_id) throw new OperationError('page_identity_changed', 'The accepted page was deleted or recreated.', 'Read the page again and submit a new intent with a new request_id.');
-          await assertUnboundPublication(tx, row, snapshot?.page.source_path);
-          if ((snapshot?.revision ?? null) !== member.observedRevision) throw new OperationError('revision_conflict', 'The page changed during preparation.', 'Read its current revision and submit the updated intent with a new request_id.');
-          await member.validate?.(tx);
+          const row = rows[i]!, member = prepared[i]!, file = recorded.get(i), sync = syncMember(row), previous = effects;
+          // A group of one is already attributed to its only member by the coordinated write.
+          const attribute = rows.length > 1;
+          // #5984: a member's checks and reads are pipelined and run in their usual order, so the first failing one is reported.
+          // A sync member validates alongside (read-only checks); a member that publishes a file sets its attribution after the file.
+          const [, snapshot] = await pipelined(tx, [
+            async () => { await previous?.(); },
+            async () => {
+              const [, , snapshot] = await (i === 0 ? first : lead(i));
+              await authorizePageVisibility(tx, row.authority, row.slug);
+              if ((snapshot?.page.id ?? null) !== row.page_id) throw new OperationError('page_identity_changed', 'The accepted page was deleted or recreated.', 'Read the page again and submit a new intent with a new request_id.');
+              await assertUnboundPublication(tx, row, snapshot?.page.source_path);
+              if ((snapshot?.revision ?? null) !== member.observedRevision) throw new OperationError('revision_conflict', 'The page changed during preparation.', 'Read its current revision and submit the updated intent with a new request_id.');
+              return snapshot;
+            },
+            async () => { if (sync) await member.validate?.(tx); },
+            async () => { if (!file && attribute) await setMemberAttribution(tx, requestAttribution(row)); },
+          ]) as [unknown, Awaited<ReturnType<BrainEngine['readPageSnapshot']>>];
+          if (!sync) await member.validate?.(tx);
           if (file) {
             if (persistenceFileHash(file.record.path) !== file.record.beforeHash) throw new OperationError('unexpected_file_bytes', 'The canonical file changed during preparation.', 'The members publish one at a time.');
             await seam('before_publication', row);
             await withFilesystemPublication([file.record.root], async () => publishPersistenceFile(member.file!, file.record.staging?.publication?.path));
             await seam('after_publication', row);
+            if (attribute) await setMemberAttribution(tx, requestAttribution(row));
           }
-          // A group of one is already attributed to its only member by the coordinated write.
-          if (rows.length > 1) await setMemberAttribution(tx, requestAttribution(row));
           member.postimage = undefined;
           const outcome = await member.apply(tx, snapshot);
           await classifyUnboundPage(tx, row);
           if (member.databaseOnlyReason === 'mirror_read_only') await classifyMirrorPage(tx, row);
           const final = await publicationPostimage(tx, row, member);
           decoratePublicationOutcome(row, member, outcome, final, file ? 1 : 0, false);
-          await recordPublicationFenceTrend(tx, row, outcome);
-          await queuePublicationEffects(tx, row, final, outcome, member, singleWrite(row) ? {} : { deferBatchReconcile: true });
+          effects = async () => {
+            await recordPublicationFenceTrend(tx, row, outcome);
+            await queuePublicationEffects(tx, row, final, outcome, member, singleWrite(row) ? {} : { deferBatchReconcile: true });
+          };
           outcomes.push(outcome);
         }
+        await effects?.();
       }, requestAttribution(head));
       // #5984 lanes: applied concurrently, committed in manifest order.
       if (lane) { timed.apply?.turn(); await awaitLaneTurn(tx, lane, rows); timed.apply?.turned(); }
@@ -390,7 +456,8 @@ export async function completeGroup(tx: BrainEngine, rows: WriteRequest[], outco
 export interface GroupExecution {
   /** #5984 lanes: the open lane run this group belongs to in this process. */
   lane?: LaneState | null;
-  prepare(row: WriteRequest): Promise<PreparedMutation>;
+  /** `engine` answers the members' repeated preparation reads once (see preparationReads). */
+  prepare(row: WriteRequest, engine: BrainEngine): Promise<PreparedMutation>;
   settled(row: WriteRequest): void;
   hostId: string;
   hooks?: GroupHooks;
@@ -422,12 +489,13 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
   if (run.lane) laneClaimed(run.lane, rows);
   try {
     const prepared: Array<{ ok: PreparedMutation } | { error: unknown }> = new Array(rows.length);
+    const reads = preparationReads(engine);
     // A put_pages group prepares all of its (at most PAGE_BATCH_GROUP_MAX) pages at once.
     const width = publicationGroupKey(rows[0]!)?.startsWith('batch:') ? PAGE_BATCH_GROUP_MAX : 4;
     const preparing = (async () => {
       for (let start = 0; start < rows.length; start += width) {
         await Promise.all(rows.slice(start, start + width).map(async (row, offset) => {
-          try { prepared[start + offset] = { ok: await run.prepare(row) }; } catch (error) { prepared[start + offset] = { error }; }
+          try { prepared[start + offset] = { ok: await run.prepare(row, reads) }; } catch (error) { prepared[start + offset] = { error }; }
         }));
       }
     })();

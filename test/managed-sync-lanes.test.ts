@@ -2,7 +2,7 @@
  * #5984 lanes (Postgres only): several bulk groups of one draining managed
  * sync publish at once and still commit in manifest order.
  */
-import { afterAll, beforeAll, expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, setSystemTime, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -81,20 +81,25 @@ test('the drain names what limited its lanes and what raises it', () => {
 });
 
 test('lane timing counts busy lanes, apply time per page and the commit-turn wait share', async () => {
-  openLanes('wt-time', 'run-time', 4, null);
-  const state = laneOf({ worktree_id: 'wt-time', intent: { lane: 'run-time' } } as never)!;
-  const a = laneApplyBegin(state), b = laneApplyBegin(state);
-  await new Promise(resolve => setTimeout(resolve, 60));
-  a.turn(); b.turn();
-  await new Promise(resolve => setTimeout(resolve, 40));
-  a.turned(); a.end(4);
-  b.turned(); b.end(2);
-  const stats = (await closeLaneRun('run-time'))!;
-  expect(stats.busy).toBeGreaterThan(1.8);
-  expect(stats.applyMsPerPage).toBeGreaterThanOrEqual(15);
-  expect(stats.applyMsPerPage).toBeLessThan(40);
-  expect(stats.turnWaitShare).toBeGreaterThan(0.3);
-  expect(stats.turnWaitShare).toBeLessThan(0.6);
+  // The clock is driven by the test, so a late timer on a loaded machine cannot move the measured shares.
+  const t0 = Date.now();
+  try {
+    setSystemTime(new Date(t0));
+    openLanes('wt-time', 'run-time', 4, null);
+    const state = laneOf({ worktree_id: 'wt-time', intent: { lane: 'run-time' } } as never)!;
+    const a = laneApplyBegin(state), b = laneApplyBegin(state);
+    setSystemTime(new Date(t0 + 60));
+    a.turn(); b.turn();
+    setSystemTime(new Date(t0 + 100));
+    a.turned(); a.end(4);
+    b.turned(); b.end(2);
+    const stats = (await closeLaneRun('run-time'))!;
+    expect(stats.busy).toBe(2);
+    expect(stats.applyMsPerPage).toBe(20);
+    expect(stats.turnWaitShare).toBe(0.4);
+  } finally {
+    setSystemTime();
+  }
 });
 
 test('a lease is shared by lanes; an exclusive writer drains and wounds it and gets the lock once the lanes leave', async () => {
