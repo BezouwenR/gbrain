@@ -8,7 +8,7 @@
  * unchanged (`getAllConfig` answers from the same read). Publication reads its config again inside its transaction.
  */
 import type { BrainEngine } from '../engine.ts';
-import { VIEWED_ENGINE } from './switches.ts';
+import { registerEngineView } from './switches.ts';
 
 const KEY_READ = 'SELECT value FROM config WHERE key=$1';
 const flat = (sql: string) => sql.replace(/\s+/g, ' ').trim();
@@ -17,8 +17,7 @@ export async function preparationConfigView(engine: BrainEngine): Promise<BrainE
   const rows = await engine.executeRaw<{ key: string; value: string }>('SELECT key,value FROM config');
   const values = new Map(rows.map(row => [row.key, row.value]));
   const value = (key: string) => values.has(key) ? values.get(key)! : null;
-  return new Proxy(engine, { get(target, key) {
-    if (key === VIEWED_ENGINE) return target;
+  return registerEngineView(new Proxy(engine, { get(target, key) {
     if (key === 'getConfig') return async (name: string) => value(name);
     if (key === 'getAllConfig') return async () => Object.fromEntries(values);
     if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) =>
@@ -27,5 +26,5 @@ export async function preparationConfigView(engine: BrainEngine): Promise<BrainE
         : target.executeRaw(sql, params, opts);
     const member = Reflect.get(target, key, target);
     return typeof member === 'function' ? member.bind(target) : member;
-  } });
+  } }), engine);
 }

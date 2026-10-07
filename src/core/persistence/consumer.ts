@@ -24,7 +24,7 @@ import { maybeRefreshPlannerStats } from '../planner-stats.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 import { faultPoint } from './fault-points.ts';
 import { releaseAbandonedClaims } from './effect-journal.ts';
-import { writeSwitchOn } from './switches.ts';
+import { readWriteSwitches, writeSwitchOn } from './switches.ts';
 
 type PhaseObservation = { name: string; started_at: string; deadline_exceeded: boolean; attempt: number; first_conn_ms?: number };
 /** #5373: set by a task that abandons a still-running preparation after losing its claim; its root is freed only once `until` settles. */
@@ -77,8 +77,10 @@ export class PersistenceConsumer {
   private topologyRetryAfter = new Map<string, number>();
   private idleLane: { conn: ReservedConnection; release: () => Promise<void> } | undefined;
   private idleLaneRetryAt = 0;
-  /** Phase 4.4: a single write is publishing on the idle lane's connection. */
+  /** Phase 4.4: a single write is publishing or admitting on the idle lane's connection. */
   private laneInUse = false;
+  /** An idle probe is running on the lane; it is not lent until the probe settles. */
+  private probeOnLane = false;
   private active = new Set<Promise<void>>();
   /** #5373: preparations and renewals that outlived their claim; stop() drains them before the engine closes. */
   private outlived = new Set<Promise<void>>();
@@ -176,7 +178,7 @@ export class PersistenceConsumer {
     const excluded = [...this.activeRoots, ...[...this.rootRetryAfter].filter(([, at]) => at > now).map(([root]) => root)];
     for (const [id, at] of this.topologyRetryAfter) if (at <= now) this.topologyRetryAfter.delete(id);
     const retryingTopologies = [...this.topologyRetryAfter.keys()];
-    const [row] = await this.phase('idle_probe', async signal => this.probeQuery<{ work: boolean }>(await this.acquireIdleLane(signal), `SELECT (
+    const [row] = await this.phase('idle_probe', async signal => this.probeQuery<{ work: boolean }>(this.laneInUse ? undefined : await this.acquireIdleLane(signal), `SELECT (
       EXISTS (SELECT 1 FROM persistence_requests r LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
         WHERE ${CLAIMABLE_WRITE_SQL}
         AND ($3::boolean OR r.blocked_reason IS DISTINCT FROM 'writer_pool_capacity'))
@@ -273,7 +275,7 @@ export class PersistenceConsumer {
   async onLane<T>(run: (transaction: <R>(fn: (tx: BrainEngine) => Promise<R>) => Promise<R>) => Promise<T>): Promise<T | typeof LANE_BUSY> {
     if (this.engine.kind !== 'postgres' || this.stopping || this.laneInUse || !await writeSwitchOn(this.engine, 'single_write_group').catch(() => true)) return LANE_BUSY;
     const conn = await this.acquireIdleLane(undefined, true) as (ReservedConnection & Partial<ReservedTransactions>) | undefined;
-    if (!conn?.transaction || this.laneInUse) return LANE_BUSY;
+    if (!conn?.transaction || this.laneInUse || this.probeOnLane || this.idleLane?.conn !== conn) return LANE_BUSY;
     this.laneInUse = true;
     try {
       return await run(fn => conn.transaction!(fn));
@@ -287,7 +289,10 @@ export class PersistenceConsumer {
   }
   private async probeQuery<T>(lane: ReservedConnection | undefined, sql: string, params: unknown[], signal?: AbortSignal): Promise<T[]> {
     if (!lane) return this.engine.executeRaw<T>(sql, params, { signal });
+    if (this.laneInUse) return this.engine.executeRaw<T>(sql, params, { signal });
+    this.probeOnLane = true;
     const query = lane.executeRaw<T>(sql, params);
+    void query.then(() => { this.probeOnLane = false; }, () => { this.probeOnLane = false; });
     if (!signal) return query;
     const aborted = Promise.withResolvers<never>();
     const onAbort = () => aborted.reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
@@ -295,8 +300,8 @@ export class PersistenceConsumer {
     try { return await Promise.race([query, aborted.promise]); }
     catch (error) {
       // The reserved query cannot be cancelled: stop using the lane now, return it to the pool once the query settles.
-      const current = this.idleLane;
-      if (current?.conn === lane) this.idleLane = undefined;
+      const current = this.idleLane?.conn === lane ? this.idleLane : undefined;
+      if (current) this.idleLane = undefined;
       this.idleLaneRetryAt = Date.now() + 60_000;
       void query.then(() => current?.release(), () => current?.release());
       throw error;
@@ -346,10 +351,13 @@ export class PersistenceConsumer {
       }
     }
     // Lane runs size themselves to the pool's long-hold budget; a single write keeps its warm lane.
-    if (laneRoots().length || this.engine.kind !== 'postgres' || !await writeSwitchOn(this.engine, 'single_write_group').catch(() => true)) await this.releaseIdleLane();
+    // The switches are read under the tick's phase deadline, so a saturated pool cannot hold the tick.
+    const fast = await this.phase('switches', signal => readWriteSwitches(this.engine, { signal }))
+      .then(switches => switches.single_write_group, async error => { await this.releaseIdleLane(); throw error; });
+    if (laneRoots().length || this.engine.kind !== 'postgres' || !fast) await this.releaseIdleLane();
     this.idleDelayMs = this.pollMs;
     this.nextDelayMs = this.pollMs;
-    const direct = afterProgress && this.ownAdmission && await writeSwitchOn(this.engine, 'single_write_group').catch(() => true);
+    const direct = afterProgress && this.ownAdmission && fast;
     this.ownAdmission = false;
     const scan = !direct && (!afterProgress || Date.now() - this.lastScan >= this.pollMs);
     if (scan) {

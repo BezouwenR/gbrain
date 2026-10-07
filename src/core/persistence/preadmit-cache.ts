@@ -19,7 +19,7 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
-import { VIEWED_ENGINE, writeSwitchOn } from './switches.ts';
+import { registerEngineView, writeSwitchOn } from './switches.ts';
 
 export const PREADMIT_TTL_MS = 30_000;
 const BRAIN_SQL = 'SELECT brain_id FROM persistence_brain WHERE singleton=1';
@@ -79,15 +79,14 @@ export async function preadmitReads(engine: BrainEngine, now: () => number = Dat
   };
   // Every cached read is filed under the brain it was taken for, which admission checks.
   if (!held.brainId || now() - held.brainId.at >= PREADMIT_TTL_MS) await read(BRAIN_SQL, undefined, undefined);
-  return new Proxy(engine, { get(target, key) {
-    if (key === VIEWED_ENGINE) return target;
+  return registerEngineView(new Proxy(engine, { get(target, key) {
     if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) => {
       const text = flat(sql);
       return text === BRAIN_SQL || text === SOURCE_SQL || text === BINDING_SQL || WRITER_SQL.has(text) ? read(text, params, opts) : target.executeRaw(sql, params, opts);
     };
     const value = Reflect.get(target, key, target);
     return typeof value === 'function' ? value.bind(target) : value;
-  } });
+  } }), engine);
 }
 
 /** Thrown by admission when the brain behind the connection is not the one the cached reads came from; never leaves the retry. */

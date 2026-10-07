@@ -37,15 +37,22 @@ function resolve(configured: Map<string, string>): WriteSwitches {
   return out;
 }
 
-/** A read-through view of an engine (preparation config, pre-admission cache) names its engine here, so it shares that engine's snapshot. */
-export const VIEWED_ENGINE = Symbol('gbrain.viewedEngine');
+/** Read-through views of an engine (preparation config, pre-admission cache) and the engine they read through. */
+const views = new WeakMap<object, object>();
+export function registerEngineView<T extends object>(view: T, engine: object): T { views.set(view, engine); return view; }
+/** The engine a view reads through (itself when it is not a view), so a view shares its engine's snapshots and memos. */
+export function viewedEngine<T extends object>(engine: T): T { return (views.get(engine) as T | undefined) ?? engine; }
 
-/** The switch snapshot of `engine`'s brain, at most SWITCH_TTL_MS old. A failed read is not kept. */
-export function readWriteSwitches(viewed: SqlEngine, now: () => number = Date.now): Promise<WriteSwitches> {
-  const engine = (viewed as { [VIEWED_ENGINE]?: SqlEngine })[VIEWED_ENGINE] ?? viewed;
+/**
+ * The switch snapshot of `engine`'s brain, at most SWITCH_TTL_MS old. A failed read is not kept.
+ * `signal` cancels a read this call starts (the consumer's tick reads under its phase deadline).
+ */
+export function readWriteSwitches(viewed: SqlEngine, opts: { now?: () => number; signal?: AbortSignal } = {}): Promise<WriteSwitches> {
+  const now = opts.now ?? Date.now;
+  const engine = viewedEngine(viewed);
   const held = snapshots.get(engine);
   if (held && held.generation === generation && now() - held.at < SWITCH_TTL_MS) return held.read;
-  const read = engine.executeRaw<{ key: string; value: string }>('SELECT key,value FROM config WHERE key = ANY($1::text[])', [WRITE_SWITCH_KEYS])
+  const read = engine.executeRaw<{ key: string; value: string }>('SELECT key,value FROM config WHERE key = ANY($1::text[])', [WRITE_SWITCH_KEYS], { signal: opts.signal })
     .then(rows => resolve(new Map(rows.map(row => [row.key, row.value]))));
   snapshots.set(engine, { at: now(), generation, read });
   read.catch(() => { if (snapshots.get(engine)?.read === read) snapshots.delete(engine); });
