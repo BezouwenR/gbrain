@@ -29,7 +29,9 @@ export interface LaneState extends LanePolicy { coordinationPath: string | null;
   tasks: number; closing: boolean; timing: LaneTiming }
 /** Lane group transactions of a run in this process: how many are open, and where their time went. */
 interface LaneTiming { open: number; since: number; openArea: number; activeMs: number;
-  applyMs: number; appliedMembers: number; turnWaitMs: number; transactionMs: number }
+  applyMs: number; appliedMembers: number; turnWaitMs: number; transactionMs: number;
+  /** Apply time per member of the recent lane groups (each new group weighs half), for group sizing. */
+  recentPerMember: number | null }
 /**
  * #5984 lanes: what a drain's lanes did, for its report. `busy` is the mean number of lane transactions open
  * while at least one was; `applyMsPerPage` the time from a group's transaction begin to its commit-turn wait,
@@ -42,7 +44,7 @@ let claiming = 0;
 /** The drain's lane policy for a worktree; replaces any earlier one. */
 export function openLanes(worktreeId: string, run: string, lanes: number, coordinationPath: string | null): void {
   policies.set(worktreeId, { run, asked: lanes, effective: lanes, stepDown: null, overlapped: 0, fallbacks: 0, coordinationPath, claimed: new Set(), begun: new Set(), tasks: 0, closing: false,
-    timing: { open: 0, since: Date.now(), openArea: 0, activeMs: 0, applyMs: 0, appliedMembers: 0, turnWaitMs: 0, transactionMs: 0 } });
+    timing: { open: 0, since: Date.now(), openArea: 0, activeMs: 0, applyMs: 0, appliedMembers: 0, turnWaitMs: 0, transactionMs: 0, recentPerMember: null } });
 }
 /**
  * Ends a drain's lane run on every worktree it opened: no new lane claims, then waits (up to `maxMs`) for the
@@ -58,7 +60,7 @@ export async function closeLaneRun(run: string, maxMs = 90_000): Promise<LaneSta
   return open.length ? laneStats(open.map(([, state]) => state.timing)) : null;
 }
 function laneStats(timings: LaneTiming[]): LaneStats {
-  const sum = (key: keyof LaneTiming) => timings.reduce((total, timing) => total + timing[key], 0);
+  const sum = (key: Exclude<keyof LaneTiming, 'recentPerMember'>) => timings.reduce((total, timing) => total + timing[key], 0);
   const round = (value: number, places: number) => Math.round(value * 10 ** places) / 10 ** places;
   const active = sum('activeMs'), members = sum('appliedMembers'), transactions = sum('transactionMs');
   return { busy: active > 0 ? round(sum('openArea') / active, 2) : null, applyMsPerPage: members > 0 ? Math.round(sum('applyMs') / members) : null,
@@ -90,6 +92,8 @@ export function laneApplyBegin(state: LaneState): { turn(): void; turned(): void
       if (turnAt === null) return;
       timing.applyMs += turnAt - began;
       timing.appliedMembers += members;
+      const perMember = (turnAt - began) / Math.max(1, members);
+      timing.recentPerMember = timing.recentPerMember === null ? perMember : (timing.recentPerMember + perMember) / 2;
       timing.turnWaitMs += waited || Date.now() - turnAt;
     },
   };
@@ -113,6 +117,10 @@ export function laneTask(state: LaneState): () => void {
 export function lanePolicy(worktreeId: string): LanePolicy | null {
   const state = policies.get(worktreeId);
   return state ? { run: state.run, asked: state.asked, effective: state.effective, stepDown: state.stepDown, overlapped: state.overlapped, fallbacks: state.fallbacks } : null;
+}
+/** The recent apply time per member of a worktree's open lane run in this process; null before a lane group reached its turn. */
+export function laneApplyMsPerMember(worktreeId: string): number | null {
+  return policies.get(worktreeId)?.timing.recentPerMember ?? null;
 }
 /** The open lane runs and how many lanes each may run now (0 while the worktree's lease drains for an exclusive writer). */
 export function laneRoots(): Array<{ worktreeId: string; run: string; capacity: number }> {

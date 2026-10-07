@@ -24,6 +24,8 @@ import type { SyncAuthority } from './sync-authority.ts';
 /** What sets a drain's lane ceiling: lanes off, the configured maximum, or the connection pool. */
 export type LanesCap = 'disabled' | 'maximum' | 'pool';
 export interface BulkSettings { enabled: boolean; reason: string | null; size: number; maxTxnMs: number;
+  /** Whether `sync.bulk_max_txn_ms` (or its env) was set; an explicit budget only ever lowers the group budget. */
+  maxTxnExplicit?: boolean;
   /** #5984 lanes: groups published at once (1 = one at a time), and why it is lower than asked when it is. */
   lanes?: number; lanesMax?: number; lanesReason?: string | null; lanesCap?: LanesCap;
   /** The drain's lane run (set by the drain when lanes > 1); lane groups carry it as `intent.lane`. */
@@ -40,11 +42,12 @@ async function resolveGrouping(engine: BrainEngine, noBulk: boolean | undefined)
   const configured = await engine.getConfig('sync.bulk').catch(() => null);
   const size = await whole(engine, 'GBRAIN_SYNC_BULK_SIZE', 'sync.bulk_size', 16, 1, 64);
   const maxTxnMs = await whole(engine, 'GBRAIN_SYNC_BULK_MAX_TXN_MS', 'sync.bulk_max_txn_ms', 15_000, 100, 300_000);
+  const maxTxnExplicit = !!process.env.GBRAIN_SYNC_BULK_MAX_TXN_MS || await engine.getConfig('sync.bulk_max_txn_ms').then(v => v != null).catch(() => false);
   const reason = noBulk ? 'disabled by --no-bulk' : env === '0' || env === 'false' ? 'disabled by GBRAIN_SYNC_BULK=0'
     : env === undefined || env === '' ? (configured === 'false' || configured === '0' ? 'disabled by config sync.bulk=false' : null) : null;
-  if (reason) return { enabled: false, reason, size, maxTxnMs };
-  if (engine.kind !== 'postgres') return { enabled: false, reason: 'PGLite publishes without network round trips; bulk applies to Postgres', size, maxTxnMs };
-  return { enabled: true, reason: null, size, maxTxnMs };
+  if (reason) return { enabled: false, reason, size, maxTxnMs, maxTxnExplicit };
+  if (engine.kind !== 'postgres') return { enabled: false, reason: 'PGLite publishes without network round trips; bulk applies to Postgres', size, maxTxnMs, maxTxnExplicit };
+  return { enabled: true, reason: null, size, maxTxnMs, maxTxnExplicit };
 }
 /** The most groups a drain publishes at once: what `--lanes`, `sync.lanes` and `GBRAIN_SYNC_LANES` accept, and their default. */
 export const MAX_SYNC_LANES = 16;
@@ -79,16 +82,26 @@ export function groupableIntent(intent: SyncIntent): boolean {
   return (intent.kind === 'managed_sync_import' || intent.kind === 'managed_sync_delete') && !intent.renameFrom && !intent.companyApproval;
 }
 
+/** Apply budgets for a lane group: normally, and while a foreground write on the worktree is queued or just committed. */
+export const LANE_GROUP_BUDGET_MS = 5_000;
+export const FOREGROUND_GROUP_BUDGET_MS = 2_000;
 /**
- * Adaptive group size: as many members as fit the time budget at the last
- * observed per-member time from admission to commit, within the configured
- * maximum. Foreground writes queued behind a group wait at most about this
- * budget (sync.bulk_max_txn_ms); while a foreground write is queued on the
- * worktree, no group forms, so it is served before the next page (ENG-A5).
+ * Adaptive group size: as many members as fit the time budget at the last observed time per member, within
+ * the configured maximum. The budget is, in order: the first group of a drain is small (2 pages) so its first
+ * commit lands early; with lanes a group gets `LANE_GROUP_BUDGET_MS` of apply time (`FOREGROUND_GROUP_BUDGET_MS`
+ * while a foreground write is queued or just committed), without lanes `sync.bulk_max_txn_ms`; an explicit
+ * `sync.bulk_max_txn_ms` only ever lowers it. With lanes the time per member is the lanes' measured apply time
+ * (transaction begin to the commit-turn wait), which does not grow with how long a group waited in the window;
+ * without a measurement a group takes the configured size. Foreground writes queued behind a group wait at
+ * most about this budget (ENG-A5).
  */
-export function nextGroupSize(settings: BulkSettings, perMemberMs: number | null): number {
-  if (perMemberMs === null || perMemberMs <= 0) return Math.min(4, settings.size);
-  return Math.max(1, Math.min(settings.size, Math.floor(settings.maxTxnMs / perMemberMs)));
+export function nextGroupSize(settings: BulkSettings, perMemberMs: number | null, opts: { first?: boolean; foreground?: boolean } = {}): number {
+  if (opts.first) return Math.min(2, settings.size);
+  const lanes = (settings.lanes ?? 1) > 1;
+  let budget = lanes ? opts.foreground ? FOREGROUND_GROUP_BUDGET_MS : LANE_GROUP_BUDGET_MS : settings.maxTxnMs;
+  if (lanes && settings.maxTxnExplicit) budget = Math.min(budget, settings.maxTxnMs);
+  if (perMemberMs === null || perMemberMs <= 0) return lanes ? settings.size : Math.min(4, settings.size);
+  return Math.max(1, Math.min(settings.size, Math.floor(budget / perMemberMs)));
 }
 
 /**
