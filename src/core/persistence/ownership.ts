@@ -9,6 +9,7 @@ import { discoverGitRoot } from '../sync-git.ts';
 import { cliOptsToProgressOptions, getCliOptions } from '../cli-options.ts';
 import { createProgress, type ProgressOptions } from '../progress.ts';
 import { digest, sha256 } from './digest.ts';
+import { pipelined } from '../page-state/transactions.ts';
 import { localHostId, persistenceHome } from './identity.ts';
 import type { SqlEngine, WriteRequest } from './model.ts';
 import { acquireNativeLock, tryAcquireNativeLock, type NativeLockHandle } from './native-lock.ts';
@@ -181,9 +182,12 @@ export async function probeWorktreeWriter(binding: WorktreeBinding, engine?: Bra
 }
 export async function guardOwnership(tx: SqlEngine, row: WriteRequest, hostId: string): Promise<WorktreeBinding | null> {
   if (!row.worktree_id) return null;
-  const [owner] = await tx.executeRaw<{ owner_host_id: string; owner_epoch: string | number; state: string }>(
-    'SELECT owner_host_id,owner_epoch,state FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [row.worktree_id]);
-  const binding = await getWorktreeBinding(tx, row.source_id, hostId);
+  // #5984: both reads in one pipeline (the worktree row is locked first, as before).
+  const [[owner], binding] = await pipelined({ kind: (tx as { kind?: string }).kind ?? '' }, [
+    () => tx.executeRaw<{ owner_host_id: string; owner_epoch: string | number; state: string }>(
+      'SELECT owner_host_id,owner_epoch,state FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [row.worktree_id]),
+    () => getWorktreeBinding(tx, row.source_id, hostId),
+  ]) as [Array<{ owner_host_id: string; owner_epoch: string | number; state: string }>, WorktreeBinding | null];
   if (!owner || !binding || binding.worktree_id !== row.worktree_id || binding.source_incarnation !== row.source_incarnation ||
     owner.owner_host_id !== hostId || owner.state !== 'active' || String(binding.topology_generation) !== String(row.topology_generation)) {
     throw opError('owner_unavailable', 'The accepted worktree ownership or source topology changed.',

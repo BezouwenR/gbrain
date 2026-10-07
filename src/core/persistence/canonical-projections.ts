@@ -358,14 +358,15 @@ export async function prepareCanonicalProjections(engine: BrainEngine, page: Par
       () => tx.executeRaw(`UPDATE timeline_entries t SET detail=r.next FROM jsonb_to_recordset($2::text::jsonb) AS r(id integer,detail text,next text)
         WHERE t.page_id=$1 AND t.event_page_id IS NULL AND t.id=r.id AND t.detail=r.detail`, [id, refreshes]),
     ];
+    // The timeline rows are independent of the fact and take rows, so they ride in the first pipeline.
     if (factRows.length) {
-      await pipelined(tx, [expireFacts]);
+      await pipelined(tx, [expireFacts, ...timelineRows]);
       await tx.insertFacts(factRows, { source_id: sourceId }); // gbrain-allow-direct-insert: canonical fence projection shares the journal publication transaction
       await pipelined(tx, [...factFields, checkTakes, dropTakes]);
-    } else await pipelined(tx, [expireFacts, checkTakes, dropTakes]);
+    } else await pipelined(tx, [expireFacts, checkTakes, dropTakes, ...timelineRows]);
     if (takes.length) {
       await tx.addTakesBatch(takes.map(t => takesPreparation.toCanonicalBatchInput(id, t)));
-      await pipelined(tx, [...resolveTakes, ...timelineRows]);
-    } else await pipelined(tx, timelineRows);
+      await pipelined(tx, resolveTakes);
+    }
   };
 }

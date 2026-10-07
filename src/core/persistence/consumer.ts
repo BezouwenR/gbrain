@@ -598,7 +598,7 @@ export class PersistenceConsumer {
     const rows = [row, ...followers];
     for (const member of rows) this.executing.add(member.id);
     try {
-      return await executeClaimedGroup(this.engine, rows, { hostId: this.hostId, lane, prepare: member => this.prepare(this.engine, member, this.config),
+      return await executeClaimedGroup(this.engine, rows, { hostId: this.hostId, lane, prepare: (member, engine) => this.prepare(engine, member, this.config),
         lease: this.leaseTiming(),
         leftRunning: (work, blocksRoot) => {
           const settled = this.keepUntilSettled(work);
