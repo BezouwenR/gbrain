@@ -15,6 +15,7 @@ import { catalogueError } from '../error-catalogue.ts';
 import { ACTIVE_REFRESH_STATES_SQL, refreshFenceClear } from './worktree-refresh-schema.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertGraduationAdmission } from './graduation-custody.ts';
+import { pipelined } from '../page-state/transactions.ts';
 import {
   isTerminal, principalKey, requestPrincipal, recoveryFiles,
   type JournalLimits, type Principal, type RecoveryRecord, type RequestState,
@@ -218,27 +219,33 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
     || input.operation !== first.operation || (input.targetKind ?? 'page') !== 'page' || (input.protocolVersion ?? 1) !== 1 || digest(input.authority) !== digest(first.authority))) {
     throw new TypeError('A group admission requires one source, worktree, principal, operation and authority.');
   }
-  const limits = await readJournalLimits(tx, overrides);
   const stamp = writerStamp();
   const items = inputs.map(input => ({ input, requestId: requireUuid(input.requestId ?? randomUUID()), fingerprint: intentDigest(input),
     bytes: jsonBytes(input.intent) + jsonBytes(input.authority), terminalBytes: input.terminalReservation ?? Math.max(16_384, jsonBytes(input.authority) + 8192) }));
-  await declarePersistenceProtocol(tx);
-  await assertGraduationAdmission(tx);
   assertMutationProtocol({ target_kind: 'page', protocol_version: 1 });
-  if (first.worktreeId) await assertWorktreeAdmission(tx, first);
-  const [source] = await tx.executeRaw<{ incarnation: string; archived: boolean }>('SELECT incarnation,archived FROM sources WHERE id=$1 FOR SHARE', [first.sourceId]);
+  const ids = items.map(item => item.requestId);
+  // #5984: the checks are independent reads and share locks, so they go out back to back in the order they always
+  // had (protocol, graduation, worktree, source, writer, counters); a failure is raised in that order.
+  const [limits, , , , sources, , counters, topology, priorRows] = await pipelined(tx, [
+    () => readJournalLimits(tx, overrides),
+    () => declarePersistenceProtocol(tx),
+    () => assertGraduationAdmission(tx),
+    () => first.worktreeId ? assertWorktreeAdmission(tx, first) : Promise.resolve(),
+    () => tx.executeRaw<{ incarnation: string; archived: boolean }>('SELECT incarnation,archived FROM sources WHERE id=$1 FOR SHARE', [first.sourceId]),
+    () => Promise.all(items.map(({ input }) => authorizeWrite(tx, input.authority, input.operation, input.slug, true))),
+    () => lockCounters(tx, ['brain', principalKey(first.principal)]),
+    () => first.principal.kind === 'local_cli'
+      ? tx.executeRaw<{ request_id: string }>('SELECT request_id FROM persistence_topology_changes WHERE principal_id=$1::uuid AND request_id=ANY($2::uuid[]) LIMIT 1', [first.principal.id, ids])
+      : Promise.resolve([]),
+    () => tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2 AND request_id=ANY($3::uuid[])',
+      [first.principal.kind, first.principal.id, ids]),
+  ]) as [JournalLimits, unknown, unknown, unknown, Array<{ incarnation: string; archived: boolean }>, unknown, Counter[], Array<{ request_id: string }>, WriteRequest[]];
+  const [source] = sources;
   if (!source || source.archived || source.incarnation !== first.sourceIncarnation) {
     throw new OperationError('source_changed', 'The write source is missing, archived, or was replaced.', 'Resolve the source again and submit a new request.');
   }
-  for (const { input } of items) await authorizeWrite(tx, input.authority, input.operation, input.slug, true);
-  const counters = await lockCounters(tx, ['brain', principalKey(first.principal)]);
-  const ids = items.map(item => item.requestId);
-  if (first.principal.kind === 'local_cli') {
-    const [topology] = await tx.executeRaw<{ request_id: string }>('SELECT request_id FROM persistence_topology_changes WHERE principal_id=$1::uuid AND request_id=ANY($2::uuid[]) LIMIT 1', [first.principal.id, ids]);
-    if (topology) throw lifecycleIdConflict(topology.request_id);
-  }
-  const priors = new Map((await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2 AND request_id=ANY($3::uuid[])',
-    [first.principal.kind, first.principal.id, ids])).map(row => [row.request_id, row]));
+  if (topology[0]) throw lifecycleIdConflict(topology[0].request_id);
+  const priors = new Map(priorRows.map(row => [row.request_id, row]));
   for (const item of items) {
     const prior = priors.get(item.requestId);
     if (!prior) continue;

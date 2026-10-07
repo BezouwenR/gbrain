@@ -665,17 +665,25 @@ async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk
       if (foreground) bulk.foregroundAt = performance.now();
     }
     if (bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_RECENT_MS) break;
-    const base: Cursor = { ...current, index: start - 1 };
-    // A freeze refusal here is left for the single path to raise in order, after the publishing groups.
-    const frozen = await freezeFollowers(engine, base, config, groupSize(base, bulk), freezeAt(base)).catch(() => []);
-    if (!frozen.length) break;
-    const after = (window.at(-1) ?? current.group!).at(-1)!.requestId;
-    const members = frozen.map(member => ({ ...member, intent: { ...member.intent, group: frozen[0]!.requestId, after, ...(lane ? { lane } : {}) } }));
-    // A failed admission ends this pass (the group is frozen again on the next); a lost cursor returns the winner's.
-    const saved = await admitAndSave(engine, key, current, { ...current, window: [...window, members] }, members, assertActive).catch(() => undefined);
+    // The window's free slots are frozen and then admitted and saved in one transaction, up to a lane count of
+    // groups at a time, so lanes start on the first ones while the rest are frozen.
+    const formed: Pending[][] = [];
+    let next = start;
+    while (window.length + formed.length < depth && formed.length < Math.max(1, depth / 2) && next < current.entries.length) {
+      const base: Cursor = { ...current, index: next - 1 };
+      // A freeze refusal here is left for the single path to raise in order, after the publishing groups.
+      const frozen = await freezeFollowers(engine, base, config, groupSize(base, bulk), freezeAt(base)).catch(() => []);
+      if (!frozen.length) break;
+      const after = (formed.at(-1) ?? window.at(-1) ?? current.group!).at(-1)!.requestId;
+      formed.push(frozen.map(member => ({ ...member, intent: { ...member.intent, group: frozen[0]!.requestId, after, ...(lane ? { lane } : {}) } })));
+      next += frozen.length;
+    }
+    if (!formed.length) break;
+    // A failed admission ends this pass (the groups are frozen again on the next); a lost cursor returns the winner's.
+    const saved = await admitAndSave(engine, key, current, { ...current, window: [...window, ...formed] }, formed.flat(), assertActive).catch(() => undefined);
     if (saved === undefined) break;
     if (saved === null) return currentCursor(engine, key, current);
-    (bulk.admitted ??= new Set()).add(members[0]!.requestId);
+    for (const group of formed) (bulk.admitted ??= new Set()).add(group[0]!.requestId);
     current = saved;
   }
   assertActive();
@@ -744,6 +752,21 @@ async function groupStep(engine: BrainEngine, cursor: Cursor, key: string, bulk:
   const stuck = members[committed];
   const stuckRow = stuck ? states.get(stuck.requestId) : undefined;
   const failed = !!stuck && !!stuckRow && isTerminalWriteState(stuckRow.state);
+  if (!stuck && next.window?.length) {
+    next.window = [...next.window];
+    // Window groups that lanes already committed are passed in this same save: the feeder's cost per wait stays
+    // one save however many groups committed meanwhile. It stops at the first group not wholly committed.
+    const ids = next.window.flat().map(member => member.requestId);
+    const done = new Map((await engine.executeRaw<WriteRequest>(`SELECT request_id,state,outcome FROM persistence_requests
+      WHERE principal_kind=$1 AND principal_id=$2 AND request_id=ANY($3::uuid[]) AND state='committed'`, [principal.kind, principal.id, ids])).map(row => [row.request_id, row]));
+    while (next.window.length && next.window[0]!.every(member => done.has(member.requestId))) {
+      const group = next.window.shift()!;
+      for (const member of group) countCommitted(next.counts, member, done.get(member.requestId)!.outcome);
+      onProgress?.({ phase: 'managed_sync.group', bankedFiles: next.index, total: cursor.entries.length, group: group.length });
+      next.index += group.length;
+    }
+    if (next.index !== cursor.index + committed) next.progress = stampProgress(cursor.progress, cursor.index, next.index, drainStartedAt);
+  }
   if (!stuck) {
     // The window's first group becomes the cursor's group; its requests are already admitted and queued.
     const [promoted, ...rest] = next.window ?? [];
