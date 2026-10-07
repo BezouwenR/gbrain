@@ -18,6 +18,7 @@ import { admitWriteGroupInTransaction } from './journal.ts';
 import { retryWriteAdmission } from './admission-retry.ts';
 import { wouldWaiveEntry, type WaiverCursor, type WaiverEntry } from './sync-waivers.ts';
 import type { WriteRequest } from './model.ts';
+import { pipelined } from '../page-state/transactions.ts';
 import type { SyncIntent } from './sync-prepare.ts';
 import type { SyncAuthority } from './sync-authority.ts';
 
@@ -132,12 +133,15 @@ export async function admitGroup(engine: BrainEngine, members: WaiverEntry[], cu
   cursorHolds: (tx: BrainEngine) => Promise<boolean>): Promise<WriteRequest[] | null> {
   const head = members[0]!;
   return retryWriteAdmission(head.requestId, remaining => engine.transaction(async tx => {
-    await tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true)",
-      [`${Math.min(1000, remaining)}ms`, `${remaining}ms`]);
-    const rows = await admitWriteGroupInTransaction(tx, members.map(member => ({ requestId: member.requestId, operation: 'submit_job',
-      sourceId: cursor.sourceId, sourceIncarnation: cursor.incarnation, slug: member.slug, pageId: member.pageId,
-      worktreeId: cursor.binding.worktree_id, topologyGeneration: cursor.binding.topology_generation,
-      principal: cursor.authority.writer.principal, authority: cursor.authority.writer, callerIntent: member.intent, intent: member.intent })));
+    // The settings go out with the admission's first burst of checks, ahead of them.
+    const [, rows] = await pipelined(tx, [
+      () => tx.executeRaw("SELECT set_config('synchronous_commit','on',true),set_config('lock_timeout',$1,true),set_config('statement_timeout',$2,true)",
+        [`${Math.min(1000, remaining)}ms`, `${remaining}ms`]),
+      () => admitWriteGroupInTransaction(tx, members.map(member => ({ requestId: member.requestId, operation: 'submit_job',
+        sourceId: cursor.sourceId, sourceIncarnation: cursor.incarnation, slug: member.slug, pageId: member.pageId,
+        worktreeId: cursor.binding.worktree_id, topologyGeneration: cursor.binding.topology_generation,
+        principal: cursor.authority.writer.principal, authority: cursor.authority.writer, callerIntent: member.intent, intent: member.intent }))),
+    ]) as [unknown, WriteRequest[]];
     if (!await cursorHolds(tx)) throw new GroupMoved();
     return rows;
   })).catch(error => { if (error instanceof GroupMoved) return null; throw error; });

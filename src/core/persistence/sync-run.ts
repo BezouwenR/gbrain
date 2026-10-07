@@ -124,6 +124,11 @@ async function saveCursor(engine: BrainEngine, key: string, before: Cursor | nul
   inTx?: (tx: BrainEngine) => Promise<unknown>): Promise<Cursor> {
   const saved = await engine.transaction(async tx => {
     assertActive?.();
+    if (!requireIdle) {
+      const current = await writeCursor(tx, key, before, next, inTx, true);
+      assertActive?.();
+      return current;
+    }
     await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
     if (requireIdle) {
       await tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid FOR UPDATE', [next.binding.worktree_id]);
@@ -142,20 +147,26 @@ async function saveCursor(engine: BrainEngine, key: string, before: Cursor | nul
   return saved;
 }
 /** Compare-and-swap inside the caller's transaction; a lost swap returns the cursor that won. */
-async function writeCursor(tx: BrainEngine, key: string, before: Cursor | null, next: Cursor, inTx?: (tx: BrainEngine) => Promise<unknown>): Promise<Cursor> {
+async function writeCursor(tx: BrainEngine, key: string, before: Cursor | null, next: Cursor, inTx?: (tx: BrainEngine) => Promise<unknown>, synchronous = false): Promise<Cursor> {
   if (before === null) {
+    if (synchronous) await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
     await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb) ON CONFLICT DO NOTHING`, [`${OP}-manifest`, next.runId, JSON.stringify(next.entries)]);
     await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb) ON CONFLICT DO NOTHING`, [OP, key, JSON.stringify([header(next)])]);
   } else {
-    const saved = await tx.executeRaw(`UPDATE op_checkpoints SET completed_keys=$4::text::jsonb,updated_at=now()
-      WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb RETURNING fingerprint`, [OP, key, JSON.stringify([header(before)]), JSON.stringify([header(next)])]);
-    await tx.executeRaw('UPDATE op_checkpoints SET updated_at=now() WHERE op=$1 AND fingerprint=$2', [`${OP}-manifest`, next.runId]);
+    // #5984: the settings, the compare-and-swap and the manifest touch go out together; a won swap is the saved cursor.
+    const [, saved] = await pipelined(tx, [
+      () => synchronous ? tx.executeRaw("SELECT set_config('synchronous_commit','on',true)") : Promise.resolve([]),
+      () => tx.executeRaw(`UPDATE op_checkpoints SET completed_keys=$4::text::jsonb,updated_at=now()
+      WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb RETURNING fingerprint`, [OP, key, JSON.stringify([header(before)]), JSON.stringify([header(next)])]),
+      () => tx.executeRaw('UPDATE op_checkpoints SET updated_at=now() WHERE op=$1 AND fingerprint=$2', [`${OP}-manifest`, next.runId]),
+    ]) as [unknown, unknown[]];
     // #5988: a hold write or clear commits with the cursor step that passes its entry, never without it.
     if (saved.length) await inTx?.(tx);
     // #6188 (E33): the run's fences_normalized total commits with the cursor step that counts it, so the trend never differs from the cursor.
     const fences = next.counts.fences;
     if (saved.length && fences?.count && fences.count !== before.counts.fences?.count) await recordSyncRunTrend(tx, { sourceId: next.sourceId, runId: next.runId,
       day: new Date().toISOString().slice(0, 10), count: fences.count, byClass: fences.by_class, writers: fences.dirs });
+    if (saved.length) return next;
   }
   return currentCursor(tx, key, next);
 }

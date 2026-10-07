@@ -266,7 +266,7 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
       if (Number(row.terminal_bytes) + terminalBytes > limits[`${scope}TerminalBytes`]) throw await cumulativeCapacityError(tx, `${scope} reserved receipt bytes`,
         row.key, `${scope}TerminalBytes`, Number(row.terminal_bytes), limits[`${scope}TerminalBytes`]);
     }
-    const rows = await tx.executeRaw<WriteRequest>(`INSERT INTO persistence_requests
+    const [rows] = await pipelined(tx, [() => tx.executeRaw<WriteRequest>(`INSERT INTO persistence_requests
       (principal_kind,principal_id,request_id,operation,source_id,source_incarnation,page_id,slug,
        worktree_id,topology_generation,digest,intent,authority,intent_bytes,terminal_reservation,target_kind,protocol_version,
        admitter_version,admitter_host_id)
@@ -276,11 +276,11 @@ export async function admitWriteGroupInTransaction(tx: BrainEngine, inputs: Writ
       RETURNING *`, [first.principal.kind, first.principal.id, first.operation, first.sourceId, first.sourceIncarnation, first.worktreeId ?? null,
       first.topologyGeneration ?? null, JSON.stringify(first.authority), stamp.version, stamp.hostId,
       JSON.stringify(fresh.map(item => ({ request_id: item.requestId, page_id: item.input.pageId ?? null, slug: item.input.slug, digest: item.fingerprint,
-        intent: item.input.intent, intent_bytes: item.bytes, terminal_reservation: item.terminalBytes })))]);
-    for (const row of rows) priors.set(row.request_id, row);
-    await tx.executeRaw(`UPDATE persistence_counters SET outstanding_count=outstanding_count+$4,
+        intent: item.input.intent, intent_bytes: item.bytes, terminal_reservation: item.terminalBytes })))]),
+      () => tx.executeRaw(`UPDATE persistence_counters SET outstanding_count=outstanding_count+$4,
       intent_bytes=intent_bytes+$2,lifetime_ids=lifetime_ids+$4,terminal_bytes=terminal_bytes+$3 WHERE key=ANY($1::text[])`,
-    [counters.map(c => c.key), bytes, terminalBytes, fresh.length]);
+      [counters.map(c => c.key), bytes, terminalBytes, fresh.length])]) as [WriteRequest[]];
+    for (const row of rows) priors.set(row.request_id, row);
   }
   return items.map(item => priors.get(item.requestId)!);
 }
