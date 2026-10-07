@@ -21,9 +21,11 @@ import type { WriteRequest } from './model.ts';
 import type { SyncIntent } from './sync-prepare.ts';
 import type { SyncAuthority } from './sync-authority.ts';
 
+/** What sets a drain's lane ceiling: lanes off, the configured maximum, or the connection pool. */
+export type LanesCap = 'disabled' | 'maximum' | 'pool';
 export interface BulkSettings { enabled: boolean; reason: string | null; size: number; maxTxnMs: number;
   /** #5984 lanes: groups published at once (1 = one at a time), and why it is lower than asked when it is. */
-  lanes?: number; lanesReason?: string | null;
+  lanes?: number; lanesMax?: number; lanesReason?: string | null; lanesCap?: LanesCap;
   /** The drain's lane run (set by the drain when lanes > 1); lane groups carry it as `intent.lane`. */
   laneRun?: string }
 export interface BulkReport { enabled: boolean; reason: string | null; groups: number; grouped_pages: number; largest_group: number }
@@ -44,21 +46,25 @@ async function resolveGrouping(engine: BrainEngine, noBulk: boolean | undefined)
   if (engine.kind !== 'postgres') return { enabled: false, reason: 'PGLite publishes without network round trips; bulk applies to Postgres', size, maxTxnMs };
   return { enabled: true, reason: null, size, maxTxnMs };
 }
+/** The most groups a drain publishes at once: what `--lanes`, `sync.lanes` and `GBRAIN_SYNC_LANES` accept, and their default. */
+export const MAX_SYNC_LANES = 16;
 /**
- * #5984 lanes: `--lanes N` / `--no-lanes` > `GBRAIN_SYNC_LANES` > `sync.lanes` > 6, then clamped to what the
- * connection pool can hold at once (its long-hold capacity minus 3 for the sync loop, one foreground write and
- * the consumer's control work). Lanes need bulk groups.
+ * #5984 lanes: `--lanes N` / `--no-lanes` > `GBRAIN_SYNC_LANES` > `sync.lanes` > 16 sets the maximum number of
+ * groups published at once; the drain runs that many unless the connection pool holds fewer long transactions
+ * (its long-hold capacity minus 3 for the sync loop, one foreground write and the consumer's control work).
+ * `lanesMax` is the maximum asked for, `lanes` the ceiling in effect, and `lanesReason` why it is lower.
+ * Lanes need bulk groups.
  */
-async function resolveLanes(engine: BrainEngine, bulk: BulkSettings, flag: number | undefined): Promise<{ lanes: number; lanesReason: string | null }> {
-  if (!bulk.enabled) return { lanes: 1, lanesReason: `bulk groups are off (${bulk.reason})` };
-  if (flag !== undefined && (!Number.isInteger(flag) || flag < 1 || flag > 8)) throw new OperationError('invalid_params', `--lanes must be a whole number from 1 to 8; got ${flag}.`,
-    'Pass --lanes 6 (the default), or --no-lanes to publish one group at a time.');
-  const asked = flag ?? await whole(engine, 'GBRAIN_SYNC_LANES', 'sync.lanes', 6, 1, 8);
-  if (asked === 1) return { lanes: 1, lanesReason: flag === 1 ? 'disabled by --no-lanes' : 'disabled by sync.lanes=1 (or GBRAIN_SYNC_LANES=1)' };
+async function resolveLanes(engine: BrainEngine, bulk: BulkSettings, flag: number | undefined): Promise<{ lanes: number; lanesMax: number; lanesReason: string | null; lanesCap: LanesCap }> {
+  if (!bulk.enabled) return { lanes: 1, lanesMax: 1, lanesReason: `bulk groups are off (${bulk.reason})`, lanesCap: 'disabled' };
+  if (flag !== undefined && (!Number.isInteger(flag) || flag < 1 || flag > MAX_SYNC_LANES)) throw new OperationError('invalid_params', `--lanes must be a whole number from 1 to ${MAX_SYNC_LANES}; got ${flag}.`,
+    `Pass --lanes ${MAX_SYNC_LANES} (the default maximum), or --no-lanes to publish one group at a time.`);
+  const asked = flag ?? await whole(engine, 'GBRAIN_SYNC_LANES', 'sync.lanes', MAX_SYNC_LANES, 1, MAX_SYNC_LANES);
+  if (asked === 1) return { lanes: 1, lanesMax: 1, lanesReason: flag === 1 ? 'disabled by --no-lanes' : 'disabled by sync.lanes=1 (or GBRAIN_SYNC_LANES=1)', lanesCap: 'disabled' };
   const pool = (engine as BrainEngine & { sql?: BudgetPool }).sql;
   const capacity = pool ? poolLongHoldCapacity(pool) - 3 : 1;
-  if (capacity >= asked) return { lanes: asked, lanesReason: null };
-  return { lanes: Math.max(1, capacity), lanesReason: `the connection pool holds ${capacity + 3} long transactions; raise GBRAIN_POOL_SIZE for more lanes` };
+  if (capacity >= asked) return { lanes: asked, lanesMax: asked, lanesReason: null, lanesCap: 'maximum' };
+  return { lanes: Math.max(1, capacity), lanesMax: asked, lanesReason: `the connection pool holds ${capacity + 3} long transactions; set GBRAIN_POOL_SIZE=${asked + 4} for ${asked} lanes`, lanesCap: 'pool' };
 }
 async function whole(engine: BrainEngine, env: string, key: string, fallback: number, min: number, max: number): Promise<number> {
   const raw = process.env[env] ? Number(process.env[env]) : await engine.getConfig(key).then(v => v == null ? undefined : Number(v)).catch(() => undefined);

@@ -18,7 +18,8 @@ import { WINDOW_CANCEL_MESSAGE } from '../src/core/persistence/sync-window.ts';
 import { acquireShared, leaseDraining, leaseWounded, yieldLease } from '../src/core/persistence/worktree-lease.ts';
 import type { NativeLockHandle } from '../src/core/persistence/native-lock.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { awaitLaneTurn, closeLaneRun, laneClaim, laneOf, laneRoots, laneTask, openLanes } from '../src/core/persistence/sync-lanes.ts';
+import { awaitLaneTurn, closeLaneRun, laneApplyBegin, laneClaim, laneOf, laneRoots, laneTask, openLanes } from '../src/core/persistence/sync-lanes.ts';
+import { lanesLimit } from '../src/core/persistence/sync-drain.ts';
 
 const home = mkdtempSync(join(tmpdir(), 'gbrain-managed-lanes-'));
 let engine: BrainEngine | undefined;
@@ -55,14 +56,44 @@ afterAll(async () => {
   rmSync(home, { recursive: true, force: true });
 });
 
-test('lane settings follow flag > env > config > 6, clamp to the pool and need bulk groups', async () => {
+test('lane settings are a maximum: flag > env > config > 16, clamped to the pool, and need bulk groups', async () => {
   if (!engine) return;
-  expect(await resolveBulkSettings(engine, false)).toMatchObject({ enabled: true, lanes: 6, lanesReason: null });
-  expect(await resolveBulkSettings(engine, false, 1)).toMatchObject({ lanes: 1, lanesReason: 'disabled by --no-lanes' });
-  expect(await resolveBulkSettings(engine, false, 8)).toMatchObject({ lanes: 8, lanesReason: null });
+  expect(await resolveBulkSettings(engine, false)).toMatchObject({ enabled: true, lanes: 8, lanesMax: 16, lanesCap: 'pool',
+    lanesReason: 'the connection pool holds 11 long transactions; set GBRAIN_POOL_SIZE=20 for 16 lanes' });
+  expect(await resolveBulkSettings(engine, false, 1)).toMatchObject({ lanes: 1, lanesMax: 1, lanesCap: 'disabled', lanesReason: 'disabled by --no-lanes' });
+  expect(await resolveBulkSettings(engine, false, 8)).toMatchObject({ lanes: 8, lanesMax: 8, lanesCap: 'maximum', lanesReason: null });
+  expect(await resolveBulkSettings(engine, false, 12)).toMatchObject({ lanes: 8, lanesMax: 12, lanesCap: 'pool' });
   expect(await resolveBulkSettings(engine, true, 4)).toMatchObject({ enabled: false, lanes: 1 });
-  await withEnv({ GBRAIN_SYNC_LANES: '2' }, async () => expect(await resolveBulkSettings(engine!, false)).toMatchObject({ lanes: 2 }));
-  await expect(resolveBulkSettings(engine, false, 9)).rejects.toMatchObject({ code: 'invalid_params' });
+  await withEnv({ GBRAIN_SYNC_LANES: '2' }, async () => expect(await resolveBulkSettings(engine!, false)).toMatchObject({ lanes: 2, lanesCap: 'maximum' }));
+  await expect(resolveBulkSettings(engine, false, 17)).rejects.toMatchObject({ code: 'invalid_params' });
+  await withEnv({ GBRAIN_SYNC_LANES: '17' }, async () => expect(resolveBulkSettings(engine!, false)).rejects.toMatchObject({ code: 'invalid_params' }));
+});
+
+test('the drain names what limited its lanes and what raises it', () => {
+  const base = { maximum: 16, configured: 6, effective: 6, step_down: null, busy: 5.8 };
+  expect(lanesLimit({ ...base, configured: 1, effective: 1, maximum: 1 }, 'disabled')).toMatchObject({ kind: 'lanes_off' });
+  expect(lanesLimit({ ...base, effective: 5, step_down: 'lock_timeout on a lane group' }, 'pool')).toMatchObject({ kind: 'database_contention' });
+  expect(lanesLimit({ ...base, busy: 3.1 }, 'pool')).toMatchObject({ kind: 'feeder', raise: null });
+  expect(lanesLimit(base, 'pool')).toMatchObject({ kind: 'pool', raise: expect.stringContaining('GBRAIN_POOL_SIZE=20') });
+  expect(lanesLimit({ ...base, maximum: 6 }, 'maximum')).toMatchObject({ kind: 'maximum', raise: expect.stringContaining('sync.lanes 16') });
+  expect(lanesLimit({ ...base, maximum: 16, configured: 16, effective: 16, busy: 15 }, 'maximum')).toMatchObject({ kind: 'maximum', raise: null });
+});
+
+test('lane timing counts busy lanes, apply time per page and the commit-turn wait share', async () => {
+  openLanes('wt-time', 'run-time', 4, null);
+  const state = laneOf({ worktree_id: 'wt-time', intent: { lane: 'run-time' } } as never)!;
+  const a = laneApplyBegin(state), b = laneApplyBegin(state);
+  await new Promise(resolve => setTimeout(resolve, 60));
+  a.turn(); b.turn();
+  await new Promise(resolve => setTimeout(resolve, 40));
+  a.turned(); a.end(4);
+  b.turned(); b.end(2);
+  const stats = (await closeLaneRun('run-time'))!;
+  expect(stats.busy).toBeGreaterThan(1.8);
+  expect(stats.applyMsPerPage).toBeGreaterThanOrEqual(15);
+  expect(stats.applyMsPerPage).toBeLessThan(40);
+  expect(stats.turnWaitShare).toBeGreaterThan(0.3);
+  expect(stats.turnWaitShare).toBeLessThan(0.6);
 });
 
 test('a lease is shared by lanes; an exclusive writer drains and wounds it and gets the lock once the lanes leave', async () => {
@@ -168,7 +199,9 @@ test('lanes publish several groups at once and every page still commits, attribu
   if (!engine) return;
   const f = await fixture(engine, notes(80));
   const result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true, lanes: 4 });
-  expect(result.drain).toMatchObject({ outcome: 'synced', bulk: { enabled: true, lanes: { configured: 4 } } });
+  expect(result.drain).toMatchObject({ outcome: 'synced', bulk: { enabled: true, lanes: { maximum: 4, configured: 4, limited_by: { kind: expect.any(String) } } } });
+  expect(result.drain!.bulk!.lanes.busy).toBeGreaterThan(1);
+  expect(result.drain!.bulk!.lanes.apply_ms_per_page).toBeGreaterThan(0);
   expect(result.drain!.bulk!.lanes.overlapped_groups).toBeGreaterThan(0);
   expect(result.drain!.bulk!.lanes.fallbacks).toBe(0);
   const rows = await imports(engine, f.id);

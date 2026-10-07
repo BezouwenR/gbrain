@@ -31,7 +31,7 @@ import { OperationError } from '../ops/contract.ts';
 import { authorizeStoredRequest } from './authority.ts';
 import { localHostId } from './identity.ts';
 import { acquireWorktree, acquireWorktreeShared, getWorktreeBinding, guardOwnership } from './ownership.ts';
-import { awaitLaneBegin, awaitLaneTurn, LaneAbort, laneClaimed, laneFinished, stepDownLanes, type LaneState } from './sync-lanes.ts';
+import { awaitLaneBegin, awaitLaneTurn, LaneAbort, laneApplyBegin, laneClaimed, laneFinished, stepDownLanes, type LaneState } from './sync-lanes.ts';
 import { cancelRows, windowPredecessor } from './sync-window.ts';
 import { clearResolvedRecoveries, completeWrite, ENSURE_COUNTERS_SQL, getWriteRequestById, LOCK_COUNTERS_SQL, markRecovering, prepareRecoveries,
   publicationGroupKey, reclaimReleasedWrite, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
@@ -129,6 +129,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
   let releaseCapacity: (() => void) | null = null;
   const recorded = new Map<number, { row: WriteRequest; record: FileRecoveryRecord; bytes: number }>();
   let committed = false;
+  const timed: { apply: ReturnType<typeof laneApplyBegin> | null } = { apply: null };
   try {
     const blocked = await engine.executeRaw(`SELECT 1 FROM persistence_requests WHERE worktree_id=$1::uuid AND NOT (id=ANY($2::uuid[])) AND recovery IS NOT NULL
       UNION ALL SELECT 1 FROM persistence_effects WHERE worktree_id=$1::uuid AND recovery IS NOT NULL LIMIT 1`, [head.worktree_id, rows.map(row => row.id)]);
@@ -151,6 +152,8 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
     }
     if (lane) await awaitLaneBegin(lane, rows);
     const done = await engine.transaction(async transaction => {
+      timed.apply?.end(rows.length);
+      if (lane) timed.apply = laneApplyBegin(lane);
       const tx = groupReads(transaction);
       await declareDurablePersistence(tx);
       const live = await guardOwnership(tx, head, hostId);
@@ -193,7 +196,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
         }
       }, requestAttribution(head));
       // #5984 lanes: applied concurrently, committed in manifest order.
-      if (lane) await awaitLaneTurn(tx, lane, rows);
+      if (lane) { timed.apply?.turn(); await awaitLaneTurn(tx, lane, rows); timed.apply?.turned(); }
       const done = await completeGroup(tx, rows, outcomes);
       // Every member is complete in this transaction: the batch's last page re-arms the batch's mention links once.
       const last = rows[rows.length - 1]!;
@@ -226,6 +229,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
     await hooks.rolledBack?.(rows);
     return { done: null, requeued };
   } finally {
+    timed.apply?.end(rows.length);
     releaseCapacity?.();
     await lock.release();
   }
