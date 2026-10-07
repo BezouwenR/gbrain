@@ -717,6 +717,12 @@ export function receiptFor(row: WriteRequest, facts?: WriteHealthFacts, now = Da
 }
 
 const healthQueries = new WeakMap<BrainEngine, Promise<unknown>>();
+/**
+ * Receipt health facts per root. #5984: a queued request waits on any earlier unfinished request of its root;
+ * a claimed one (a lane, a group follower, or a foreground write claimed ahead of queued sync rows) waits only
+ * on an earlier one already publishing or recovering, so the queued rows it overtook never make it report
+ * `waiting_on_earlier_write`.
+ */
 export async function writeHealthFacts(engine: BrainEngine, rows: WriteRequest[]): Promise<Map<string, WriteHealthFacts>> {
   if (rows.length > 100) throw new RangeError('Receipt health pages are limited to 100 rows.');
   const pending = rows.filter(row => !isTerminal(row));
@@ -725,20 +731,24 @@ export async function writeHealthFacts(engine: BrainEngine, rows: WriteRequest[]
   const roots = [...new Set(pending.map(row => row.worktree_id ?? `db:${row.source_incarnation}`))];
   const abort = new AbortController();
   const observed_at = new Date().toISOString();
-  const query = engine.executeRaw<{ root: string; sequence: string | null; recovery_required: boolean; owner_unavailable: boolean; inspect_owner: boolean }>(`
+  const query = engine.executeRaw<{ root: string; sequence: string | null; started_sequence: string | null; recovery_required: boolean; owner_unavailable: boolean; inspect_owner: boolean }>(`
     WITH roots AS (SELECT unnest($1::text[]) AS root)
-    SELECT roots.root,head.sequence::text,COALESCE(head.inspect_owner,false) AS inspect_owner,
+    SELECT roots.root,head.sequence::text,head.started_sequence::text,COALESCE(head.inspect_owner,false) AS inspect_owner,
       COALESCE(head.recovering,false) OR EXISTS (SELECT 1 FROM persistence_effects e
         WHERE e.worktree_id=w.id AND e.recovery IS NOT NULL) AS recovery_required,
       w.id IS NOT NULL AND (w.state<>'active' OR w.owner_host_id IS NULL) AS owner_unavailable
     FROM roots LEFT JOIN persistence_worktrees w ON w.id::text=roots.root
     LEFT JOIN LATERAL (
-      (SELECT r.sequence,r.recovery IS NOT NULL AS recovering,
+      (SELECT r.sequence,(SELECT s.sequence FROM persistence_requests s WHERE s.worktree_id=w.id
+          AND (s.state IN ('running','recovering') OR s.recovery IS NOT NULL) ORDER BY s.sequence LIMIT 1) AS started_sequence,
+        r.recovery IS NOT NULL AS recovering,
         r.blocked_reason IN ('unexpected_file_bytes','unexpected_staging_bytes') AS inspect_owner FROM persistence_requests r
         WHERE r.worktree_id=w.id AND (r.state IN ('queued','running','recovering') OR r.recovery IS NOT NULL)
         ORDER BY r.sequence LIMIT 1)
       UNION ALL
-      (SELECT r.sequence,r.recovery IS NOT NULL AS recovering,
+      (SELECT r.sequence,(SELECT s.sequence FROM persistence_requests s WHERE s.worktree_id IS NULL AND s.source_incarnation=r.source_incarnation
+          AND s.state IN ('running','recovering') ORDER BY s.sequence LIMIT 1) AS started_sequence,
+        r.recovery IS NOT NULL AS recovering,
         r.blocked_reason IN ('unexpected_file_bytes','unexpected_staging_bytes') AS inspect_owner FROM persistence_requests r
         WHERE r.worktree_id IS NULL AND r.source_incarnation=CASE WHEN roots.root LIKE 'db:%' THEN substring(roots.root FROM 4)::uuid END
         AND r.state IN ('queued','running','recovering') ORDER BY r.sequence LIMIT 1)
@@ -753,10 +763,12 @@ export async function writeHealthFacts(engine: BrainEngine, rows: WriteRequest[]
   const byRoot = new Map(facts.map(fact => [fact.root, fact]));
   for (const row of pending) {
     const fact = byRoot.get(row.worktree_id ?? `db:${row.source_incarnation}`);
-    if (fact) result.set(row.id, { observed_at, recovery_required: fact.recovery_required,
+    if (!fact) continue;
+    const head = row.state === 'queued' ? fact.sequence : fact.started_sequence;
+    result.set(row.id, { observed_at, recovery_required: fact.recovery_required,
       owner_unavailable: fact.owner_unavailable,
       inspect_owner: fact.inspect_owner,
-      earlier_write: fact.sequence != null && BigInt(fact.sequence) < BigInt(row.sequence) });
+      earlier_write: head != null && BigInt(head) < BigInt(row.sequence) });
   }
   return result;
 }

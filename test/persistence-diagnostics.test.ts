@@ -4,7 +4,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { LATEST_VERSION, runMigrations } from '../src/core/migrate.ts';
 import type { OperationContext } from '../src/core/ops/contract.ts';
-import { submitPageMutation } from '../src/core/persistence/page-mutations.ts';
+import { initializeLocalPersistence, submitPageMutation } from '../src/core/persistence/page-mutations.ts';
 import { submissionAuthority } from '../src/core/persistence/authority.ts';
 import { admitWrite, writeHealthFacts } from '../src/core/persistence/journal.ts';
 import type { WriteRequest } from '../src/core/persistence/model.ts';
@@ -139,5 +139,45 @@ test('writer status labels the answering process consumer instead of reporting i
     expect(diagnostics.ingress).toBeUndefined();
     expect(diagnostics.local_process_ingress.state).toBe('not_running');
     expect(diagnostics.local_process_ingress.scope).toContain('another process may own');
+  }
+});
+
+test('#5984 4.5: health never reports an overtaking claimed write as waiting, nor skips the overtaken sync row', async () => {
+  for (const engine of engines) {
+    await disposePersistenceConsumer(engine);
+    const ctx: OperationContext = { engine, config: { engine: engine.kind }, sourceId: 'default',
+      remote: false, dryRun: false, logger: { info() {}, warn() {}, error() {} } };
+    await initializeLocalPersistence(ctx);
+    await engine.executeRaw("DELETE FROM config WHERE key LIKE 'persistence.limits.%'");
+    const [source] = await engine.executeRaw<{ incarnation: string }>("SELECT incarnation FROM sources WHERE id='default'");
+    const admit = async (slug: string, intent: Record<string, unknown>) => {
+      const authority = await submissionAuthority(ctx, 'put_page', 'default', source.incarnation, slug);
+      return admitWrite(engine, { principal: authority.principal, authority, operation: 'put_page', sourceId: 'default',
+        sourceIncarnation: source.incarnation, slug, requestId: randomUUID(), callerIntent: {}, intent });
+    };
+    const sync = await admit('inbox/overtaken-sync', { kind: 'managed_sync_import', content: 'a' });
+    const laterSync = await admit('inbox/later-sync', { kind: 'managed_sync_import', content: 'b' });
+    const foreground = await admit('inbox/overtaking-foreground', { content: 'c' });
+    const worktree = randomUUID();
+    await engine.executeRaw("INSERT INTO persistence_worktrees(id,owner_host_id,state) VALUES($1,$2,'active')", [worktree, randomUUID()]);
+    await engine.executeRaw('UPDATE persistence_requests SET worktree_id=$2 WHERE id=ANY($1::uuid[])', [[sync.id, laterSync.id, foreground.id], worktree]);
+    const read = async () => engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=ANY($1::uuid[]) ORDER BY sequence', [[sync.id, laterSync.id, foreground.id]]);
+    const earlier = async () => {
+      const rows = await read();
+      const facts = await writeHealthFacts(engine, rows);
+      return Object.fromEntries(rows.filter(row => facts.has(row.id)).map(row => [row.slug, facts.get(row.id)!.earlier_write]));
+    };
+    // The later-sequence foreground write is claimed ahead of the queued sync rows that do not name its page.
+    await engine.executeRaw("UPDATE persistence_requests SET state='running',execution_token=$2::uuid WHERE id=$1::uuid", [foreground.id, randomUUID()]);
+    expect(await earlier()).toEqual({ 'inbox/overtaken-sync': false, 'inbox/later-sync': true, 'inbox/overtaking-foreground': false });
+    // It commits first: the overtaken sync row is still the head and still reported pending, never skipped.
+    await engine.executeRaw("UPDATE persistence_requests SET state='committed',execution_token=NULL,completed_at=now() WHERE id=$1::uuid", [foreground.id]);
+    expect(await earlier()).toEqual({ 'inbox/overtaken-sync': false, 'inbox/later-sync': true });
+    // The overtaken row is then claimed and publishes; the later sync row still waits on it while it runs.
+    await engine.executeRaw("UPDATE persistence_requests SET state='running',execution_token=$2::uuid WHERE id=$1::uuid", [sync.id, randomUUID()]);
+    expect(await earlier()).toEqual({ 'inbox/overtaken-sync': false, 'inbox/later-sync': true });
+    await engine.executeRaw("UPDATE persistence_requests SET state='committed',execution_token=NULL,completed_at=now() WHERE id=$1::uuid", [sync.id]);
+    expect(await earlier()).toEqual({ 'inbox/later-sync': false });
+    await engine.executeRaw("UPDATE persistence_requests SET state='cancelled',completed_at=now() WHERE id=$1::uuid", [laterSync.id]);
   }
 });
