@@ -375,6 +375,7 @@ export class PostgresEngine implements BrainEngine {
         // GBRAIN_PG_NOTICES=1.
         onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
         onpoisoned: (status: string) => this.onPoisoned('read', status),
+        shared_types: db.resolveSharedTypes(),
       };
       if (Object.keys(timeouts).length > 0) {
         opts.connection = timeouts;
@@ -559,6 +560,7 @@ export class PostgresEngine implements BrainEngine {
         if (verify.healed.length > 0) {
           process.stderr.write(`  Schema verify: self-healed ${verify.healed.length} missing column(s)\n`);
         }
+        if (applied > 0 || verify.healed.length > 0) db.clearSharedTypes(this.sql, pool);
 
         // v0.30.1 (Fix 5): sweep zombie HNSW indexes (indisvalid=false) from
         // crashed CREATE INDEX CONCURRENTLY calls. Best-effort; errors logged
