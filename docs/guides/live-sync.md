@@ -35,53 +35,33 @@ every 10 seconds on stderr:
 [sync] 1240/9382 processed (1200 written, 40 waived this run) · 42.1 pages/min · indexing ETA 3h13m
 ```
 
-On Postgres the drain publishes in **bulk groups**: it freezes up to 16
-following page imports and deletes with the current one and admits them in the
-same transaction that records them in the sync cursor; the writer publishes the
-group in one transaction. Every page still gets its own write request, receipt,
-attribution and failure report; if one page fails, the pages before it commit,
-that page is reported, and the pages after it are cancelled and re-frozen once
-it is fixed. The first group of a drain is one or two pages, so a short backlog
-shows its first commit within seconds. Later groups are sized from the measured
-apply time per page: about 5 seconds of work per group with lanes (2 seconds
-while foreground writes are recent), or `sync.bulk_max_txn_ms` (default 15 s)
-without them. An explicitly set `sync.bulk_max_txn_ms` lowers the lane budget
-too.
+On Postgres the drain publishes in **bulk groups** of up to 16 page imports and
+deletes, each admitted with the cursor step that records it and published in one
+transaction. Every page still gets its own write request, receipt, attribution
+and failure report; if one page fails, the pages before it commit, that page is
+reported, and the pages after it are cancelled and re-frozen once it is fixed.
+The first group is one or two pages; later groups hold about 5 s of measured
+apply time with lanes (2 s while foreground writes are recent), else
+`sync.bulk_max_txn_ms` (default 15 s).
 
-Groups publish in **lanes**: several groups at once, each in its own
-transaction on its own connection. The maximum is 16 (`--lanes N` from 1 to 16,
-`--no-lanes` for one at a time, or `gbrain config set sync.lanes N` /
-`GBRAIN_SYNC_LANES`). The connection pool caps it: the drain keeps three
-connections for the sync loop, one foreground write and the writer's control
-work, so the default pool of 10 runs 6 lanes and `GBRAIN_POOL_SIZE=20` runs 16.
-Lanes apply their pages at the same time but commit in file order: a group
-commits only after the group before it has committed, so a reader never sees a
-later page without the earlier ones. While lanes publish, the drain keeps
+Up to 16 groups publish at once in **lanes**, each on its own connection
+(`--lanes N`, `--no-lanes`, `sync.lanes` or `GBRAIN_SYNC_LANES`), capped by the
+pool: the default pool of 10 runs 6, `GBRAIN_POOL_SIZE=20` runs 16. Lanes apply pages at the same time but commit in file order, so a reader never
+sees a later page without the earlier ones. While lanes publish, the drain keeps
 freezing and admitting the next groups. Nothing is admitted ahead while
 foreground writes are recent (one was queued in the last minute), and a
 foreground write that needs the worktree makes the lanes finish their current
-groups and step aside. If a page fails, the groups after it are cancelled with
-the reason "An earlier page of the same sync did not commit" and re-frozen once
-the failure is fixed. A lock or statement timeout in a lane costs one lane for
+groups and step aside. Groups after a failed page are cancelled ("An earlier
+page of the same sync did not commit") and re-frozen once it is fixed. A lock or statement timeout in a lane costs one lane for
 the rest of the run.
 
-When the drain wrote pages with lanes on, it ends with one line naming what
-limited it and, when a setting would help, what raises it:
-
-```
-[sync] lanes: 6 of 16, 5.4 busy on average; the connection pool allowed 6 of 16 lanes. Set GBRAIN_POOL_SIZE=20 for 16 lanes, if the database has the connections to spare.
-```
-
-The limit is one of `database_contention` (a lock or statement timeout lowered
-the lane count; no setting raises it), `feeder` (lanes waited for the sync loop
-to prepare groups), `pool`, `maximum` or `lanes_off`. Turn bulk off with
+A lane drain ends with a `[sync] lanes:` line naming what limited it and what
+setting, if any, raises it. Turn bulk off with
 `--no-bulk`, `GBRAIN_SYNC_BULK=0` or `gbrain config set sync.bulk false`. The
 final JSON reports `drain.bulk` (`enabled`, `reason` when off, `groups`,
 `largest_group`, `admitted_ahead`, and `lanes`: `maximum`, `configured`,
 `effective`, `reason` when fewer, `step_down`, `overlapped_groups`,
-`fallbacks` (the lane groups that published singly or went back to the queue),
-`busy`, `apply_ms_per_page`, `turn_wait_share` and `limited_by` with `kind`,
-`message` and `raise`). Finish a drain before downgrading gbrain: an older
+`fallbacks`, `busy`, `apply_ms_per_page`, `turn_wait_share` and `limited_by`). Finish a drain before downgrading gbrain: an older
 version refuses a group this version admitted ahead, and the sync stops there
 instead of publishing a page twice. PGLite publishes without network round
 trips and does not use bulk groups.
