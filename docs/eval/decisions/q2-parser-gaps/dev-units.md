@@ -2,7 +2,7 @@
 
 U1 (adviser wording) and the joint unit U34 (U3 board wording never types `works_at`, U4 advisory, board and investor
 roles are not employment starts) ship: the preregistered held-out decision confirmed the package P2 = {U3, U4, U1}
-(`afcec1ad`), and `ENABLED_TYPING_UNITS` is `[U3, U4, U1]`. U6 failed the held-out safety conditions (now-recall
+(`afcec1ad`), and `ENABLED_TYPING_UNITS` is `[U3, U4, U1]`. U6 failed the safety conditions at held-out selection on I1 and W1 (now-recall
 −0.012, as-of exact −0.011, one new wrong transition by identity), and U25 (U2 with U5) added nothing on the
 confirmation set (difference 0.000 on all 200 pairs). Following the preregistration, the U2, U5 and U6 code was removed
 before landing, and the landing head types identically to `afcec1ad` (see "Landing equivalence").

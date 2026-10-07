@@ -116,7 +116,7 @@ shipped (see "Tested and not shipped" below); their code is removed, so those ph
 |---|---|---|
 | U2 ordinary roles | "<role> for [X]", "led design at [X]", "[X] (<role>)", "as <role>" after a join or sign-on, where every other rule gave `mentions` | measured jointly with U5 as U25 (U2 alone let the single-value pass close a former employer on the wrong date); on the confirmation set U25 added nothing over the package before it (difference 0.000 on all 200 pairs) |
 | U5 leave idioms and exchange moves | "parted company with", "handed in her notice at", "called it a day at", "swapped [A] for [B]" as dated ends | part of U25, above |
-| U6 start framings | "first day at", "onboarding week at", "began working at", "a new chapter at" as dated starts | failed the held-out safety conditions: now-recall −0.012, as-of exact −0.011, and one new wrong transition by identity |
+| U6 start framings | "first day at", "onboarding week at", "began working at", "a new chapter at" as dated starts | failed the safety conditions at held-out selection (set I1 and W1), so it was never packaged: now-recall −0.012, as-of exact −0.011, and one new wrong transition by identity |
 
 Development evidence and the reworks each unit went through: `docs/eval/decisions/q2-parser-gaps/dev-units.md`.
 
