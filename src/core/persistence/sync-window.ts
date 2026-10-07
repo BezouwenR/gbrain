@@ -46,12 +46,25 @@ export async function windowPredecessorCommitted(engine: Pick<BrainEngine, 'exec
 }
 
 /**
- * Cancels a claimed window group whose predecessor did not commit: the claimed
- * head and its still-queued members. Returns the settled rows, or null when the
- * group may publish.
+ * #6252: whether an earlier member of this row's bulk group ended without committing (failed, cancelled or
+ * conflicted). Such a row must not publish: a group commits in manifest order, so its pages after a member that
+ * did not commit are cancelled and re-frozen once that member is resolved, never written ahead of it.
+ */
+export async function earlierGroupMemberFailed(engine: Pick<BrainEngine, 'executeRaw'>, row: Pick<WriteRequest, 'intent' | 'request_id' | 'worktree_id' | 'sequence'>): Promise<boolean> {
+  const group = (row.intent as Record<string, unknown> | null | undefined)?.group;
+  if (typeof group !== 'string' || group === row.request_id || !row.worktree_id) return false;
+  const failed = await engine.executeRaw(`SELECT 1 FROM persistence_requests WHERE worktree_id=$1::uuid AND intent->>'group'=$2
+    AND sequence<$3 AND state IN ('failed','cancelled','conflict') LIMIT 1`, [row.worktree_id, group, row.sequence]);
+  return failed.length > 0;
+}
+
+/**
+ * Cancels a claimed window group whose predecessor did not commit, or a claimed group member whose earlier member
+ * did not commit (#6252): the claimed row and its group's still-queued members. Returns the settled rows, or null
+ * when it may publish.
  */
 export async function cancelOrphanedWindowGroup(engine: BrainEngine, head: WriteRequest): Promise<WriteRequest[] | null> {
-  if (await windowPredecessorCommitted(engine, head)) return null;
+  if (await windowPredecessorCommitted(engine, head) && !await earlierGroupMemberFailed(engine, head)) return null;
   const group = typeof head.intent?.group === 'string' ? head.intent.group : head.request_id;
   const members = await engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE worktree_id=$1::uuid AND intent->>'group'=$2
     AND state='queued' AND id<>$3::uuid ORDER BY sequence`, [head.worktree_id, group, head.id]);
