@@ -17,7 +17,7 @@ import { assertSyncPageOrigin, sameSyncOrigin, syncOriginScope } from './sync-or
 import { assertManagedSyncActive, assertSyncDispatchActive, managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, syncProcessingOptions, SYNC_PROCESSING_KEYS, type SyncAuthority, type SyncProcessingOptions } from './sync-authority.ts';
 import { prepareManagedSyncMutation, type SyncCursorOptions, type SyncIntent } from './sync-prepare.ts';
 import { screeningRequest } from './noop-kernel.ts';
-import { waiveNoopEntry, type NoopWaiver } from './sync-waivers.ts';
+import { noopWaiversEnabled, screenWaiver, waiveNoopEntry, waiveNoopRun, waiverBatchEnabled, type NoopWaiver, type WaiverRunEntry } from './sync-waivers.ts';
 import { resolve } from 'node:path';
 import { currentCompanyBrainSync, getCompanyBrainProfile, readCompanyBrainPlan } from '../company-brain/profile.ts';
 import { readCommittedBlob } from '../company-brain/revision.ts';
@@ -42,7 +42,7 @@ import { faultPoint } from './fault-points.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { principalAttribution } from './attribution.ts';
 import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
-import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, fencesNormalizedReport, readSyncHoldPolicy, recordSyncConversion, recoveredReport, writeGitHold, type FencesTally } from './sync-holds.ts';
+import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, readSyncHoldPolicy, recordSyncConversion, recoveredReport, writeGitHold, type FencesTally } from './sync-holds.ts';
 
 export interface ManagedSyncWriteDiagnostic {
   source_id: string;
@@ -534,6 +534,51 @@ interface BulkPass { settings: BulkSettings; perMemberMs: number | null;
 const FOREGROUND_RECENT_MS = 60_000;
 type FreezeAt = (base: Cursor) => (index: number) => Promise<Pending | null>;
 
+/** The most consecutive no-op entries one waiver transaction passes. */
+const WAIVER_RUN_MAX = 64;
+/**
+ * #5984 Phase 3: when the frozen head would be waived, freezes and screens the entries after it four at a time
+ * (stopping at the first that would not be waived, is held, is overtaken, refuses to freeze, or at the checkpoint)
+ * and waives the run in one transaction, without a `pending` cursor save per entry. Returns null to take the
+ * per-entry path for the head (its screen admits it, or the run's transaction validated nothing or timed out);
+ * otherwise the cursor past the waived prefix (or as another run moved it), with the entry that ended the prefix
+ * saved as pending.
+ */
+async function waiveRun(engine: BrainEngine, cursor: Cursor, head: Pending, key: string, config: GBrainConfig, assertActive: () => void,
+  frozenRun: Parameters<typeof freezeEntry>[4], drainStartedAt: number, limit: number, onProgress: SyncOpts['onProgress']): Promise<Cursor | null> {
+  const first = await screenWaiver(engine, cursor, head, config);
+  if (!first) return null;
+  assertActive();
+  const run: WaiverRunEntry[] = [{ pending: head, waived: first }];
+  const max = Math.max(1, Math.min(WAIVER_RUN_MAX, limit));
+  extend: for (let next = cursor.index + 1; run.length < max && next < cursor.entries.length;) {
+    const batch = Array.from({ length: Math.min(4, max - run.length, cursor.entries.length - next) }, (_, i) => next + i);
+    const frozen = await Promise.all(batch.map(index => freezeEntry(engine, { ...cursor, index }, key, assertActive, frozenRun).catch(() => null)));
+    const screened = await Promise.all(frozen.map((entry, i) => entry && !('hold' in entry) && !entry.rebound
+      ? screenWaiver(engine, { ...cursor, index: batch[i]! }, entry, config).catch(() => null) : null));
+    for (const [i, waived] of screened.entries()) {
+      if (!waived) break extend;
+      run.push({ pending: frozen[i] as Pending, waived });
+    }
+    next += batch.length;
+  }
+  assertActive();
+  const observedAt = frozenRun.observedAt ?? new Date().toISOString();
+  const done = await waiveNoopRun(engine, cursor, run, key, async (tx, prefix) => {
+    let next: Cursor = cursor;
+    for (const { waived } of prefix) next = waivedCursor(next, waived);
+    const paths = prefix.map(({ pending }) => pending.intent.path).filter((path): path is string => typeof path === 'string');
+    return writeCursor(tx, key, cursor, { ...next, progress: stampProgress(cursor.progress, cursor.index, cursor.index + prefix.length, drainStartedAt) }, async inner => {
+      for (const path of await heldGitPaths(inner, cursor.sourceId, cursor.incarnation, paths)) await holdClear(cursor, path, observedAt)!(inner);
+    });
+  }, tx => currentCursor(tx, key, cursor));
+  if (!done) return null;
+  for (let index = cursor.index + 1; index <= cursor.index + done.waived; index++) onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: index, total: cursor.entries.length, waived: true });
+  assertActive();
+  return done.next && done.cursor.index === cursor.index + done.waived
+    ? saveCursor(engine, key, done.cursor, { ...done.cursor, pending: done.next as Pending }, false, assertActive) : done.cursor;
+}
+
 /** #5984 bulk: freezes the followers of an eligible head and records them with it as the cursor's group. */
 async function formGroup(engine: BrainEngine, head: Cursor, pending: Pending, key: string, bulk: BulkPass, config: GBrainConfig, freezeAt: FreezeAt,
   assertActive: () => void): Promise<Cursor> {
@@ -868,6 +913,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     let creditedPages = 0, creditStarted = 0, foregroundQueued = false;
     const sliceStarted = performance.now(), sliceFirstIndex = cursor.index, drainStartedAt = opts.drainStartedAt ?? Date.now();
     const bulk: BulkPass = { settings: opts.bulk && !company ? opts.bulk : { enabled: false, reason: null, size: 1, maxTxnMs: 0 }, perMemberMs: null };
+    const waiveBatch = noopWaiversEnabled() && await waiverBatchEnabled(engine);
     opts.onProgress?.({ phase: 'managed_sync.start', bankedFiles: cursor.index, total: cursor.entries.length });
     while (!cursor.done) {
       assertActive();
@@ -901,6 +947,10 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
           if (slice && (cursor.index - sliceFirstIndex >= slice.maxPages || performance.now() - sliceStarted >= slice.maxMs)) return result(cursor, 'partial', 'writer_yield');
           continue;
         }
+        const waived: Cursor | null = waiveBatch && !frozen.rebound ? await waiveRun(engine, cursor, frozen, key, config, assertActive, frozenRun, drainStartedAt,
+          slice ? slice.maxPages - (cursor.index - sliceFirstIndex) : WAIVER_RUN_MAX, opts.onProgress) : null;
+        if (waived && slice && (waived.index - sliceFirstIndex >= slice.maxPages || performance.now() - sliceStarted >= slice.maxMs)) return result(waived, 'partial', 'writer_yield');
+        if (waived) { cursor = waived; continue; }
         cursor = await saveCursor(engine, key, cursor, { ...cursor, ...(frozen.rebound ? { overtaken: true as const } : {}), pending: frozen }, false, assertActive);
       }
       if (!cursor.pending) continue; // another owner-loop advanced the cursor
