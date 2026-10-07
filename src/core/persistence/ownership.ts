@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { pipelined } from '../page-state/transactions.ts';
 import type { BrainEngine } from '../engine.ts';
 import { OperationError, opError } from '../ops/contract.ts';
 import { readFix } from '../ops/op-fix.ts';
@@ -181,9 +182,12 @@ export async function probeWorktreeWriter(binding: WorktreeBinding, engine?: Bra
 }
 export async function guardOwnership(tx: SqlEngine, row: WriteRequest, hostId: string): Promise<WorktreeBinding | null> {
   if (!row.worktree_id) return null;
-  const [owner] = await tx.executeRaw<{ owner_host_id: string; owner_epoch: string | number; state: string }>(
-    'SELECT owner_host_id,owner_epoch,state FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [row.worktree_id]);
-  const binding = await getWorktreeBinding(tx, row.source_id, hostId);
+  // The worktree lock and the binding read are sent together; the server takes the lock first.
+  const [[owner], binding] = await pipelined(tx, [
+    () => tx.executeRaw<{ owner_host_id: string; owner_epoch: string | number; state: string }>(
+      'SELECT owner_host_id,owner_epoch,state FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [row.worktree_id]),
+    () => getWorktreeBinding(tx, row.source_id, hostId),
+  ]) as [Array<{ owner_host_id: string; owner_epoch: string | number; state: string }>, WorktreeBinding | null];
   if (!owner || !binding || binding.worktree_id !== row.worktree_id || binding.source_incarnation !== row.source_incarnation ||
     owner.owner_host_id !== hostId || owner.state !== 'active' || String(binding.topology_generation) !== String(row.topology_generation)) {
     throw opError('owner_unavailable', 'The accepted worktree ownership or source topology changed.',

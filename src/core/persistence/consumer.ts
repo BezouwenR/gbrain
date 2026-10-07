@@ -1,9 +1,10 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { CLAIMABLE_WRITE_SQL, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, compactWriteReceipts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
-import { finishUnpublishedFailure, publishMutation, recoverPublication, type PreparedMutation } from './coordinator.ts';
+import { finishUnpublishedFailure, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { localHostId } from './identity.ts';
-import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX } from './group-publish.ts';
+import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
+import { preparationConfigView } from './config-snapshot.ts';
 import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { refreshManagedFilesystemRoots } from './filesystem-guard.ts';
@@ -15,12 +16,15 @@ import { runPersistenceEffects } from './effects.ts';
 import { PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { isWriteErrorCode } from './types.ts';
 import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
+import { OperationError } from '../ops/contract.ts';
+import type { ReservedTransactions } from '../postgres-engine/reserved-transactions.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
 import { maybeRefreshPlannerStats } from '../planner-stats.ts';
 import { refreshFenceClear } from './worktree-refresh-schema.ts';
 import { faultPoint } from './fault-points.ts';
 import { releaseAbandonedClaims } from './effect-journal.ts';
+import { writeSwitchOn } from './switches.ts';
 
 type PhaseObservation = { name: string; started_at: string; deadline_exceeded: boolean; attempt: number; first_conn_ms?: number };
 /** #5373: set by a task that abandons a still-running preparation after losing its claim; its root is freed only once `until` settles. */
@@ -57,6 +61,8 @@ export async function runResidentProjectionInvocation(engine: BrainEngine, hostI
 }
 
 const PARKED_WORKER: Promise<void> = Promise.resolve();
+/** `onLane`'s answer when the lane cannot be lent: the caller runs on the pool instead. */
+export const LANE_BUSY = Symbol('gbrain.laneBusy');
 
 export type PrepareMutation = (engine: BrainEngine, row: WriteRequest, config: GBrainConfig, signal?: AbortSignal) => Promise<PreparedMutation>;
 export class PersistenceConsumer {
@@ -71,6 +77,8 @@ export class PersistenceConsumer {
   private topologyRetryAfter = new Map<string, number>();
   private idleLane: { conn: ReservedConnection; release: () => Promise<void> } | undefined;
   private idleLaneRetryAt = 0;
+  /** Phase 4.4: a single write is publishing on the idle lane's connection. */
+  private laneInUse = false;
   private active = new Set<Promise<void>>();
   /** #5373: preparations and renewals that outlived their claim; stop() drains them before the engine closes. */
   private outlived = new Set<Promise<void>>();
@@ -88,6 +96,8 @@ export class PersistenceConsumer {
   private maintenanceVolume = 50;
   private lastScan = 0;
   private progressWake = false;
+  /** Phase 4.3: this process admitted a write since the last tick; that tick claims before any scan. */
+  private ownAdmission = false;
   private lastError: { code: string; at: string; phase?: string } | undefined;
   private abort = new AbortController();
   private phaseObservation: PhaseObservation | undefined;
@@ -124,9 +134,15 @@ export class PersistenceConsumer {
   /**
    * Work admitted by this process: tick now instead of waiting out the idle
    * backoff. Like a completed publication, it claims at once and leaves scans
-   * to at most one pass per poll interval.
+   * to at most one pass per poll interval. `ownAdmission` (the waiter of a
+   * write this process just admitted) makes that tick skip the scans and
+   * claim directly; the scans keep their own cadence, and recovery records
+   * still block the claim (CLAIMABLE_WRITE_SQL).
    */
-  wake(): void { this.progressWake = true; this.idleDelayMs = this.pollMs; this.schedule(0); }
+  wake(ownAdmission = false): void {
+    if (ownAdmission) this.ownAdmission = true;
+    this.progressWake = true; this.idleDelayMs = this.pollMs; this.schedule(0);
+  }
   private get pollMs(): number { return this.opts.pollMs ?? 250; }
   private get idleMaxMs(): number { return Math.max(this.pollMs, this.opts.idleMaxMs ?? 5000); }
   private schedule(ms: number): void {
@@ -196,12 +212,14 @@ export class PersistenceConsumer {
    * permit fall back to pooled probes. The lane always comes from the ordinary
    * pool, never the direct/session route, whose clients are scarcer (#5233).
    */
-  private async acquireIdleLane(signal?: AbortSignal): Promise<ReservedConnection | undefined> {
+  private async acquireIdleLane(signal?: AbortSignal, forPublication = false): Promise<ReservedConnection | undefined> {
     if (this.idleLane) return this.idleLane.conn;
     if (this.engine.kind !== 'postgres' || this.stopping || Date.now() < this.idleLaneRetryAt) return undefined;
     const pool = (this.engine as { getPoolDiagnostics?: () => { poolMax: number | null; tracked: Record<string, number> } | null }).getPoolDiagnostics?.();
     // Only reserve from an otherwise idle pool: a saturated pool falls back to a cancellable pooled probe.
-    if (!pool?.poolMax || pool.poolMax < 3 || Object.values(pool.tracked).some(count => count > 0)) return undefined;
+    // A single write's publication (Phase 4.4) also reserves it while at least two other connections stay free.
+    const inUse = Object.values(pool?.tracked ?? {}).reduce((sum, count) => sum + Math.max(0, count), 0);
+    if (!pool?.poolMax || pool.poolMax < 3 || (forPublication ? pool.poolMax - inUse < 3 : inUse > 0)) return undefined;
     const held = Promise.withResolvers<void>();
     const reserved = Promise.withResolvers<ReservedConnection>();
     const done = this.engine.withReservedConnection(async conn => { reserved.resolve(conn); await held.promise; }, { route: 'ordinary' })
@@ -223,9 +241,49 @@ export class PersistenceConsumer {
     } finally { signal?.removeEventListener('abort', onAbort); }
   }
   private async releaseIdleLane(): Promise<void> {
+    if (this.laneInUse) return;
     const lane = this.idleLane;
     this.idleLane = undefined;
     await lane?.release();
+  }
+  /**
+   * Phase 4.4: publishes a single write. On Postgres, with the
+   * `single_write_group` switch on, its group-of-one transaction runs on the
+   * idle lane's reserved connection (taken while at least two other pool
+   * connections stay free, and kept across single-write ticks), so its prepared
+   * statements survive the pool's idle timeout and stay warm from one
+   * foreground write to the next; without the lane it publishes on the pool.
+   */
+  private async publishSingle(row: WriteRequest, prepared: PreparedMutation): Promise<{ done: WriteRequest; settled: boolean }> {
+    // A waiter learns of the commit before the recovery record is cleared (the clear still runs under the worktree lock).
+    let settled = false;
+    const hooks = { committed: (rows: WriteRequest[]) => { settled = true; this.settled(rows[0]!); } };
+    const published = await this.onLane(transaction => publishSingleWrite(this.engine, row, prepared, this.hostId, hooks, transaction));
+    const done = published === LANE_BUSY ? await publishSingleWrite(this.engine, row, prepared, this.hostId, hooks) : published;
+    return { done, settled: settled && done.state === 'committed' };
+  }
+  /**
+   * Phase 4.4: runs `run` with transactions on the warm lane connection (the
+   * single-write publication's, also lent to this process's own single-write
+   * admission), or returns LANE_BUSY without running it when the lane is in
+   * use, unavailable, or the `single_write_group` switch is off. A failure
+   * that may have broken the connection (not a refusal or an SQL error the
+   * transaction rolled back) gives the lane up for a minute.
+   */
+  async onLane<T>(run: (transaction: <R>(fn: (tx: BrainEngine) => Promise<R>) => Promise<R>) => Promise<T>): Promise<T | typeof LANE_BUSY> {
+    if (this.engine.kind !== 'postgres' || this.stopping || this.laneInUse || !await writeSwitchOn(this.engine, 'single_write_group').catch(() => true)) return LANE_BUSY;
+    const conn = await this.acquireIdleLane(undefined, true) as (ReservedConnection & Partial<ReservedTransactions>) | undefined;
+    if (!conn?.transaction || this.laneInUse) return LANE_BUSY;
+    this.laneInUse = true;
+    try {
+      return await run(fn => conn.transaction!(fn));
+    } catch (error) {
+      const code = (error as { code?: unknown } | null)?.code;
+      if (!(error instanceof OperationError) && !(typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code)) && this.idleLane?.conn === conn) {
+        this.laneInUse = false; await this.releaseIdleLane(); this.idleLaneRetryAt = Date.now() + 60_000;
+      }
+      throw error;
+    } finally { this.laneInUse = false; }
   }
   private async probeQuery<T>(lane: ReservedConnection | undefined, sql: string, params: unknown[], signal?: AbortSignal): Promise<T[]> {
     if (!lane) return this.engine.executeRaw<T>(sql, params, { signal });
@@ -287,10 +345,13 @@ export class PersistenceConsumer {
         return;
       }
     }
-    await this.releaseIdleLane();
+    // Lane runs size themselves to the pool's long-hold budget; a single write keeps its warm lane.
+    if (laneRoots().length || this.engine.kind !== 'postgres' || !await writeSwitchOn(this.engine, 'single_write_group').catch(() => true)) await this.releaseIdleLane();
     this.idleDelayMs = this.pollMs;
     this.nextDelayMs = this.pollMs;
-    const scan = !afterProgress || Date.now() - this.lastScan >= this.pollMs;
+    const direct = afterProgress && this.ownAdmission && await writeSwitchOn(this.engine, 'single_write_group').catch(() => true);
+    this.ownAdmission = false;
+    const scan = !direct && (!afterProgress || Date.now() - this.lastScan >= this.pollMs);
     if (scan) {
       this.lastScan = Date.now();
       await this.phase('refresh_roots', signal => refreshManagedFilesystemRoots(this.engine,
@@ -537,7 +598,10 @@ export class PersistenceConsumer {
       this.leaseTiming(), () => abort.abort({ code: 'claim_lost' }));
     const releaseReason = () => !lease.held ? 'claim_lost' : observation.deadline_exceeded ? 'preparation_deadline' : 'consumer_stopping';
     try {
-      const preparation = this.prepare(this.engine, row, this.config, bounded ? abort.signal : undefined);
+      // Phase 4.3: a single page write prepares against one config read instead of one per key.
+      const preparation = (async () => this.prepare(this.engine.kind === 'postgres' && singleWrite(row)
+        && await writeSwitchOn(this.engine, 'single_write_group').catch(() => true) ? await preparationConfigView(this.engine) : this.engine,
+      row, this.config, bounded ? abort.signal : undefined))();
       const prepared = await lease.whileHeld(preparation);
       if (prepared === CLAIM_LOST) {
         root.until = this.keepUntilSettled(preparation);
@@ -557,12 +621,12 @@ export class PersistenceConsumer {
       this.preparing.delete(row.id);
       preparationActive = false;
       await faultPoint('consumer:prepared', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation });
-      const done = await publishMutation(this.engine, row, prepared, this.hostId);
+      const { done, settled } = await this.publishSingle(row, prepared);
       if (done.state === 'failed') this.log('publication', done.error_code ?? 'storage_error', done.error_message ?? undefined);
       if (done.state === 'committed' && row.worktree_id && !String(row.intent?.kind).startsWith('managed_sync_')) {
         this.foregroundCounts.set(row.worktree_id, this.foregroundCompletions(row.worktree_id) + 1);
       }
-      return this.settled(done);
+      return settled ? isTerminal(done) : this.settled(done);
     } catch (error) {
       if (preparationActive && bounded && performance.now() >= deadline) observation.deadline_exceeded = true;
       if (preparationActive && (abort.signal.aborted || observation.deadline_exceeded)) {
@@ -621,6 +685,7 @@ export class PersistenceConsumer {
     await this.tickPromise;
     await this.releaseIdleLane();
     await Promise.allSettled([...this.active]);
+    await this.releaseIdleLane();
     while (this.outlived.size) await Promise.all([...this.outlived]);
     await this.projectionWorker;
     await this.effectsWorker;

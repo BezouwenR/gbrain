@@ -1,6 +1,7 @@
 import type { BrainEngine } from '../engine.ts';
 import { validateSlug } from '../utils.ts';
 import type { PageKey } from './types.ts';
+import { pipelined } from './transactions.ts';
 
 /** Source locks precede auth/request locks in callers; repeat held locks safely. */
 export async function lockPageKeys(engine: Pick<BrainEngine, 'executeRaw'>, keys: readonly PageKey[]): Promise<void> {
@@ -12,8 +13,24 @@ export async function lockPageKeys(engine: Pick<BrainEngine, 'executeRaw'>, keys
   }
   const ordered = [...unique.values()].sort((a, b) => a.sourceId < b.sourceId ? -1 : a.sourceId > b.sourceId ? 1 : a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0);
   const sources = new Map<string, string>();
-  for (const { sourceId } of ordered) {
-    if (sources.has(sourceId)) continue;
+  const sourceIds = [...new Set(ordered.map(key => key.sourceId))];
+  // One source key (the common case): its share lock and the guard statements are sent together; the
+  // guards take the incarnation from the locked row, and a missing source is reported before anything else.
+  if (sourceIds.length === 1 && ordered.length === 1) {
+    const key = ordered[0]!;
+    await pipelined(engine, [
+      async () => {
+        const rows = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation FROM sources WHERE id=$1 FOR SHARE', [key.sourceId]);
+        if (!rows.length) throw new Error(`Page source does not exist: ${key.sourceId}`);
+      },
+      () => engine.executeRaw('INSERT INTO page_write_guards(source_incarnation,slug) SELECT incarnation,$2 FROM sources WHERE id=$1 ON CONFLICT DO NOTHING', [key.sourceId, key.slug]),
+      () => engine.executeRaw('SELECT g.slug FROM page_write_guards g JOIN sources s ON s.incarnation=g.source_incarnation WHERE s.id=$1 AND g.slug=$2 FOR UPDATE OF g', [key.sourceId, key.slug]),
+      // Also fence direct SQL row writers. The guard remains when this row is absent.
+      () => engine.executeRaw('SELECT id FROM pages WHERE source_id=$1 AND slug=$2 FOR UPDATE', [key.sourceId, key.slug]),
+    ]);
+    return;
+  }
+  for (const sourceId of sourceIds) {
     const rows = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation FROM sources WHERE id=$1 FOR SHARE', [sourceId]);
     if (!rows.length) throw new Error(`Page source does not exist: ${sourceId}`);
     sources.set(sourceId, rows[0].incarnation);
@@ -21,19 +38,24 @@ export async function lockPageKeys(engine: Pick<BrainEngine, 'executeRaw'>, keys
   if (ordered.length > 1) {
     // #5984: many keys in three statements, still created and locked in the sorted key order.
     const incarnations = ordered.map(key => sources.get(key.sourceId)!), slugs = ordered.map(key => key.slug), sourceIds = ordered.map(key => key.sourceId);
-    await engine.executeRaw('INSERT INTO page_write_guards(source_incarnation,slug) SELECT i,s FROM unnest($1::uuid[],$2::text[]) WITH ORDINALITY AS k(i,s,n) ORDER BY n ON CONFLICT DO NOTHING', [incarnations, slugs]);
-    await engine.executeRaw(`SELECT g.slug FROM unnest($1::uuid[],$2::text[]) WITH ORDINALITY AS k(i,s,n)
-      JOIN page_write_guards g ON g.source_incarnation=k.i AND g.slug=k.s ORDER BY k.n FOR UPDATE OF g`, [incarnations, slugs]);
-    await engine.executeRaw(`SELECT p.id FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS k(src,s,n)
-      JOIN pages p ON p.source_id=k.src AND p.slug=k.s ORDER BY k.n FOR UPDATE OF p`, [sourceIds, slugs]);
+    await pipelined(engine, [
+      () => engine.executeRaw('INSERT INTO page_write_guards(source_incarnation,slug) SELECT i,s FROM unnest($1::uuid[],$2::text[]) WITH ORDINALITY AS k(i,s,n) ORDER BY n ON CONFLICT DO NOTHING', [incarnations, slugs]),
+      () => engine.executeRaw(`SELECT g.slug FROM unnest($1::uuid[],$2::text[]) WITH ORDINALITY AS k(i,s,n)
+      JOIN page_write_guards g ON g.source_incarnation=k.i AND g.slug=k.s ORDER BY k.n FOR UPDATE OF g`, [incarnations, slugs]),
+      () => engine.executeRaw(`SELECT p.id FROM unnest($1::text[],$2::text[]) WITH ORDINALITY AS k(src,s,n)
+      JOIN pages p ON p.source_id=k.src AND p.slug=k.s ORDER BY k.n FOR UPDATE OF p`, [sourceIds, slugs]),
+    ]);
     return;
   }
+  // The three statements of a key are sent together (#5984 pipelining); the server still runs them in this order.
   for (const key of ordered) {
     const params = [sources.get(key.sourceId)!, key.slug];
-    await engine.executeRaw('INSERT INTO page_write_guards(source_incarnation,slug) VALUES ($1::uuid,$2) ON CONFLICT DO NOTHING', params);
-    await engine.executeRaw('SELECT slug FROM page_write_guards WHERE source_incarnation=$1::uuid AND slug=$2 FOR UPDATE', params);
-    // Also fence direct SQL row writers. The guard remains when this row is absent.
-    await engine.executeRaw('SELECT id FROM pages WHERE source_id=$1 AND slug=$2 FOR UPDATE', [key.sourceId, key.slug]);
+    await pipelined(engine, [
+      () => engine.executeRaw('INSERT INTO page_write_guards(source_incarnation,slug) VALUES ($1::uuid,$2) ON CONFLICT DO NOTHING', params),
+      () => engine.executeRaw('SELECT slug FROM page_write_guards WHERE source_incarnation=$1::uuid AND slug=$2 FOR UPDATE', params),
+      // Also fence direct SQL row writers. The guard remains when this row is absent.
+      () => engine.executeRaw('SELECT id FROM pages WHERE source_id=$1 AND slug=$2 FOR UPDATE', [key.sourceId, key.slug]),
+    ]);
   }
 }
 

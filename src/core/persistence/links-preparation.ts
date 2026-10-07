@@ -8,6 +8,7 @@ import { capturedLinkEndpoints, indexLinkSources, loadLinkSourcePolicy, resolveC
 import { collectWantedLinks, isWantedPagesEnabled } from '../wanted-links.ts';
 import { readFix } from '../ops/op-fix.ts';
 import { lineGrammarOptions } from '../line-grammar.ts';
+import { primeRelationSemantics } from '../link-semantics-pack.ts';
 
 async function liveSlugAliases(engine: BrainEngine, sourceId: string, targets: string[]): Promise<Map<string, string>> {
   if (!targets.length) return new Map();
@@ -72,8 +73,13 @@ export const LINK_ENDPOINTS_SQL = `WITH own AS (
     FROM pages WHERE source_id=s.id AND slug=ANY(e.refs) AND deleted_at IS NULL OFFSET 0) p
   WHERE s.id<>$1`;
 
+/**
+ * `primeSemantics`: install the pack relation semantics now, during preparation, so apply's
+ * replacement does not read them again inside the publication transaction.
+ */
 export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
-  page: Pick<ParsedPage, 'type' | 'compiled_truth' | 'timeline' | 'frontmatter'>, sourceId: string) {
+  page: Pick<ParsedPage, 'type' | 'compiled_truth' | 'timeline' | 'frontmatter'>, sourceId: string, primeSemantics = false) {
+  if (primeSemantics) await primeRelationSemantics(engine);
   const resolver = makeResolver(engine, { mode: 'live', sourceId, basenameIndex: () => sourceBasenameIndex(engine, sourceId) });
   const opts = { globalBasename: await isGlobalBasenameEnabled(engine), lineGrammar: await lineGrammarOptions(engine),
     pack: (await loadActivePackForLocalEngine(engine, { sourceId }))?.manifest ?? null };
@@ -122,7 +128,7 @@ export async function prepareAutomaticLinks(engine: BrainEngine, slug: string,
     if (!snapshot) throw new Error('Automatic link origin disappeared');
     try {
       const result = await tx.replaceDerivedLinks({ slug, sourceId, expectedRevision: snapshot.revision,
-        sourceIncarnation: snapshot.sourceIncarnation }, rows, { preserveExisting: true, wanted: { ...wanted, producers: [...wanted.producers] },
+        sourceIncarnation: snapshot.sourceIncarnation, snapshot }, rows, { preserveExisting: true, semanticsPrimed: primeSemantics, wanted: { ...wanted, producers: [...wanted.producers] },
         expectedEndpoints: capturedLinkEndpoints(rows, new Map([...metadata,
           [`${sourceId}\0${slug}`, { slug, source_id: sourceId, type: page.type, knowledge_revision: snapshot.revision }]]))
           .filter(endpoint => endpoint.slug !== slug || endpoint.sourceId !== sourceId) });

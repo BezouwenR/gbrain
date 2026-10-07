@@ -61,6 +61,7 @@ import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { resolveImportContextualMode } from './import-contextual-mode.ts';
 import { runGuardrails } from './guardrails.ts';
 import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence } from './facts-fence.ts';
+import { pipelined } from './page-state/transactions.ts';
 
 /**
  * #2044 / #4548: row-level, visibility-aware fence merge for one page
@@ -242,6 +243,8 @@ export async function importFromContent(
     prepare?: (prepared: import('./persistence/prepared-import.ts').PreparedContentImport) => Promise<ImportResult>;
     /** #5984, with `prepare`: the coordinator proves the base revision under its page guard, and the caller seals the text projection and checks the read-back (`contentHash`) from its own read after apply; apply skips all three. */
     coordinated?: boolean;
+    /** With `coordinated`: the caller's own read of this page (deleted rows included) just before, reused as the import base. */
+    existingSnapshot?: import('./page-state/types.ts').PageSnapshot | null;
     /** Internal canonical metadata, after protected-body overlays and before hashing. */
     prepareFrontmatter?: (page: ParsedPage) => void;
     noEmbed?: boolean;
@@ -558,7 +561,7 @@ export async function importFromContent(
   // engine.putPage defaults to 'default' when sourceId is unset, so the read
   // mirrors that default instead of matching the slug in ANY source (the
   // unscoped-check/scoped-write bug class).
-  const existingSnapshot = opts.prepare ? await engine.readPageSnapshot(slug, { sourceId: sourceId ?? 'default', includeDeleted: true }) : null;
+  const existingSnapshot = !opts.prepare ? null : opts.coordinated && opts.existingSnapshot !== undefined ? opts.existingSnapshot : await engine.readPageSnapshot(slug, { sourceId: sourceId ?? 'default', includeDeleted: true });
   const existing = opts.prepare ? existingSnapshot?.page ?? null : await engine.getPage(slug, { sourceId: sourceId ?? 'default', includeDeleted: true });
   if (existing) stabilizeSafetyAssessments(parsed.frontmatter, existing.frontmatter);
 
@@ -899,31 +902,25 @@ export async function importFromContent(
     // under CAS, and --no-embed drains read it back. Every chunk row is
     // replaced below, so no older vector survives under this stamp.
     // This stamp certifies no vector: embedding_signature stays deferred.
-    await tx.updatePageContextualRetrievalState(
-      slug,
-      sourceId ?? 'default',
-      effectiveCRMode,
-      corpusGeneration,
-    );
-
-    // Tag reconciliation (A14): frontmatter tags carry tag_source='frontmatter'.
-    // A frontmatter-owned row whose tag left the frontmatter is deleted; rows
-    // explicit adds own ('added': add_tag, enrichment, the code importer) and
-    // legacy NULL rows are never deleted here (#1621: reindex must not wipe
-    // enrichment). A legacy row still in the frontmatter is adopted. Prepared
-    // (managed) imports keep the add-only union their canonical file renders.
-    if (!opts.prepare) {
-      await tx.executeRaw(`DELETE FROM tags t USING pages p WHERE p.id = t.page_id AND p.source_id = $1 AND p.slug = $2
-        AND t.tag_source = 'frontmatter' AND NOT (t.tag = ANY($3::text[]))`, [txOpts.sourceId, slug, parsed.tags]);
-    }
-    for (const tag of parsed.tags) {
-      await tx.addTag(slug, tag, opts.prepare ? txOpts : { ...txOpts, tagSource: 'frontmatter' });
-    }
-
-    // Replace every derived row atomically. Only vectors the A13 reuse gate
-    // above admitted carry over; a new seal otherwise inherits nothing from an
-    // older index, whose contextual vector may have included a private sibling.
-    await tx.deleteChunks(slug, txOpts);
+    // The stamp, the tag reconciliation and the chunk delete touch independent rows: sent together.
+    await pipelined(tx, [
+      () => tx.updatePageContextualRetrievalState(slug, sourceId ?? 'default', effectiveCRMode, corpusGeneration),
+      // Tag reconciliation (A14): frontmatter tags carry tag_source='frontmatter'.
+      // A frontmatter-owned row whose tag left the frontmatter is deleted; rows
+      // explicit adds own ('added': add_tag, enrichment, the code importer) and
+      // legacy NULL rows are never deleted here (#1621: reindex must not wipe
+      // enrichment). A legacy row still in the frontmatter is adopted. Prepared
+      // (managed) imports keep the add-only union their canonical file renders.
+      async () => {
+        if (!opts.prepare) await tx.executeRaw(`DELETE FROM tags t USING pages p WHERE p.id = t.page_id AND p.source_id = $1 AND p.slug = $2
+          AND t.tag_source = 'frontmatter' AND NOT (t.tag = ANY($3::text[]))`, [txOpts.sourceId, slug, parsed.tags]);
+        for (const tag of parsed.tags) await tx.addTag(slug, tag, opts.prepare ? txOpts : { ...txOpts, tagSource: 'frontmatter' });
+      },
+      // Replace every derived row atomically. Only vectors the A13 reuse gate
+      // above admitted carry over; a new seal otherwise inherits nothing from an
+      // older index, whose contextual vector may have included a private sibling.
+      () => tx.deleteChunks(slug, txOpts),
+    ]);
     if (chunks.length > 0) {
       const embeddingColumn = await stampEmbeddingInputs(tx, chunks, null,
         { title: parsed.title, tier: effectiveCRMode === 'title' ? 'title' : 'none', corpusGeneration });

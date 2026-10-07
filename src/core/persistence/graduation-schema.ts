@@ -74,8 +74,17 @@ function parseJson<T>(value: unknown): T | null {
   return value as T;
 }
 
+/** Engines (their root, never a transaction clone) whose database is known to have the table; an absence is never kept. */
+const tablePresent = new WeakSet<object>();
+function rootEngine(engine: object): object {
+  let root = engine;
+  while (Object.hasOwn(root, '_pageTransaction')) root = Object.getPrototypeOf(root);
+  return root;
+}
 export async function graduationTablePresent(engine: BrainEngine): Promise<boolean> {
+  if (tablePresent.has(rootEngine(engine))) return true;
   const [row] = await engine.executeRaw<{ present: boolean }>(`SELECT to_regclass('persistence_graduation') IS NOT NULL AS present`);
+  if (row?.present === true) tablePresent.add(rootEngine(engine));
   return row?.present === true;
 }
 

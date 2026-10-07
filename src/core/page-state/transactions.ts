@@ -78,8 +78,8 @@ export function transactionMemo<T>(tx: object, keys: string | readonly string[],
  * calls' first. The first failure in call order that is not a 25P02 abort is
  * thrown (the 25P02 itself when that is all there is). PGLite runs the calls one at a time.
  */
-export async function pipelined(engine: { kind: string }, calls: ReadonlyArray<() => Promise<unknown>>): Promise<unknown[]> {
-  if (engine.kind !== 'postgres') {
+export async function pipelined(engine: object, calls: ReadonlyArray<() => Promise<unknown>>): Promise<unknown[]> {
+  if ((engine as { kind?: unknown }).kind !== 'postgres') {
     const results: unknown[] = [];
     for (const call of calls) results.push(await call());
     return results;

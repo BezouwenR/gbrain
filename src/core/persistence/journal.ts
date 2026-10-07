@@ -8,6 +8,8 @@ import { digest, jsonBytes, requireUuid } from './digest.ts';
 import { authorizeWrite } from './authority.ts';
 import { journalLimitKey, oneYearCapacity, readJournalLimits, readReceiptRetentionDays } from './limits.ts';
 import { retryWriteAdmission } from './admission-retry.ts';
+import { PreadmitBrainChanged } from './preadmit-cache.ts';
+import { pipelined } from '../page-state/transactions.ts';
 import { writeHealth, type WriteHealthFacts } from './health.ts';
 import { writerStamp } from './writer-versions.ts';
 import { publicFailureDetail } from './publication-failure.ts';
@@ -15,7 +17,6 @@ import { catalogueError } from '../error-catalogue.ts';
 import { ACTIVE_REFRESH_STATES_SQL, refreshFenceClear } from './worktree-refresh-schema.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, declarePersistenceProtocol, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertGraduationAdmission } from './graduation-custody.ts';
-import { pipelined } from '../page-state/transactions.ts';
 import {
   isTerminal, principalKey, requestPrincipal, recoveryFiles,
   type JournalLimits, type Principal, type RecoveryRecord, type RequestState,
@@ -39,6 +40,8 @@ export interface WriteAdmission {
   intent: Record<string, unknown>;
   authority: WriteAuthority;
   terminalReservation?: number;
+  /** Phase 4.2: the brain the cached pre-admission reads came from; admission under another brain throws PreadmitBrainChanged. */
+  brainId?: string;
 }
 interface Counter {
   key: string; outstanding_count: number | string; intent_bytes: number | string;
@@ -96,8 +99,12 @@ export const ENSURE_COUNTERS_SQL = 'INSERT INTO persistence_counters(key) SELECT
 export const LOCK_COUNTERS_SQL = 'SELECT * FROM persistence_counters WHERE key=ANY($1::text[]) ORDER BY key COLLATE "C" FOR UPDATE';
 export async function lockCounters(tx: SqlEngine, keys: string[]): Promise<Counter[]> {
   const sorted = [...new Set(keys)].sort();
-  await tx.executeRaw(ENSURE_COUNTERS_SQL, [sorted]);
-  return tx.executeRaw<Counter>(LOCK_COUNTERS_SQL, [sorted]);
+  // Sent together; the server creates the rows before it locks them.
+  const [, locked] = await pipelined(tx, [
+    () => tx.executeRaw(ENSURE_COUNTERS_SQL, [sorted]),
+    () => tx.executeRaw<Counter>(LOCK_COUNTERS_SQL, [sorted]),
+  ]) as [unknown, Counter[]];
+  return locked;
 }
 export async function getWriteRequest(engine: SqlEngine, principal: Principal, requestId: string): Promise<WriteRequest | null> {
   const [row] = await engine.executeRaw<WriteRequest>(
@@ -131,10 +138,12 @@ export function assertReplayIntent(row: WriteRequest, expectedDigest: string): W
     'This request_id was already accepted with different intent.', 'Replay the original request, or allocate a new request_id for a new intent.');
   return row;
 }
-export async function admitWrite(engine: BrainEngine, input: WriteAdmission, overrides?: Partial<JournalLimits>): Promise<WriteRequest> {
+export async function admitWrite(engine: BrainEngine, input: WriteAdmission, overrides?: Partial<JournalLimits>,
+  transaction: <T>(fn: (tx: BrainEngine) => Promise<T>) => Promise<T> = fn => engine.transaction(fn)): Promise<WriteRequest> {
   const { requestId, apply } = await prepareAdmission(engine, input, overrides);
-  return retryWriteAdmission(requestId, remaining => engine.transaction(async tx => {
-    await declareDurablePersistence(tx, `${Math.min(100, remaining)}ms`, `${remaining}ms`);
+  return retryWriteAdmission(requestId, remaining => transaction(async tx => {
+    const brain = await declareDurablePersistence(tx, `${Math.min(100, remaining)}ms`, `${remaining}ms`);
+    if (input.brainId !== undefined && brain !== input.brainId) throw new PreadmitBrainChanged();
     return apply(tx);
   }));
 }
@@ -152,23 +161,28 @@ async function prepareAdmission(engine: BrainEngine, input: WriteAdmission, over
   const stamp = writerStamp();
   return { requestId, apply: async (tx: BrainEngine): Promise<WriteRequest> => {
     await declarePersistenceProtocol(tx);
-    await assertGraduationAdmission(tx);
-    assertMutationProtocol({ target_kind: input.targetKind, protocol_version: input.protocolVersion });
-    if (input.worktreeId) await assertWorktreeAdmission(tx, input);
-    // Source membership is locked before principal/counter/request guards. A
-    // deleted/recreated source never receives work accepted for its old identity.
-    const [source] = await tx.executeRaw<{ incarnation: string; archived: boolean }>(
-      'SELECT incarnation,archived FROM sources WHERE id=$1 FOR SHARE', [input.sourceId]);
-    if (!source || source.archived || source.incarnation !== input.sourceIncarnation) {
-      throw new OperationError('source_changed', 'The write source is missing, archived, or was replaced.', 'Resolve the source again and submit a new request.');
-    }
-    await authorizeWrite(tx, input.authority, input.operation, input.slug, true);
-    const counters = await lockCounters(tx, ['brain', principalKey(input.principal)]);
-    if(input.principal.kind==='local_cli') {
-      const topology=await tx.executeRaw('SELECT id FROM persistence_topology_changes WHERE principal_id=$1::uuid AND request_id=$2::uuid',[input.principal.id,requestId]);
-      if(topology.length) throw lifecycleIdConflict(requestId);
-    }
-    const prior = await getWriteRequest(tx, input.principal, requestId);
+    // The guards are sent together in lock order (worktree, source, writer, counters) and judged in
+    // that order: the first refusal in this list is the one reported, as when they ran one by one.
+    const [, , , , , counters, topology, prior] = await pipelined(tx, [
+      () => assertGraduationAdmission(tx),
+      async () => assertMutationProtocol({ target_kind: input.targetKind, protocol_version: input.protocolVersion }),
+      async () => { if (input.worktreeId) await assertWorktreeAdmission(tx, input); },
+      // Source membership is locked before principal/counter/request guards. A
+      // deleted/recreated source never receives work accepted for its old identity.
+      async () => {
+        const [source] = await tx.executeRaw<{ incarnation: string; archived: boolean }>(
+          'SELECT incarnation,archived FROM sources WHERE id=$1 FOR SHARE', [input.sourceId]);
+        if (!source || source.archived || source.incarnation !== input.sourceIncarnation) {
+          throw new OperationError('source_changed', 'The write source is missing, archived, or was replaced.', 'Resolve the source again and submit a new request.');
+        }
+      },
+      () => authorizeWrite(tx, input.authority, input.operation, input.slug, true),
+      () => lockCounters(tx, ['brain', principalKey(input.principal)]),
+      () => input.principal.kind === 'local_cli' ? tx.executeRaw('SELECT id FROM persistence_topology_changes WHERE principal_id=$1::uuid AND request_id=$2::uuid', [input.principal.id, requestId])
+        : Promise.resolve([]),
+      () => getWriteRequest(tx, input.principal, requestId),
+    ]) as [unknown, unknown, unknown, unknown, unknown, Counter[], unknown[], WriteRequest | null];
+    if (topology.length) throw lifecycleIdConflict(requestId);
     if (prior) {
       if ((prior.target_kind ?? 'page') !== (input.targetKind ?? 'page') || (prior.protocol_version ?? 1) !== (input.protocolVersion ?? 1)) {
         throw opError('idempotency_conflict', 'This request_id belongs to a different mutation target or protocol.',
@@ -346,13 +360,16 @@ export async function renewGroupClaims(engine: SqlEngine, rows: WriteRequest[], 
  * judged first, as before).
  */
 async function assertWorktreeAdmission(tx: BrainEngine, input: WriteAdmission): Promise<void> {
-  await tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [input.worktreeId]);
-  const [state] = await tx.executeRaw<{ refresh: { id: string; state: string; source_ids: string[] } | string | null; bound: boolean }>(`SELECT
+  // Sent together: the server takes the share lock before it reads the fence and the binding.
+  const [, [state]] = await pipelined(tx, [
+    () => tx.executeRaw('SELECT id FROM persistence_worktrees WHERE id=$1::uuid FOR SHARE', [input.worktreeId]),
+    () => tx.executeRaw<{ refresh: { id: string; state: string; source_ids: string[] } | string | null; bound: boolean }>(`SELECT
       (SELECT row_to_json(f) FROM (SELECT id,state,source_ids FROM persistence_worktree_refreshes
         WHERE worktree_id=$3::uuid AND state IN ${ACTIVE_REFRESH_STATES_SQL} LIMIT 1) f) AS refresh,
       EXISTS (SELECT 1 FROM persistence_source_bindings WHERE source_id=$1
         AND source_incarnation=$2::uuid AND worktree_id=$3::uuid AND topology_generation=$4) AS bound`,
-  [input.sourceId, input.sourceIncarnation, input.worktreeId, input.topologyGeneration]);
+    [input.sourceId, input.sourceIncarnation, input.worktreeId, input.topologyGeneration]),
+  ]) as [unknown, Array<{ refresh: { id: string; state: string; source_ids: string[] } | string | null; bound: boolean }>];
   const refresh = typeof state?.refresh === 'string' ? JSON.parse(state.refresh) as { id: string; state: string; source_ids: string[] } : state?.refresh ?? null;
   if (refresh) await assertWorktreeNotRefreshing(tx, input, refresh);
   if (!state?.bound) throw opError('source_changed', 'The source binding changed during admission.',
@@ -409,11 +426,14 @@ export async function hasClaimableWrite(engine: SqlEngine, hostId: string, exclu
 /** Claims commit before OS-lock waits. An unresolved head blocks its entire root. */
 export async function claimNextWrite(engine: BrainEngine, hostId: string, leaseMs = 30_000, excludeRoots: string[] = []): Promise<WriteRequest | null> {
   return engine.transactionDirect(async tx => {
-    await declarePersistenceProtocol(tx);
-    const [row] = await tx.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
+    // The protocol declaration and the FIFO head read are sent together.
+    const [, [row]] = await pipelined(tx, [
+      () => declarePersistenceProtocol(tx),
+      () => tx.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
       LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
       WHERE ${CLAIMABLE_WRITE_SQL}
-      ORDER BY r.sequence LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, excludeRoots]);
+      ORDER BY r.sequence LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, excludeRoots]),
+    ]) as [unknown, WriteRequest[]];
     if (!row) return null;
     const [claimed] = await tx.executeRaw<WriteRequest>(`UPDATE persistence_requests SET state='running',
       execution_token=$2::uuid,claim_expires_at=now()+($3::double precision*interval '1 millisecond'),
@@ -507,18 +527,18 @@ export async function prepareRecovery(engine: BrainEngine, row: WriteRequest, re
  * whose claim moved, or that already holds a record, fails the whole call and
  * nothing is recorded.
  */
-export async function prepareRecoveries(engine: BrainEngine, members: { row: WriteRequest; record: RecoveryRecord; bytes: number }[]): Promise<void> {
+export async function prepareRecoveries(engine: BrainEngine, members: { row: WriteRequest; record: RecoveryRecord; bytes: number }[],
+  transaction: <T>(fn: (tx: BrainEngine) => Promise<T>) => Promise<T> = fn => engine.transaction(fn), knownLimits?: JournalLimits): Promise<void> {
   if (!members.length) return;
   const worktree = members[0]!.row.worktree_id;
   if (!worktree || members.some(member => member.row.worktree_id !== worktree)) throw new TypeError('Grouped filesystem recovery requires one worktree.');
-  const limits = await readJournalLimits(engine);
+  const limits = knownLimits ?? await readJournalLimits(engine);
   const total = members.reduce((sum, member) => sum + member.bytes, 0);
   if (members.some(member => member.bytes > limits.worktreeRecoveryBytes || member.bytes > limits.brainRecoveryBytes)) {
     throw new OperationError('request_too_large', 'This request exceeds the configured recovery capacity.', 'Increase recovery capacity before submitting a new request.');
   }
-  await engine.transaction(async tx => {
-    await declareDurablePersistence(tx);
-    const counters = await lockCounters(tx, ['brain', `worktree:${worktree}`]);
+  await transaction(async tx => {
+    const [, counters] = await pipelined(tx, [() => declareDurablePersistence(tx), () => lockCounters(tx, ['brain', `worktree:${worktree}`])]) as [unknown, Counter[]];
     for (const c of counters) if (Number(c.recovery_bytes) + total > (c.key === 'brain' ? limits.brainRecoveryBytes : limits.worktreeRecoveryBytes)) throw capacityError('recovery bytes currently reserved by other requests');
     const recorded = await tx.executeRaw(`WITH recorded AS (UPDATE persistence_requests r SET recovery=t.record,recovery_bytes=t.bytes,updated_at=now()
         FROM jsonb_to_recordset($1::text::jsonb) AS t(id uuid,token uuid,record jsonb,bytes bigint)
@@ -532,12 +552,13 @@ export async function prepareRecoveries(engine: BrainEngine, members: { row: Wri
 }
 
 /** Clears the resolved recovery records of a committed group in one transaction; a record that changed is cleared on its own. */
-export async function clearResolvedRecoveries(engine: BrainEngine, rows: WriteRequest[]): Promise<void> {
+export async function clearResolvedRecoveries(engine: BrainEngine, rows: WriteRequest[],
+  transaction: <T>(fn: (tx: BrainEngine) => Promise<T>) => Promise<T> = fn => engine.transaction(fn)): Promise<void> {
   const resolved = rows.filter(row => row.recovery && isTerminal(row));
-  if (resolved.length < 2) { for (const row of resolved) await clearResolvedRecovery(engine, row.id, row); return; }
+  if (resolved.length < 2) { for (const row of resolved) await clearResolvedRecovery(engine, row.id, row, transaction); return; }
   for (const row of resolved) for (const file of recoveryFiles(row.recovery!)) assertRecoveryStagingAbsent(file);
   const worktree = resolved[0]!.worktree_id;
-  const cleared = new Set((await engine.transaction(async tx => {
+  const cleared = new Set((await transaction(async tx => {
     await declareDurablePersistence(tx);
     const keys = ['brain', ...(worktree ? [`worktree:${worktree}`] : [])];
     await lockCounters(tx, keys);
@@ -608,21 +629,24 @@ export async function completeWrite(tx: SqlEngine, row: WriteRequest, state: 'co
  * staging files can change: its staging is checked first and the record is
  * cleared in one statement when it is still exactly that record.
  */
-export async function clearResolvedRecovery(engine: BrainEngine, id: string, known?: WriteRequest): Promise<void> {
+export async function clearResolvedRecovery(engine: BrainEngine, id: string, known?: WriteRequest,
+  transaction: <T>(fn: (tx: BrainEngine) => Promise<T>) => Promise<T> = fn => engine.transaction(fn)): Promise<void> {
   const row = known ?? await getWriteRequestById(engine, id);
   if (!row?.recovery || !isTerminal(row)) return;
   if (known) for (const file of recoveryFiles(row.recovery)) assertRecoveryStagingAbsent(file);
-  await engine.transaction(async tx => {
-    await declareDurablePersistence(tx);
+  await transaction(async tx => {
     const keys = ['brain', ...(row.worktree_id ? [`worktree:${row.worktree_id}`] : [])];
-    await lockCounters(tx, keys);
     if (known) {
-      const [cleared] = await tx.executeRaw(`WITH locked AS (SELECT id,recovery_bytes FROM persistence_requests WHERE id=$1::uuid AND recovery=$3::text::jsonb
+      // The settings, the counter lock and the clear of the exact known record are sent together.
+      const [, , [cleared]] = await pipelined(tx, [() => declareDurablePersistence(tx), () => lockCounters(tx, keys), () => tx.executeRaw(`WITH locked AS (SELECT id,recovery_bytes FROM persistence_requests WHERE id=$1::uuid AND recovery=$3::text::jsonb
           AND state IN ('committed','conflict','failed','cancelled') FOR UPDATE),
         released AS (UPDATE persistence_counters SET recovery_bytes=recovery_bytes-(SELECT recovery_bytes FROM locked) WHERE key=ANY($2::text[]) AND EXISTS (SELECT 1 FROM locked))
         UPDATE persistence_requests r SET recovery=NULL,recovery_bytes=0,blocked_reason=NULL FROM locked WHERE r.id=locked.id RETURNING r.id`,
-      [id, keys, JSON.stringify(row.recovery)]);
+      [id, keys, JSON.stringify(row.recovery)])]) as [unknown, unknown, unknown[]];
       if (cleared) return;
+    } else {
+      await declareDurablePersistence(tx);
+      await lockCounters(tx, keys);
     }
     const [locked] = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid FOR UPDATE', [id]);
     if (!locked?.recovery || !isTerminal(locked)) return;
