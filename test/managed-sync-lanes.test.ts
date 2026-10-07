@@ -229,7 +229,7 @@ test('a failed page under lanes stops the run: earlier pages commit, nothing aft
   const failedAt = rows.findIndex(row => row.slug === 'notes/n030');
   expect(rows[failedAt]!.state).toBe('failed');
   expect(rows.slice(0, failedAt).every(row => row.state === 'committed')).toBe(true);
-  expect(rows.slice(failedAt + 1).every(row => row.state === 'cancelled')).toBe(true);
+  expect(rows.slice(failedAt + 1).filter(row => row.state !== 'cancelled').map(row => `${row.slug} ${row.state} group=${row.grp} lane=${row.lane}`)).toEqual([]);
   for (const row of rows.slice(failedAt + 1)) expect(await engine.getPage(row.slug, { sourceId: f.id })).toBeNull();
   const laterGroups = rows.slice(failedAt + 1).filter(row => row.grp !== rows[failedAt]!.grp);
   for (const row of laterGroups) expect(row.error_message).toBe(WINDOW_CANCEL_MESSAGE);

@@ -71,16 +71,27 @@ export async function cancelWindow(engine: BrainEngine, window: Array<Array<{ re
  * #5984 lanes: after a drain's lane tasks settled, cancels its lane run's still-queued rows, in manifest order,
  * whose predecessor ended without committing (a lane that saw its predecessor go back to the queue releases its
  * group, which the window cancellation had skipped while it was claimed). The consumer's FIFO claim cancels the
- * same rows later (`cancelOrphanedWindowGroup`); this settles them before the drain reports.
+ * same rows later (`cancelOrphanedWindowGroup`); this settles them before the drain reports. With `settleMs`, it
+ * also waits (up to that long) for orphans the consumer already claimed under the FIFO to finish cancelling, so
+ * a blocked drain never reports one of them still running.
  */
-export async function cancelOrphanedLaneRows(engine: BrainEngine, run: string): Promise<void> {
-  const rows = await engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE state='queued' AND intent->>'lane'=$1 ORDER BY sequence`, [run]);
-  for (const row of rows) {
-    const after = windowPredecessor(row);
-    if (!after) continue;
-    const [prior] = await engine.executeRaw<{ state: string }>('SELECT state FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2 AND request_id=$3::uuid',
-      [row.principal_kind, row.principal_id, after]);
-    if (prior && ['failed', 'conflict', 'cancelled'].includes(prior.state)) await cancelRows(engine, [row]);
+export async function cancelOrphanedLaneRows(engine: BrainEngine, run: string, settleMs = 0): Promise<void> {
+  const started = Date.now();
+  for (;;) {
+    const rows = await engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE state IN ('queued','running') AND intent->>'lane'=$1 ORDER BY sequence`, [run]);
+    let unsettled = false;
+    for (const row of rows) {
+      const after = windowPredecessor(row);
+      if (!after) continue;
+      const [prior] = await engine.executeRaw<{ state: string }>('SELECT state FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2 AND request_id=$3::uuid',
+        [row.principal_kind, row.principal_id, after]);
+      if (!prior || !['failed', 'conflict', 'cancelled'].includes(prior.state)) continue;
+      // A running orphan is one the consumer claimed under the FIFO after the lanes closed; it cancels it itself.
+      if (row.state === 'running') unsettled = true;
+      else await cancelRows(engine, [row]);
+    }
+    if (!unsettled || Date.now() - started >= settleMs) return;
+    await new Promise(resolve => setTimeout(resolve, 50));
   }
 }
 

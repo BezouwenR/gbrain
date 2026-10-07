@@ -315,7 +315,7 @@ export async function drainManagedSync(engine: BrainEngine, opts: SyncOpts, anno
     if (laneRun) {
       const stats = await closeLaneRun(laneRun);
       const { cancelOrphanedLaneRows } = await import('./sync-window.ts');
-      await cancelOrphanedLaneRows(engine, laneRun).catch(() => undefined);
+      await cancelOrphanedLaneRows(engine, laneRun, result?.drain?.outcome === 'blocked' ? 10_000 : 0).catch(() => undefined);
       const lanes = result?.drain?.bulk?.lanes;
       if (lanes && stats) Object.assign(lanes, { busy: stats.busy, apply_ms_per_page: stats.applyMsPerPage, turn_wait_share: stats.turnWaitShare });
     }
