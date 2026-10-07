@@ -13,11 +13,12 @@ import { withEnv } from '../helpers/with-env.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { OperationContext } from '../../src/core/ops/contract.ts';
 import { submitPageMutation } from '../../src/core/persistence/page-mutations.ts';
-import { revokeLocalWriter } from '../../src/core/persistence/identity.ts';
+import { persistenceHome, revokeLocalWriter } from '../../src/core/persistence/identity.ts';
 import { installFaultHook } from '../../src/core/persistence/fault-points.ts';
 import { resetWriteSwitches } from '../../src/core/persistence/switches.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
 import { getWorktreeBinding } from '../../src/core/persistence/ownership.ts';
+import { tryAcquireNativeLock, type NativeLockHandle } from '../../src/core/persistence/native-lock.ts';
 
 const d = hasDatabase() ? describe : describe.skip;
 const url = () => process.env.DATABASE_URL!;
@@ -107,12 +108,17 @@ d('single page writes on Postgres (Phase 4.1-4.4)', () => {
           });
           if (caseName === 'archived source') await administered("UPDATE sources SET archived=true WHERE id='default'");
           if (caseName === 'moved binding') await administered("UPDATE persistence_source_bindings SET topology_generation=topology_generation+1 WHERE source_id='default'");
+          let refreshLock: NativeLockHandle | null = null;
           if (caseName === 'refreshing worktree') {
             const binding = (await getWorktreeBinding(engine, 'default'))!;
+            // A live refresh holds its lock, so the consumer's recovery scan leaves its fenced row alone (as for a real refresh).
+            refreshLock = await tryAcquireNativeLock(join(persistenceHome(), 'locks', `refresh-${binding.worktree_id}.lock`));
+            expect(refreshLock).not.toBeNull();
             await engine.executeRaw(`INSERT INTO persistence_worktree_refreshes (worktree_id,source_ids,principal_id,owner_epoch,topology_generation,state,old_head,target_head,upstream_ref)
               VALUES ($1::uuid,ARRAY['default'],gen_random_uuid(),$2,$3,'fenced','a','b','origin/main')`, [binding.worktree_id, binding.owner_epoch, binding.topology_generation]);
           }
-          refused = await failure(put(ctx, 'notes/next', 'Next write.'));
+          try { refused = await failure(put(ctx, 'notes/next', 'Next write.')); }
+          finally { await refreshLock?.release(); }
           const [admitted] = await engine.executeRaw<{ n: number; generation: string | null }>(
             "SELECT count(*)::int AS n,max(topology_generation)::text AS generation FROM persistence_requests WHERE slug='notes/next'");
           // A moved binding is not a refusal: the write is admitted under the current binding, as without the cache.
@@ -127,6 +133,7 @@ d('single page writes on Postgres (Phase 4.1-4.4)', () => {
       const uncached = await outcome('0');
       const cached = await outcome('1');
       if (caseName !== 'moved binding') expect(uncached).not.toBeNull();
+      if (caseName === 'refreshing worktree') expect(uncached?.code).toBe('worktree_refreshing');
       expect(cached).toEqual(uncached);
     }, 180_000);
   }

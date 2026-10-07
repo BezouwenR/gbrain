@@ -343,7 +343,7 @@ export function lanesLimit(lanes: Pick<LanesReport, 'maximum' | 'configured' | '
   if (cap === 'pool') return { kind: 'pool', message: `the connection pool allowed ${lanes.configured} of ${lanes.maximum} lanes.`,
     raise: `Set GBRAIN_POOL_SIZE=${lanes.maximum + 4} for ${lanes.maximum} lanes, if the database has the connections to spare.` };
   return { kind: 'maximum', message: `the configured maximum of ${lanes.maximum} lanes was in use.`,
-    raise: lanes.maximum < 16 ? 'Run gbrain config set sync.lanes 16 (or pass --lanes 16) to allow more.' : null };
+    raise: lanes.maximum < 16 ? 'Pass gbrain sync --lanes 16, or run gbrain config set sync.lanes 16, to allow more.' : null };
 }
 
 export interface DrainNext {
