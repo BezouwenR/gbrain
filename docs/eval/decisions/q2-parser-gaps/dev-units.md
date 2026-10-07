@@ -1,12 +1,51 @@
 # Q2 Track C: typing units on development data
 
-All six units are implemented behind `ENABLED_TYPING_UNITS` (empty, so the build types exactly like master) and each
-was measured alone and together on development data only. After reworks, no unit has a development type steal or a
-new wrong transition by identity, no unit lowers a trap family, and the all-unit package removes every E5 false start
-and every wrong single-value closure while adding 73 current employers to the live read. The development data shows
-two dependencies, now recorded as joint units: **U34** (U4 needs U3) and **U25** (U2 needs U5); the family is U1, U25,
-U34, U6 (see "Dependency units"). U2 and U6 also depend on U4's guard for the E5 probe, which I handled inside U2 and
-U6 with page-level guards instead of overlapping U4.
+U1 (adviser wording) and the joint unit U34 (U3 board wording never types `works_at`, U4 advisory, board and investor
+roles are not employment starts) ship: the preregistered held-out decision confirmed the package P2 = {U3, U4, U1}
+(`afcec1ad`), and `ENABLED_TYPING_UNITS` is `[U3, U4, U1]`. U6 failed the held-out safety conditions (now-recall
+−0.012, as-of exact −0.011, one new wrong transition by identity), and U25 (U2 with U5) added nothing on the
+confirmation set (difference 0.000 on all 200 pairs). Following the preregistration, the U2, U5 and U6 code was removed
+before landing, and the landing head types identically to `afcec1ad` (see "Landing equivalence").
+
+The rest of this report is the development record written before the verdict: all six units were measured alone and
+together on development data. After reworks, no unit had a development type steal or a new wrong transition by
+identity, and the all-unit package removed every E5 false start and every wrong single-value closure while adding 73
+current employers to the live read. The development data showed two dependencies, recorded as joint units: **U34** (U4
+needs U3) and **U25** (U2 needs U5). Development gains did not predict held-out ones for U2, U5 and U6.
+
+## Landing equivalence
+
+The landing head (the U2, U5 and U6 code, their examples and the U25 alias removed; U1, U3, U4, U34, the rule ids,
+`explainLinkType` and the package script kept) was compared with the confirmed package `afcec1ad`, both at their
+built-in `ENABLED_TYPING_UNITS = [U3, U4, U1]`, with zero differences:
+
+- **world-v1** (`scripts/q2-typing-dev.ts world-v1`, every page's extracted edges, tense rows and transitions): 723
+  lines, SHA-256 `1763359f75ac050fc19e8fdd17a6694a8cf0e6a7fbd12c2b01ef5932f9ef96fd` on both, byte-identical files. The
+  digest is committed in `test/fixtures/q2-typing-units/world-v1-confirmed-package.sha256` and checked by
+  `test/link-typing-units-subsets.test.ts`.
+- **Development dumps** (`scripts/q2-typing-dev.ts dump`, pages written through `put_page` on in-memory PGLite;
+  every person page's link rows with type, source, tense and context, its `link_transitions` rows, and its default
+  `get_links` read), compared row for row and with `compare` by identity: 0 differing pages, 0 steals, 0 gains, 0
+  transition differences on every phrasing.
+
+| Phrasing (seeds 3, 5) | Person pages | Link rows | Transitions | Pages that differ |
+|---|---|---|---|---|
+| A | 232 | 1,024 | 1,056 | 0 |
+| A2 | 232 | 987 | 978 | 0 |
+| A3 | 232 | 847 | 830 | 0 |
+| role-for | 232 | 848 | 571 | 0 |
+| new-chapter | 232 | 869 | 464 | 0 |
+| paren-move | 232 | 825 | 777 | 0 |
+| signed-on | 232 | 839 | 734 | 0 |
+| adviser | 232 | 1,024 | 1,004 | 0 |
+| board-investor | 232 | 1,024 | 978 | 0 |
+| board-director | 232 | 990 | 982 | 0 |
+| leave-start-idioms | 232 | 1,003 | 464 | 0 |
+| onboarding | 232 | 894 | 464 | 0 |
+
+`src/core/link-extraction.ts` and `src/core/link-temporal-evidence.ts` on the landing head are byte-identical to
+their state at `0044223c` (after U4, before U2), which is also why the outputs match: the removed code was reachable
+only through `typingUnitEnabled('U2' | 'U5' | 'U6')`, which the package never enabled.
 
 Development data only: temporal-edges dev seeds 3 and 5 with phrasing sets A, A2, A3 and the nine
 `test/fixtures/q2-dev-phrasings/` files; world-v1 (H1 runner); relation-line variants dev seeds 1-3 (H2 runner). No

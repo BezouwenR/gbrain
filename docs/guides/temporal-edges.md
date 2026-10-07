@@ -90,27 +90,35 @@ returns, for any page and target, the stated type, the pack rule, the deciding r
 how its verb attached to this link, the alternatives it suppressed, the role prior,
 and the cue behind every dated transition.
 
-Rows marked **U1–U6** are typing units under evaluation (decision
-`q2-parser-gaps-2026-10`; U3 and U4 are measured together as the joint unit U34). They are off by default: `ENABLED_TYPING_UNITS` in
-`src/core/link-typing-units.ts` is empty, so extraction behaves exactly as the
-unmarked rows describe. A unit ships only on its preregistered held-out verdict.
+Rows marked **U1**, **U3** and **U4** are typing units that ship on: the preregistered held-out decision
+`q2-parser-gaps-2026-10` confirmed U1 and the joint unit U34 (U3 with U4, measured together because U4 alone loses
+as-of accuracy wherever board wording still types `works_at`). `ENABLED_TYPING_UNITS` in
+`src/core/link-typing-units.ts` lists them. The unmarked rows are the core rules. Three more units were tested and not
+shipped (see "Tested and not shipped" below); their code is removed, so those phrasings stay as the core rules read them.
 
 | Policy | Supported examples | Type | Temporal evidence | Unsupported (stays as written) |
 |---|---|---|---|---|
-| Employment verbs (`verb.works_at`) | "works at [X]", "VP engineering at [X]", "joined as CTO", "head of sales" | `works_at` | "Joined/Left/Moved from [X]" date it (`cue.employment.*`) | a job title alone after the link ("Joined [X] as designer") |
+| Employment verbs (`verb.works_at`) | "works at [X]", "VP engineering at [X]", "joined as CTO", "head of sales" | `works_at` | "Joined/Left/Moved from [X]" date it (`cue.employment.*`) | a job title alone after the link ("Joined [X] as designer"), "<role> for [X]", "[X] (<role>)"; leave idioms ("parted company with", "handed in her notice at") and start framings ("first day at", "onboarding week at") date nothing |
 | Advisory verbs (`verb.advises`) | "advises [X]", "is an advisor to [X]", "joined the advisory board of [X]" | `advises` | "Became an advisor to", "Started advising", "stepped down as advisor to" (`cue.advisory.*`) | "advising [X]", the `adviser` spelling |
 | Investment verbs (`verb.invested_in`) | "invested in [X]", "led the seed", "wrote a check" | `invested_in` (event) | "Invested in", "led the … round" (`cue.event.invested_in`) | "as an angel investor" |
 | Board seat (`verb.invested_in.board_seat`) | "board seat at [X]" | `invested_in` | event start | — |
 | Role priors (`prior.investor` > `prior.advisor` > `prior.employee`) | a person page that says "partner at a venture fund", "is an advisor", "is a senior engineer at" | the prior's type, for person → company links no verb typed | none of its own | timeline and see-also links never get a prior |
 | **U1** adviser wording (`unit.u1.adviser`) | "is an adviser to [X]", "serves as an adviser to", "now advising [X]", "technical adviser at [X]" | `advises` | as advisory verbs | "financial adviser at [Bank]" (a job title); a third party's role ("her husband is an adviser to"); an adviser phrase in another sentence or timeline entry |
 | **U1** local negation (`unit.u1.negated`) | "not an advisor to [X]", "no longer advises [X]", "stopped advising [X]" | `mentions` for that occurrence | the dated "no longer advises" cue still ends an `advises` the page states elsewhere | negation more than a few words away |
-| **U2** ordinary roles (`unit.u2.*`), only where everything above gave `mentions` | "is CTO for [X]", "works as a designer for [X]", "led design at [X]", "now at [X] (product manager)", "signed on with [X] as CTO", "started a new chapter at [X] as designer" | `works_at` | dated by the employment cues of the timeline | dated timeline entries; an organization two or more dated entries mention; a page that names any organization in an advisory, board or investor role; negated, planned or interview clauses; third parties; board, observer, investor and advisory titles; company pages |
 | **U3** board wording (`unit.u3.board_wording`) | "board director at [X]", "independent director of [X]", "joined as an observer at [X]", "is also a board director at [X]" | `mentions` (a role prior may still apply) | none | board membership is not a type of its own |
 | **U3** board seat without investment (`unit.u3.board_seat_without_investment`) | "holds a board seat at [X]" on a page with no investor prior | `mentions`; `invested_in` with an investor prior or "… as an investor" in the clause | event start when typed | — |
 | **U4** not-employment starts | "Became an advisor at [X]", "Took an advisory role with [X]", "Took a board role at [X]" | unchanged | no `works_at` start (`cue.employment.start` skips advisory, board, investor, angel, observer roles) | "Joined the advisory board at [X]" still reads as a join; "head of advisory services" reads as advisory |
-| **U5** leave idioms (`unit.u5.leave`) and exchanges (`unit.u5.exchange`) | "handed in her notice at [X]", "wrapped her time up at", "packed it in", "called it a day at", "stepped back from", "parted company with", "said goodbye to", "exit from"; "swapped [A] for [B]" | unchanged | dated `works_at` end (and a start for B); dropped when a later dated entry names X in words no cue reads (a possible rejoin) | event lines ("…at the farewell dinner"), qualified references ("[X]'s old office"), "traded shares of [X]"; whose leave it is (a colleague's notice dates the subject's stint) |
-| **U6** start framings (`unit.u6.start_framing`) | "first day at [X]", "day one with", "kicked off a new role at", "onboarded at", "onboarding week at", "began working at", "a new chapter at" | unchanged (dates an existing `works_at` only) | dated `works_at` start; dropped when a later dated entry names X in words no cue reads (a possible leave) | "kick-off at [X]" without a job noun, "first day of the [X] summit", event lines, "began working with [X]"; a page that names any organization in an advisory, board or investor role |
 | Stays `mentions` | board membership with no investment or advisory statement; "started something new at [X]" with no role or employment verb; third-party subjects; negation; hypotheticals and plans | `mentions` | none | — |
+
+### Tested and not shipped
+
+| Unit | What it read | Why it does not ship |
+|---|---|---|
+| U2 ordinary roles | "<role> for [X]", "led design at [X]", "[X] (<role>)", "as <role>" after a join or sign-on, where every other rule gave `mentions` | measured jointly with U5 as U25 (U2 alone let the single-value pass close a former employer on the wrong date); on the confirmation set U25 added nothing over the package before it (difference 0.000 on all 200 pairs) |
+| U5 leave idioms and exchange moves | "parted company with", "handed in her notice at", "called it a day at", "swapped [A] for [B]" as dated ends | part of U25, above |
+| U6 start framings | "first day at", "onboarding week at", "began working at", "a new chapter at" as dated starts | failed the held-out safety conditions: now-recall −0.012, as-of exact −0.011, and one new wrong transition by identity |
+
+Development evidence and the reworks each unit went through: `docs/eval/decisions/q2-parser-gaps/dev-units.md`.
 
 ### Precedence
 
@@ -122,7 +130,7 @@ link counts: a match with another link between it and this one, or written right
 before another link, belongs to that link. A unit veto (U1 negation, U3 board wording)
 drops one match and inference moves to the next. Then the role priors (investor >
 advisor > employee; person → company links only, never in timeline or see-also
-sections), then U2. A link may keep a `mentions` row beside a typed one.
+sections). A link may keep a `mentions` row beside a typed one.
 
 ### Changing a spelling (contributor recipe)
 
@@ -140,7 +148,9 @@ sections), then U2. A link may keep a `mentions` row beside a typed one.
    test/link-typing-explain.test.ts test/link-type-attachment.test.ts
    test/link-temporal-evidence.test.ts`; for a unit,
    `bun test test/link-typing-units-subsets.test.ts` (every unit subset, and world-v1
-   unchanged with no unit when a gbrain-evals checkout is beside this one).
+   typed as master with no unit and as the confirmed package with the shipped units, when a gbrain-evals checkout is
+   beside this one). A typing change to shipped behavior needs `LINK_EXTRACTOR_VERSION_TS` bumped so existing pages
+   re-extract.
 4. **Precedence effects.** Run `explainLinkType` on the example: `rule` is what
    decided, `attachment` says whether the verb belonged to this link, and `suppressed`
    lists the rules it beat (`:outranked`), the matches that belonged to another link
