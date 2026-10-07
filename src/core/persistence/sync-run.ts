@@ -33,12 +33,13 @@ import { assertManagedSyncAllowed } from './worktree-refresh.ts';
 import type { GBrainConfig } from '../config.ts';
 import { admitGroup, freezeFollowers, groupableIntent, nextGroupSize, type BulkSettings } from './sync-group.ts';
 import { cancelWindow } from './sync-window.ts';
-import { lanePolicy, openLanes } from './sync-lanes.ts';
+import { laneApplyMsPerMember, lanePolicy, openLanes } from './sync-lanes.ts';
 import { isContentRefusal } from '../import-screen.ts';
 import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
 import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
 import { fenceReceiptLocation } from '../fence-repair/refusal.ts';
 import { faultPoint } from './fault-points.ts';
+import { pipelined } from '../page-state/transactions.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { principalAttribution } from './attribution.ts';
 import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
@@ -528,10 +529,14 @@ function countCommitted(counts: Cursor['counts'], pending: Pending, outcome: Wri
   if (Array.isArray(fences) && fences.length && pending.intent.path) counts.fences = addFencesNormalized(counts.fences, pending.intent.path, fences as Array<{ class: string }>);
 }
 interface BulkPass { settings: BulkSettings; perMemberMs: number | null;
+  /** Groups this pass formed, and the heads of window groups it admitted (saved and admitted in one transaction). */
+  formed?: number; admitted?: Set<string>;
   /** #5984 admit-ahead: when this pass last saw a foreground write queued on the worktree. */
   foregroundAt?: number }
 /** While foreground writes are recent, nothing is admitted ahead, so a new foreground write waits behind at most the publishing group. */
 const FOREGROUND_RECENT_MS = 60_000;
+/** A foreground write queued or committed this recently sizes new lane groups to the foreground budget. */
+const FOREGROUND_BUDGET_RECENT_MS = 5_000;
 type FreezeAt = (base: Cursor) => (index: number) => Promise<Pending | null>;
 
 /** The most consecutive no-op entries one waiver transaction passes. */
@@ -582,12 +587,40 @@ async function waiveRun(engine: BrainEngine, cursor: Cursor, head: Pending, key:
 /** #5984 bulk: freezes the followers of an eligible head and records them with it as the cursor's group. */
 async function formGroup(engine: BrainEngine, head: Cursor, pending: Pending, key: string, bulk: BulkPass, config: GBrainConfig, freezeAt: FreezeAt,
   assertActive: () => void): Promise<Cursor> {
-  const followers = await freezeFollowers(engine, head, config, nextGroupSize(bulk.settings, bulk.perMemberMs) - 1, freezeAt(head));
+  const followers = await freezeFollowers(engine, head, config, groupSize(head, bulk) - 1, freezeAt(head));
   if (!followers.length) return head;
   // Members name their group (the head's request ID), so a consumer can claim them together.
   const lane = laneRunOf(head, bulk);
   const members = [pending, ...followers].map(member => ({ ...member, intent: { ...member.intent, group: pending.requestId, ...(lane ? { lane } : {}) } }));
-  return saveCursor(engine, key, head, { ...head, pending: members[0], group: members }, false, assertActive);
+  return await admitAndSave(engine, key, head, { ...head, pending: members[0], group: members }, members, assertActive) ?? currentCursor(engine, key, head);
+}
+/** The size of the next group this pass forms: the drain's first group is small; lanes size by their measured apply time. */
+function groupSize(cursor: Cursor, bulk: BulkPass): number {
+  const lanes = (bulk.settings.lanes ?? 1) > 1;
+  const first = !bulk.formed && !(cursor.counts.added + cursor.counts.modified + cursor.counts.deleted);
+  bulk.formed = (bulk.formed ?? 0) + 1;
+  return nextGroupSize(bulk.settings, lanes ? laneApplyMsPerMember(cursor.binding.worktree_id) : bulk.perMemberMs,
+    { first, foreground: bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_BUDGET_RECENT_MS });
+}
+/**
+ * #5984 Phase 1: admits a group's requests and saves the cursor that records them in one transaction: the
+ * admission first, then the cursor compare-and-swap, so a lost swap rolls the admission back and no request is
+ * admitted that the cursor does not hold. Returns the saved cursor, or null when another run moved the cursor.
+ */
+async function admitAndSave(engine: BrainEngine, key: string, before: Cursor, next: Cursor, members: Pending[], assertActive: () => void): Promise<Cursor | null> {
+  const rows = await admitGroup(engine, members, before, async tx => {
+    assertActive();
+    const [saved] = await pipelined(tx, [
+      () => tx.executeRaw(`UPDATE op_checkpoints SET completed_keys=$4::text::jsonb,updated_at=now()
+        WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb RETURNING fingerprint`, [OP, key, JSON.stringify([header(before)]), JSON.stringify([header(next)])]),
+      () => tx.executeRaw('UPDATE op_checkpoints SET updated_at=now() WHERE op=$1 AND fingerprint=$2', [`${OP}-manifest`, next.runId]),
+    ]) as [unknown[]];
+    return saved.length > 0;
+  });
+  if (!rows) return null;
+  startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake();
+  await faultPoint('sync:mid_checkpoint', { sourceId: next.sourceId });
+  return next;
 }
 
 /** #5984 lanes: the drain's lane run, opened for this cursor's worktree on first use; null when lanes are off. */
@@ -616,7 +649,12 @@ async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk
   for (let slot = 0; ; slot++) {
     const window = current.window ?? [];
     // A group admits only after the group before it: a failed admission ends this pass (it is retried on the next).
-    if (slot < window.length) { if (!await admitWindowGroup(engine, current, key, slot)) break; continue; }
+    if (slot < window.length) {
+      if (bulk.admitted?.has(window[slot]![0]!.requestId)) continue;
+      if (!await admitWindowGroup(engine, current, key, slot)) break;
+      (bulk.admitted ??= new Set()).add(window[slot]![0]!.requestId);
+      continue;
+    }
     if (window.length >= depth) break;
     const start = current.index + current.group!.length + window.reduce((sum, group) => sum + group.length, 0);
     if (start >= current.entries.length) break;
@@ -629,14 +667,16 @@ async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk
     if (bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_RECENT_MS) break;
     const base: Cursor = { ...current, index: start - 1 };
     // A freeze refusal here is left for the single path to raise in order, after the publishing groups.
-    const frozen = await freezeFollowers(engine, base, config, nextGroupSize(bulk.settings, bulk.perMemberMs), freezeAt(base)).catch(() => []);
+    const frozen = await freezeFollowers(engine, base, config, groupSize(base, bulk), freezeAt(base)).catch(() => []);
     if (!frozen.length) break;
     const after = (window.at(-1) ?? current.group!).at(-1)!.requestId;
     const members = frozen.map(member => ({ ...member, intent: { ...member.intent, group: frozen[0]!.requestId, after, ...(lane ? { lane } : {}) } }));
-    const saved = await saveCursor(engine, key, current, { ...current, window: [...window, members] }, false, assertActive);
-    if (saved.window?.[window.length]?.[0]?.requestId !== members[0]!.requestId) return saved;
+    // A failed admission ends this pass (the group is frozen again on the next); a lost cursor returns the winner's.
+    const saved = await admitAndSave(engine, key, current, { ...current, window: [...window, members] }, members, assertActive).catch(() => undefined);
+    if (saved === undefined) break;
+    if (saved === null) return currentCursor(engine, key, current);
+    (bulk.admitted ??= new Set()).add(members[0]!.requestId);
     current = saved;
-    slot--;
   }
   assertActive();
   return current;
