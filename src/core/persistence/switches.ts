@@ -17,6 +17,8 @@ export const WRITE_SWITCHES = {
   preadmit_cache: { key: 'persistence.preadmit_cache', env: 'GBRAIN_PREADMIT_CACHE' },
   /** Batched waiver runs; `GBRAIN_SYNC_WAIVE_NOOP=0` wins over it. */
   waive_batch: { key: 'sync.waive_batch', env: 'GBRAIN_SYNC_WAIVE_BATCH' },
+  /** Phase 4.5: a foreground write goes ahead of queued sync groups that do not name its page; off restores the FIFO and the sync side's pauses. */
+  foreground_priority: { key: 'sync.foreground_priority', env: 'GBRAIN_SYNC_FOREGROUND_PRIORITY' },
 } as const;
 export type WriteSwitch = keyof typeof WRITE_SWITCHES;
 export type WriteSwitches = Record<WriteSwitch, boolean>;

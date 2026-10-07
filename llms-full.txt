@@ -6293,10 +6293,9 @@ Up to 16 groups publish at once in **lanes**, each on its own connection
 (`--lanes N`, `--no-lanes`, `sync.lanes` or `GBRAIN_SYNC_LANES`), capped by the
 pool: the default pool of 10 runs 6, `GBRAIN_POOL_SIZE=20` runs 16. Lanes apply pages at the same time but commit in file order, so a reader never
 sees a later page without the earlier ones. While lanes publish, the drain keeps
-freezing and admitting the next groups. Nothing is admitted ahead while
-foreground writes are recent (one was queued in the last minute), and a
-foreground write that needs the worktree makes the lanes finish their current
-groups and step aside. Groups after a failed page are cancelled ("An earlier
+freezing and admitting the next groups. A page write goes ahead of
+queued groups that do not name its page (lanes finish their groups, then one
+group runs between writes); `sync.foreground_priority false` restores FIFO. Groups after a failed page are cancelled ("An earlier
 page of the same sync did not commit") and re-frozen once it is fixed. A lock or statement timeout in a lane costs one lane for
 the rest of the run.
 

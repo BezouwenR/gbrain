@@ -1,6 +1,6 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
-import { CLAIMABLE_WRITE_SQL, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, compactWriteReceipts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
+import { claimableWriteSql, foregroundPriority, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, compactWriteReceipts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
 import { finishUnpublishedFailure, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { localHostId } from './identity.ts';
 import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
@@ -96,6 +96,12 @@ export class PersistenceConsumer {
   /** #5984 lanes: running lane tasks per worktree. */
   private laneTasks = new Map<string, number>();
   private foregroundCounts = new Map<string, number>();
+  /** #5984 Phase 4.5: the newest sequence when this process last claimed a head of each lane run (one head per foreground commit). */
+  private laneHeadSeen = new Map<string, string>();
+  /** #5984 Phase 4.5: roots where a foreground write this consumer claimed ahead of queued sync rows committed since it last claimed a sync row there. */
+  private owesSyncTurn = new Set<string>();
+  /** Requests this consumer claimed ahead of a queued sync row of their root. */
+  private passedSync = new Set<string>();
   private rootRetryAfter = new Map<string, number>();
   private projectionWorker: Promise<unknown> | undefined;
   private effectsWorker: Promise<void> | undefined;
@@ -149,7 +155,7 @@ export class PersistenceConsumer {
    * to at most one pass per poll interval. `ownAdmission` (the waiter of a
    * write this process just admitted) makes that tick skip the scans and
    * claim directly; the scans keep their own cadence, and recovery records
-   * still block the claim (CLAIMABLE_WRITE_SQL).
+   * still block the claim (claimableWriteSql).
    */
   wake(ownAdmission = false): void {
     if (ownAdmission) this.ownAdmission = true;
@@ -190,7 +196,7 @@ export class PersistenceConsumer {
     const retryingTopologies = [...this.topologyRetryAfter.keys()];
     const [row] = await this.phase('idle_probe', async signal => this.probeQuery<{ work: boolean }>(this.laneInUse ? undefined : await this.acquireIdleLane(signal), `SELECT (
       EXISTS (SELECT 1 FROM persistence_requests r LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
-        WHERE ${CLAIMABLE_WRITE_SQL}
+        WHERE ${claimableWriteSql('$5')}
         AND ($3::boolean OR r.blocked_reason IS DISTINCT FROM 'writer_pool_capacity'))
       OR EXISTS (SELECT 1 FROM persistence_requests r JOIN persistence_worktrees w ON w.id=r.worktree_id
         WHERE w.owner_host_id=$1::uuid AND r.recovery IS NOT NULL AND NOT (r.worktree_id::text=ANY($2::text[])))
@@ -213,7 +219,7 @@ export class PersistenceConsumer {
       OR EXISTS (SELECT 1 FROM persistence_topology_changes c
         JOIN persistence_worktrees w ON w.id=(c.recovery->>'worktreeId')::uuid
         WHERE c.recovery IS NOT NULL AND w.owner_host_id=$1::uuid AND NOT (c.id::text=ANY($4::text[])))
-    ) AS work`, [this.hostId, excluded, publicationConcurrency(this.engine) > 0, retryingTopologies], signal));
+    ) AS work`, [this.hostId, excluded, publicationConcurrency(this.engine) > 0, retryingTopologies, await foregroundPriority(this.engine)], signal));
     return row?.work === true;
   }
   /**
@@ -445,8 +451,10 @@ export class PersistenceConsumer {
     while (!this.stopping && this.active.size - this.laneTaskCount() < concurrency) {
       const claimed = laneClaim();
       try {
-        const row = await this.phase('claim', () => claimNextWrite(this.engine, this.hostId, this.opts.claimLeaseMs ?? 30_000, [...attemptedRoots]));
+        const row = await this.phase('claim', () => claimNextWrite(this.engine, this.hostId, this.opts.claimLeaseMs ?? 30_000, [...attemptedRoots], [...this.owesSyncTurn]));
         if (!row) break;
+        if (String(row.intent?.kind ?? '').startsWith('managed_sync_')) this.owesSyncTurn.delete(row.worktree_id ?? `db:${row.source_incarnation}`);
+        else if (row.passed_sync) this.passedSync.add(row.id);
         if (this.stopping) { await releaseUnpublishedClaim(this.engine, row, 'consumer_stopping'); break; }
         const key = row.worktree_id ?? `db:${row.source_incarnation}`;
         attemptedRoots.add(key);
@@ -466,8 +474,10 @@ export class PersistenceConsumer {
       while (!this.stopping && (this.laneTasks.get(worktreeId) ?? 0) < capacity) {
         const claimed = laneClaim();
         try {
-          const row = await this.phase('claim', () => claimNextLaneHead(this.engine, this.hostId, worktreeId, run));
+          const row = await this.phase('claim', () => claimNextLaneHead(this.engine, this.hostId, worktreeId, run, undefined, this.laneHeadSeen.get(run) ?? null));
           if (!row) break;
+          this.laneHeadSeen.set(run, row.seen_sequence);
+          this.owesSyncTurn.delete(worktreeId);
           this.startLaneTask(row, worktreeId);
         } finally { claimed(); }
       }
@@ -504,6 +514,9 @@ export class PersistenceConsumer {
   /** CEO-A7: this process holds the claim, so its outcome reaches waiters through `onSettled` without a read. */
   holds(id: string): boolean { return this.executing.has(id); }
   private settled(row: WriteRequest): boolean {
+    // #5984 Phase 4.5: after a foreground write that went ahead of queued sync rows commits, this consumer's next
+    // claim on its root is plain FIFO, so a stream of writes cannot starve the sync side.
+    if (isTerminal(row) && this.passedSync.delete(row.id) && row.state === 'committed') this.owesSyncTurn.add(row.worktree_id ?? `db:${row.source_incarnation}`);
     try { this.opts.onSettled?.(row); } catch (error) { this.report(error); }
     return isTerminal(row);
   }

@@ -8,7 +8,7 @@ import type { RegistryCode } from '../error-registry.ts';
 import { currentSourceFilesystemSignal } from '../minions/source-filesystem.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { digest, sha256 } from './digest.ts';
-import { getWriteRequest, admitWriteInTransaction, intentDigest, receiptFor } from './journal.ts';
+import { getWriteRequest, admitWriteInTransaction, foregroundPriority, intentDigest, receiptFor } from './journal.ts';
 import { retryWriteAdmission } from './admission-retry.ts';
 import { assertPersistenceAccepting, awaitWrite, foregroundWriteCompletions, startPersistenceConsumer, type WriteWait } from './service.ts';
 import { assertSyncEntryOrigin, discoverManagedSync, resolveManagedSyncContext, readSyncContent, readSyncFile, syncGit, type SyncDiscovery } from './sync-discovery.ts';
@@ -552,7 +552,9 @@ interface BulkPass { settings: BulkSettings; perMemberMs: number | null;
   /** Groups this pass formed, and the heads of window groups it admitted (saved and admitted in one transaction). */
   formed?: number; admitted?: Set<string>;
   /** #5984 admit-ahead: when this pass last saw a foreground write queued on the worktree. */
-  foregroundAt?: number }
+  foregroundAt?: number;
+  /** #5984 Phase 4.5 (`foreground_priority`): foreground writes go first at claim time, so the sync side does not pause for them. */
+  foregroundFirst?: boolean }
 /** While foreground writes are recent, nothing is admitted ahead, so a new foreground write waits behind at most the publishing group. */
 const FOREGROUND_RECENT_MS = 60_000;
 /** A foreground write queued or committed this recently sizes new lane groups to the foreground budget. */
@@ -704,7 +706,7 @@ async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk
         AND state IN ('queued','running','recovering') AND NOT(COALESCE(intent->>'kind','') LIKE 'managed_sync_%') LIMIT 1`, [current.binding.worktree_id]);
       if (foreground) bulk.foregroundAt = performance.now();
     }
-    if (bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_RECENT_MS) break;
+    if (!bulk.foregroundFirst && bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_RECENT_MS) break;
     // The window's free slots are frozen and then admitted and saved in one transaction, up to a lane count of
     // groups at a time, so lanes start on the first ones while the rest are frozen.
     const formed: Pending[][] = [];
@@ -1037,7 +1039,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     let batchStart = performance.now(), batchPages = 0, foregroundWaitStart = 0, foregroundBaseline = 0;
     let creditedPages = 0, creditStarted = 0, foregroundQueued = false;
     const sliceStarted = performance.now(), sliceFirstIndex = cursor.index, drainStartedAt = opts.drainStartedAt ?? Date.now();
-    const bulk: BulkPass = { settings: opts.bulk && !company ? opts.bulk : { enabled: false, reason: null, size: 1, maxTxnMs: 0 }, perMemberMs: null };
+    const bulk: BulkPass = { settings: opts.bulk && !company ? opts.bulk : { enabled: false, reason: null, size: 1, maxTxnMs: 0 }, perMemberMs: null, foregroundFirst: await foregroundPriority(engine) };
     const waiveBatch = noopWaiversEnabled() && await waiverBatchEnabled(engine);
     opts.onProgress?.({ phase: 'managed_sync.start', bankedFiles: cursor.index, total: cursor.entries.length });
     while (!cursor.done) {
@@ -1050,7 +1052,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
           AND state IN ('queued','running','recovering') AND NOT(COALESCE(intent->>'kind','') LIKE 'managed_sync_%') LIMIT 1`, [cursor.binding.worktree_id]);
         assertActive();
         if ((foregroundQueued = Boolean(foreground))) bulk.foregroundAt = performance.now();
-        if (foreground && creditedPages === 0) {
+        if (foreground && creditedPages === 0 && !bulk.foregroundFirst) {
           startPersistenceConsumer(engine, config);
           if (!foregroundWaitStart) {
             foregroundWaitStart = performance.now();
@@ -1097,7 +1099,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         continue;
       }
       const freezeAt: FreezeAt = base => async index => { const frozen = await freezeEntry(engine, { ...base, index }, key, assertActive, frozenRun); return 'hold' in frozen ? null : frozen; };
-      if (bulk.settings.enabled && !foregroundQueued && !prior && !cursor.group && !pending.rebound && groupableIntent(pending.intent)) cursor = await formGroup(engine, cursor, pending, key, bulk, config, freezeAt, assertActive);
+      if (bulk.settings.enabled && (bulk.foregroundFirst || !foregroundQueued) && !prior && !cursor.group && !pending.rebound && groupableIntent(pending.intent)) cursor = await formGroup(engine, cursor, pending, key, bulk, config, freezeAt, assertActive);
       if (cursor.group?.[0]?.requestId === pending.requestId && cursor.pending?.requestId === pending.requestId) {
         const step = await groupStep(engine, cursor, key, bulk, config, opts.drainStartedAt ? { waitMs: 30_000, signal } : { waitMs: 5000 }, drainStartedAt, opts.onProgress,
           opts.drainStartedAt ? next => admitAhead(engine, next, key, bulk, config, freezeAt, assertActive) : undefined);
