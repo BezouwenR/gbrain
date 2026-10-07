@@ -134,7 +134,82 @@ reads `persistence_requests` and `op_checkpoints`.
   to `now()`, which is the transaction start, so this figure leaves out
   the publication transaction itself (about 5 s at 57 ms). Time-boxed
   rows also report an extrapolation for the full backlog, labelled as
-  one.
+  one. `steady_state` adds the rate between the 10% and 90% committed
+  marks, from commit times in the trace (each committed group
+  publication counts one commit per member, any process; each committed
+  single publication of a sync process counts one, except in rows with a
+  foreground writer, where the sync process's consumer also publishes
+  `put_page` writes the trace cannot tell apart), and the time from
+  the first record of the first sync process to the first commit.
+  `steady_state.db` is the same from `persistence_requests.completed_at`,
+  with the first commit measured from the row's start.
+- **Transaction classification.** The critical path and publication
+  tables split each process's records into transactions per
+  connection, whichever process or connection runs them. A group
+  publication is a transaction with the set-based completion
+  (`WITH m AS (SELECT * FROM unnest(...)) ... UPDATE persistence_requests r
+  SET state='committed'`), or with a member attribution
+  (`set_config('gbrain.write_request',...)`) and an `INSERT INTO pages` /
+  `UPDATE pages` (a lane group rolled back before its completion). A
+  single publication has the ownership guard, the counter lock and the
+  single completion. Admission, recovery record, claim, waiver (a
+  checkpoint write under a page guard), and cursor transactions follow.
+  The full rules are in `RULES` in `managed-sync-catchup-phases.ts` and
+  in each row's JSON.
+- **Feeder (`trace.feeder`).** The sync process runs the sync loop and
+  its consumer in one process, so its records are split by marker.
+  Markers are statements only the sync loop sends: cursor, waiver and
+  admission transactions, `op_checkpoints` reads, request lookups by
+  `request_id`, the admit-ahead foreground check, and write-wait reads.
+  A gap between markers that ends at a write-wait read is idle
+  (`awaitWrite`); every other gap is producing. Loose reads in producing
+  gaps are freeze and waiver-screen reads. Reads inside a consumer
+  preparation span (the k-th claim chain's end to the k-th publication's
+  begin) are reported apart as `overlapping_preparation`, because the
+  screen and the consumer's preparation run the same helpers. A freeze
+  sends one origin read, one page snapshot and one writer check, so the
+  freeze/screen split is an estimate on that basis. Waves here are
+  counted across connections. Each bucket reports statements, waves and
+  describes per entry, per group and per page.
+- **Lanes (`trace.lanes`).** Per group publication: apply time (begin
+  to the commit-turn poll), turn wait (the trailing run of
+  `SELECT state FROM persistence_requests WHERE ... request_id=$3`
+  polls), completion, statements per page before the turn, and describes
+  per group. Also the time-weighted number of open group publications
+  while at least one is open, with its distribution.
+- **Describes (`trace.describes`).** Describe round trips per
+  connection over the run, by process, and per single publication.
+- **Foreground spans (`foreground_*.spans`).** Each `put_page` is matched to
+  the writer's transactions: writes in start order take admissions in
+  order; a write's publication is the latest unassigned single
+  publication before its reply, and its claim and recovery record are
+  the latest before that. Spans: pre-admission, admission,
+  admission+claim, preparation (claim to publication begin, including
+  the recovery record), recovery record, publication, and visible
+  (publication end to the reply). p50/p95 per span.
+- **Open-loop foreground (`foreground-open`).** `cli` while a second
+  process submits one `put_page` every `--fg-interval` seconds
+  (default 5) for the whole run, whether or not earlier writes finished.
+  `foreground_open` reports the arrival rate, most writes in flight,
+  p50/p95, failures by code (`write_pending` included), spans, and the
+  catch-up rate during the row. The closed-loop `foreground` row is
+  unchanged.
+- **Settings (`settings`).** `--pool-size N` sets `GBRAIN_POOL_SIZE`
+  for every gbrain process; unset, the product default of 10 applies.
+  Each row records the effective pool size and its source,
+  `GBRAIN_SYNC_LANES` and `GBRAIN_SYNC_BULK` when set, the pooler, the
+  most lanes observed busy, and `default_settings` (true only when
+  nothing was overridden).
+- **Pooler (`--pooler pgbouncer`, report-only).** A transaction-mode
+  PgBouncer (`edoburu/pgbouncer`, pinned by digest, PgBouncer 1.26.0,
+  `default_pool_size=50`, recreated each run) runs on loopback between toxiproxy and
+  Postgres, so the RTT stays between gbrain and the pooler. gbrain runs
+  with `GBRAIN_PREPARE=false`. Stock PgBouncer refuses the
+  `statement_timeout` and `idle_in_transaction_session_timeout` startup
+  parameters gbrain sends, so the pooler ignores them (listed in the
+  row's `settings.pooler_detail.ignore_startup_parameters`): those session timeouts do
+  not reach the server. Setup still talks to Postgres directly.
+  `--pooler-port` picks the listener (default 55434).
 
 ## JSON schema (`gbrain.bench.managed-sync-catchup/v1`)
 
