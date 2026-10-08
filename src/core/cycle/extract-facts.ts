@@ -617,6 +617,8 @@ export interface ExtractFactsResult {
   factsDeleted: number;
   /** Unfenced rows (`row_num IS NULL`, live entity page) still pending after this run's fence step. */
   legacyRowsPending: number;
+  /** Pages (sorted slugs) that still hold those rows; they skip reconciliation while the other pages reconcile (#6278). */
+  legacyPages: string[];
   /** Unfenced rows this run appended to their page's fence and stamped with a row number (#5299). */
   unfencedRowsFenced: number;
   /** Active fence-owned rows expired because their page was soft-deleted. */
@@ -765,6 +767,7 @@ export async function runExtractFacts(
     factsUpdated: 0,
     factsDeleted: 0,
     legacyRowsPending: 0,
+    legacyPages: [],
     unfencedRowsFenced: 0,
     factsExpiredForDeletedPages: 0,
     pagesFailed: 0,
@@ -802,6 +805,7 @@ export async function runExtractFacts(
   // the destructive reconciliation pass; the other pages reconcile.
   const { count: legacyCount, slugs: legacySlugs } = await pendingLegacyRows(engine, sourceId);
   result.legacyRowsPending = legacyCount;
+  result.legacyPages = [...legacySlugs].sort();
   if (legacyCount > 0) {
     result.guardTriggered = true;
     result.warnings.push(

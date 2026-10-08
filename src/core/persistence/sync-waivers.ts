@@ -22,7 +22,7 @@ export interface WaiverCursor { sourceId: string; incarnation: string; root: str
 export interface WaiverEntry { requestId: string; slug: string; pageId: number | null; intent: SyncIntent }
 export interface NoopWaiver { kind: 'import' | 'delete'; kernel: NoopKernelWaiver[] }
 
-/** `persistence.sync_preparation_ms` (Lane A defines and validates it): the budget a managed sync member's preparation gets; default 120 s. */
+/** `persistence.sync_preparation_ms` (preparation-budget.ts validates it): the budget a managed sync member's preparation gets; default 120 s. */
 export const SYNC_PREPARATION_MS_KEY = 'persistence.sync_preparation_ms';
 export const SYNC_PREPARATION_DEFAULT_MS = 120_000;
 const BUDGET_TTL_MS = 5000;

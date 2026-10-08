@@ -1240,8 +1240,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     while (!cursor.done) {
       assertActive();
       if (!cursor.pending) {
-        // A source remains fair in both directions: foreground gets service,
-        // then sync earns one bounded batch even if new interactive work keeps arriving.
+        // A source remains fair in both directions: foreground gets service, then sync earns one bounded batch even if new interactive work keeps arriving.
         if (creditedPages && performance.now() - creditStarted >= 250) creditedPages = 0;
         const [foreground] = await engine.executeRaw(`SELECT id FROM persistence_requests WHERE worktree_id=$1::uuid
           AND state IN ('queued','running','recovering') AND NOT(COALESCE(intent->>'kind','') LIKE 'managed_sync_%') LIMIT 1`, [cursor.binding.worktree_id]);
