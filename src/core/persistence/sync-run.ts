@@ -1120,8 +1120,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
   let discoveryTarget: string | null = null;
   const discoveryRun = randomUUID();
   const inheritedSignal = currentSourceFilesystemSignal();
-  const signal = opts.signal && inheritedSignal ? AbortSignal.any([opts.signal, inheritedSignal]) : opts.signal ?? inheritedSignal;
-  if (signal) frozenRun.signal = signal;
+  const signal = opts.signal && inheritedSignal ? AbortSignal.any([opts.signal, inheritedSignal]) : opts.signal ?? inheritedSignal; if (signal) frozenRun.signal = signal;
   const assertActive = () => {
     assertSyncDispatchActive();
     throwIfAborted(signal);
