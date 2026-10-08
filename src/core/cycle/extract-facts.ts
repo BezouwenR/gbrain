@@ -447,6 +447,44 @@ function timelineHasGenuineFactsFenceMarker(timeline: string): boolean {
 }
 
 /**
+ * Empty-fence guard (Codex R2-#7; #2484; #2646; per page, #6278): the active
+ * unfenced rows the fence step left on live pages of this source, per page.
+ * A row counts only when `row_num IS NULL`, its `entity_slug` resolves to a
+ * LIVE page in THIS run's source (#3526 source isolation), it is not
+ * soft-expired (#2646: `forget_fact` drains rows by soft-expiring them), the
+ * source has a `local_path` (#2763), and it is not an ontology observation
+ * (`dimension IS NULL`, #6264: those are never fenced, so they must not gate
+ * either). Rows without a page or checkout (#2484: the inline writer's
+ * slugify-floor / stub-guard-blocked slugs) are structurally unfenceable and
+ * never gate.
+ */
+async function pendingLegacyRows(engine: BrainEngine, sourceId: string): Promise<{ count: number; slugs: Set<string> }> {
+  const legacy = await engine.executeRaw<{ entity_slug: string; n: string }>(
+    `SELECT f.entity_slug, COUNT(*) AS n
+       FROM facts f
+      WHERE f.source_id = $1
+        AND f.row_num IS NULL
+        AND f.dimension IS NULL
+        AND f.entity_slug IS NOT NULL
+        AND f.expired_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM pages p
+           WHERE p.source_id = f.source_id
+             AND p.slug = f.entity_slug
+             AND p.deleted_at IS NULL
+        )
+        AND EXISTS (
+          SELECT 1 FROM sources s
+           WHERE s.id = f.source_id
+             AND s.local_path IS NOT NULL
+        )
+      GROUP BY f.entity_slug`,
+    [sourceId],
+  );
+  return { count: legacy.reduce((sum, row) => sum + parseInt(row.n ?? '0', 10), 0), slugs: new Set(legacy.map(row => row.entity_slug)) };
+}
+
+/**
  * Run the extract_facts phase against the current brain state. Returns
  * an ExtractFactsResult envelope; status mapping (ok / warn / fail)
  * happens in the cycle.ts caller.
@@ -500,41 +538,10 @@ export async function runExtractFacts(
     }
   }
 
-  // ── Empty-fence guard (Codex R2-#7; #2484; #2646; per page, #6278) ──
+  // ── Empty-fence guard (per page, #6278) ─────────────────────────
   // Rows the fence step could not fence this run keep their own page out of
-  // the destructive reconciliation pass; the other pages reconcile. A row
-  // counts only when `row_num IS NULL`, its `entity_slug` resolves to a LIVE
-  // page in THIS run's source (#3526 source isolation), it is not
-  // soft-expired (#2646: `forget_fact` drains rows by soft-expiring them),
-  // the source has a `local_path` (#2763), and it is not an ontology
-  // observation (`dimension IS NULL`, #6264: those are never fenced, so they
-  // must not gate either). Rows without a page or checkout (#2484: the
-  // inline writer's slugify-floor / stub-guard-blocked slugs) are
-  // structurally unfenceable and never gate.
-  const legacy = await engine.executeRaw<{ entity_slug: string; n: string }>(
-    `SELECT f.entity_slug, COUNT(*) AS n
-       FROM facts f
-      WHERE f.source_id = $1
-        AND f.row_num IS NULL
-        AND f.dimension IS NULL
-        AND f.entity_slug IS NOT NULL
-        AND f.expired_at IS NULL
-        AND EXISTS (
-          SELECT 1 FROM pages p
-           WHERE p.source_id = f.source_id
-             AND p.slug = f.entity_slug
-             AND p.deleted_at IS NULL
-        )
-        AND EXISTS (
-          SELECT 1 FROM sources s
-           WHERE s.id = f.source_id
-             AND s.local_path IS NOT NULL
-        )
-      GROUP BY f.entity_slug`,
-    [sourceId],
-  );
-  const legacyCount = legacy.reduce((sum, row) => sum + parseInt(row.n ?? '0', 10), 0);
-  const legacySlugs = new Set(legacy.map(row => row.entity_slug));
+  // the destructive reconciliation pass; the other pages reconcile.
+  const { count: legacyCount, slugs: legacySlugs } = await pendingLegacyRows(engine, sourceId);
   result.legacyRowsPending = legacyCount;
   if (legacyCount > 0) {
     result.guardTriggered = true;

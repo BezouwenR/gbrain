@@ -966,6 +966,16 @@ More: [docs/guides/retrieval-feedback.md#feedback_disabled](../../docs/guides/re
 
 More: [docs/guides/retrieval-feedback.md#feedback_not_authorized](../../docs/guides/retrieval-feedback.md#feedback_not_authorized)
 
+### fence_unrenderable
+
+<a id="fence_unrenderable"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A legacy fact row was not adopted into its page's facts fence because the fence codec reads the rendered row back as something other than the stored fact. | The fence trims a claim, folds CRLF to LF, reads `~~x~~` as a struck row and `<br>` as a line break; a claim the codec would change by more than whitespace cannot be written into the fence without changing what it says, so the row stays a legacy row (active and searchable, nothing is lost) and is counted by doctor fence_integrity as unrenderable_legacy_facts. The same code names a planned adoption whose rendered fence does not read back as its facts; that is a gbrain planning defect, not caller input. | Nothing to fix in the page: the rows stay active and searchable. Report the page slug and the reason class with the gbrain version; do not forget or expire a row to clear this count. Run: gbrain doctor --only fence_integrity --json | agent | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/write-refusals.md#fence_unrenderable](../../docs/guides/write-refusals.md#fence_unrenderable)
+
 ### fetch_failed
 
 <a id="fetch_failed"></a>
