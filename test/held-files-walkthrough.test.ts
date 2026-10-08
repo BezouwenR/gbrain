@@ -193,8 +193,8 @@ test('#6278: a source holding frontmatter, fence and preparation-stalled files r
     expect(retry.next_action).toContain('preparation-stalled hold(s) are not file problems');
     // Read notices: local and remote, no path for the remote relay, writer status named for the stalled kind.
     const notice = heldFilesNotice([coverage], false)!;
-    expect(notice.fix.argv).toEqual(['gbrain', 'repair', 'frontmatter', '--source', id]);
-    expect(notice.fix.why).toContain('writer status');
+    expect(notice.fix!.argv).toEqual(['gbrain', 'repair', 'frontmatter', '--source', id]);
+    expect(notice.fix!.why).toContain('writer status');
     const relay = hostOperatorFix([{ source_id: id, route: coverageRoute(coverage) }], 'why');
     expect(relay.user_message).toContain(`'gbrain sources writer status --source ${id} --json'`);
     expect(relay.user_message).toContain('the files themselves are fine');
