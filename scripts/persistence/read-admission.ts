@@ -69,7 +69,7 @@ export function observeAdmissionTransactions(engine: BrainEngine,
   const reserve = engine.withReservedConnection;
   const reservedConnections = new WeakMap<object, object>();
   async function withReservedConnection<T>(this: BrainEngine, fn: (conn: any) => Promise<T>, opts?: unknown): Promise<T> {
-    return reserve.call(this, (conn: any) => {
+    return reserve.call<BrainEngine, [(conn: any) => Promise<T>, never], Promise<T>>(this, (conn: any) => {
       let observedConn = reservedConnections.get(conn);
       if (!observedConn) {
         observedConn = typeof conn?.transaction !== 'function' ? conn : new Proxy(conn, { get(target, property, receiver) {
