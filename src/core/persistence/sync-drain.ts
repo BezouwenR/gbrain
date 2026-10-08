@@ -353,11 +353,17 @@ export function drainClaimOf(row: { head_state: string | null; head_claim_phase:
   const waiting = own ? stamp!.waiting_on : null;
   return { phase, step: own && typeof stamp!.step === 'string' ? stamp!.step : null,
     waiting_on: typeof waiting === 'string' && ['git', 'fs', 'db', 'pool', 'unknown'].includes(waiting) ? waiting as DrainClaim['waiting_on'] : own ? 'unknown' : null,
-    step_age_ms: own ? age(stamp!.since) : null, claim_age_ms: own ? age(stamp!.claimed_at) : null, lapsed: row.head_lapsed === true,
-    owner_pid: own && typeof stamp!.pid === 'number' ? stamp!.pid : null,
+    step_age_ms: own ? age(stamp!.step_since ?? stamp!.since) : null, claim_age_ms: own ? age(stamp!.claimed_at) : null, lapsed: row.head_lapsed === true,
+    owner_pid: own ? ownerPid(stamp!) : null,
     allowance_ms: Math.min(budgets.ceilingMs + STALL_GRACE_MS, budget + STALL_GRACE_MS) };
 }
 function safeJson(text: string): unknown { try { return JSON.parse(text); } catch { return null; } }
+/** The stamp stores the owner as `owner: { kind, pid, version }` (claim-phase.ts); a top-level `pid` is the pre-release shape test fixtures used. */
+function ownerPid(stamp: Record<string, unknown>): number | null {
+  const owner = stamp.owner && typeof stamp.owner === 'object' ? stamp.owner as Record<string, unknown> : null;
+  const pid = owner && typeof owner.pid === 'number' ? owner.pid : stamp.pid;
+  return typeof pid === 'number' ? pid : null;
+}
 /** The preparation budgets the drain's allowance reads (Lane A defines and validates the keys; defaults are the documented ones). */
 async function readPreparationBudgets(engine: Pick<BrainEngine, 'getConfig'>): Promise<{ syncMs: number; maintenanceMs: number; ceilingMs: number }> {
   const read = async (key: string, fallback: number) => { const n = Number((await engine.getConfig(key).catch(() => null))?.trim()); return Number.isInteger(n) && n > 0 ? n : fallback; };

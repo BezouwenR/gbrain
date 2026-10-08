@@ -110,8 +110,13 @@ describe('drainClaimOf', () => {
   const stamp = (over: Record<string, unknown> = {}) => ({ phase: 'preparing', claimed_at: '2026-10-07T11:58:00Z', since: '2026-10-07T11:59:00Z', token: 't', ...over });
 
   test('reads this claim\'s stamp: phase, step, wait cause, ages, pid and the allowance from the head\'s budget plus grace', () => {
-    const c = drainClaimOf({ head_state: 'running', head_claim_phase: stamp({ step: 'origin_check', waiting_on: 'pool', pid: 4242 }), head_token: 't', head_lapsed: false, head_kind: 'managed_sync_import' }, budgets, now);
-    expect(c).toEqual({ phase: 'preparing', step: 'origin_check', waiting_on: 'pool', step_age_ms: 60_000, claim_age_ms: 120_000, lapsed: false, owner_pid: 4242, allowance_ms: 120_000 + STALL_GRACE_MS });
+    // The stamp claim-phase.ts writes: the pid lives under `owner`, and the step has its own `step_since`.
+    const c = drainClaimOf({ head_state: 'running', head_claim_phase: stamp({ step: 'origin_check', step_since: '2026-10-07T11:59:30Z', waiting_on: 'pool', owner: { kind: 'sync', pid: 4242, version: '0.60.109.0' } }),
+      head_token: 't', head_lapsed: false, head_kind: 'managed_sync_import' }, budgets, now);
+    expect(c).toEqual({ phase: 'preparing', step: 'origin_check', waiting_on: 'pool', step_age_ms: 30_000, claim_age_ms: 120_000, lapsed: false, owner_pid: 4242, allowance_ms: 120_000 + STALL_GRACE_MS });
+    // A stamp without `step_since` falls back to the phase's `since`; a pre-release top-level `pid` is still read.
+    expect(drainClaimOf({ head_state: 'running', head_claim_phase: stamp({ step: 'origin_check', pid: 4243 }), head_token: 't', head_lapsed: false, head_kind: 'managed_sync_import' }, budgets, now))
+      .toMatchObject({ step_age_ms: 60_000, owner_pid: 4243 });
     expect(drainClaimOf({ head_state: 'running', head_claim_phase: JSON.stringify(stamp({ phase: 'publishing' })), head_token: 't', head_lapsed: false, head_kind: 'put_page' }, { ...budgets, maintenanceMs: 300_000 }, now))
       .toMatchObject({ phase: 'publishing', step: null, waiting_on: 'unknown', allowance_ms: 300_000 + STALL_GRACE_MS });
     // The ceiling caps the allowance.
@@ -138,7 +143,7 @@ describe('engineStallProbe fingerprint', () => {
     const [wt] = await engine.executeRaw<{ id: string }>('INSERT INTO persistence_worktrees(owner_host_id) VALUES(gen_random_uuid()) RETURNING id::text AS id');
     const [src] = await engine.executeRaw<{ incarnation: string }>('SELECT incarnation::text AS incarnation FROM sources WHERE id=$1', [id]);
     const token = randomUUID(), requestId = randomUUID();
-    const stampOf = (step: string) => JSON.stringify({ phase: 'preparing', claimed_at: new Date(Date.now() - 90_000).toISOString(), since: new Date(Date.now() - 60_000).toISOString(), token, step, waiting_on: 'db', pid: process.pid });
+    const stampOf = (step: string) => JSON.stringify({ phase: 'preparing', claimed_at: new Date(Date.now() - 90_000).toISOString(), since: new Date(Date.now() - 60_000).toISOString(), token, step, step_since: new Date(Date.now() - 60_000).toISOString(), waiting_on: 'db', owner: { kind: 'sync', pid: process.pid, version: 'test' } });
     const [row] = await engine.executeRaw<{ id: string }>(`INSERT INTO persistence_requests(principal_kind,principal_id,request_id,operation,source_id,source_incarnation,slug,worktree_id,digest,authority,intent,intent_bytes,terminal_reservation,
         state,execution_token,claim_expires_at,claim_phase)
       VALUES('local_cli','cli:example',$1::uuid,'submit_job',$2,$3::uuid,'notes/p',$4::uuid,'d','{}'::jsonb,'{"kind":"managed_sync_import","path":"notes/p.md"}'::jsonb,1,16384,'running',$5::uuid,now()+interval '30 seconds',$6::text::jsonb)
