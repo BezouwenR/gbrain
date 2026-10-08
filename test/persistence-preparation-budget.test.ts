@@ -12,7 +12,7 @@
  */
 import { afterEach, describe, expect, test } from 'bun:test';
 import { DEFAULT_PREPARATION_POLICY, PREPARATION_BUDGET_KEYS, PREPARATION_DEADLINE, preparationBudgetMs, preparationKind, racePreparation,
-  resolvePreparationPolicy, validatePreparationConfigValue } from '../src/core/persistence/preparation-budget.ts';
+  resolvePreparationPolicy, startPreparation, validatePreparationConfigValue } from '../src/core/persistence/preparation-budget.ts';
 import { readPreparationPolicy, readWriteSwitches, resetWriteSwitches, WRITE_SWITCHES } from '../src/core/persistence/switches.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -85,7 +85,7 @@ describe('preparation_deadlines switch', () => {
   });
 });
 
-describe('racePreparation', () => {
+describe('startPreparation / racePreparation', () => {
   test('a preparation inside its budget yields its result and never aborts', async () => {
     let signal: AbortSignal | undefined;
     const raced = await racePreparation(async s => { signal = s; await sleep(10); return 'prepared'; }, 500);
@@ -93,20 +93,22 @@ describe('racePreparation', () => {
     expect(signal?.aborted).toBe(false);
   });
   test('a preparer that honours its signal is cut off at the budget: the deadline wins, not its abort rejection', async () => {
-    const raced = await racePreparation(async signal => new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })), 20);
-    expect('deadline' in raced && raced.deadline).toBe(PREPARATION_DEADLINE);
-    if ('deadline' in raced) await expect(raced.work).rejects.toMatchObject({ code: 'preparation_deadline' });
+    const run = startPreparation(async signal => new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })), 20);
+    expect(await run.outcome).toEqual({ deadline: PREPARATION_DEADLINE });
+    expect(run.expired).toBe(true);
+    await expect(run.work).rejects.toMatchObject({ code: 'preparation_deadline' });
   });
   test('a preparer that ignores its signal is cut off at the budget too, and its late result is left to the caller', async () => {
     const release = Promise.withResolvers<string>();
     let seen = 0;
     const started = performance.now();
-    const raced = await racePreparation(async () => release.promise, 20, { onDeadline: () => { seen++; } });
+    const run = startPreparation(async () => release.promise, 20, { onDeadline: () => { seen++; } });
+    expect(await run.outcome).toEqual({ deadline: PREPARATION_DEADLINE });
     expect(performance.now() - started).toBeGreaterThanOrEqual(15);
-    expect('deadline' in raced).toBe(true);
+    expect(run.signal.aborted).toBe(true);
     expect(seen).toBe(1);
     release.resolve('late');
-    if ('deadline' in raced) expect(await raced.work).toBe('late');
+    expect(await run.work).toBe('late');
   });
   test('a synchronous preparation that outruns the timer still reads as a deadline (resolve and reject)', async () => {
     for (const reject of [false, true]) {
@@ -116,19 +118,20 @@ describe('racePreparation', () => {
         if (reject) throw new DOMException('late', 'AbortError');
         return 'late';
       }, 10);
-      expect('deadline' in raced).toBe(true);
+      expect(raced).toEqual({ deadline: PREPARATION_DEADLINE });
     }
   });
-  test('a real failure inside the budget propagates', async () => {
+  test('a real failure inside the budget propagates; without a budget the outcome follows the work', async () => {
     await expect(racePreparation(async () => { throw new Error('boom'); }, 500)).rejects.toThrow('boom');
+    const unbounded = startPreparation(async () => { await sleep(30); return 'done'; }, undefined);
+    expect(unbounded.late()).toBe(false);
+    expect(await unbounded.outcome).toEqual({ result: 'done' });
+    expect(unbounded.expired).toBe(false);
   });
-  test('an outer cancellation aborts the work with its own reason and rejects the race', async () => {
-    const outer = new AbortController();
-    let reason: unknown;
-    const racing = racePreparation(async signal => new Promise<never>((_, reject) => signal.addEventListener('abort', () => { reason = signal.reason; reject(signal.reason); }, { once: true })),
-      5_000, { signal: outer.signal });
-    outer.abort({ code: 'consumer_stopping' });
-    await expect(racing).rejects.toMatchObject({ code: 'consumer_stopping' });
-    expect(reason).toMatchObject({ code: 'consumer_stopping' });
+  test('abort(reason) cancels the preparer with that reason and the outcome follows the work, not the deadline', async () => {
+    const run = startPreparation(async signal => new Promise<never>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })), 5_000);
+    run.abort({ code: 'consumer_stopping' });
+    await expect(run.outcome).rejects.toMatchObject({ code: 'consumer_stopping' });
+    expect(run.expired).toBe(false);
   });
 });

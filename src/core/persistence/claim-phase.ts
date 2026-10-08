@@ -88,6 +88,16 @@ export function claimPhaseStamp(clock: ClaimPhaseClock, token: string | null, ow
     step: clock.step, step_since: new Date(clock.stepSince).toISOString(), waiting_on: clock.waitingOn, owner });
 }
 
+/**
+ * #6278: the SQL that charges a reclaimed expired claim to its request's
+ * `preparation_attempts`: only a claim whose owner stamped it `preparing`
+ * under the token being reclaimed (a kill mid-preparation), never one that
+ * was publishing, undispatched (no stamp of its token) or stamped by an
+ * earlier claim.
+ */
+export const EXPIRED_PREPARING_CHARGE_SQL = (r: string) =>
+  `CASE WHEN ${r}.claim_phase->>'phase'='preparing' AND ${r}.claim_phase->>'token'=${r}.execution_token::text THEN 1 ELSE 0 END`;
+
 /** `persistence.max_claim_ms`: how long a write may hold its claim before doctor reports it as stalled. */
 export const MAX_CLAIM_CONFIG_KEY = 'persistence.max_claim_ms';
 export const MAX_CLAIM_DEFAULT_MS = 600_000;

@@ -125,49 +125,64 @@ export function preparationBudgetMs(row: Pick<WriteRequest, 'operation' | 'inten
   return kind === 'foreground' ? foregroundMs : kind === 'sync' ? policy.syncMs : policy.maintenanceMs;
 }
 
-/** What `racePreparation` yields when the budget passes before the work settles. */
+/** What a preparation's `outcome` yields when the budget passes before the work settles. */
 export const PREPARATION_DEADLINE: unique symbol = Symbol('preparation_deadline');
+export type PreparationOutcome<T> = { result: T } | { deadline: typeof PREPARATION_DEADLINE };
+export interface PreparationRun<T> {
+  /** The preparer's own promise; after a deadline the caller owns it and must never publish its result. */
+  work: Promise<T>;
+  /** The result, or the deadline when the budget passes first (the work keeps running); a failure inside the budget rejects. */
+  outcome: Promise<PreparationOutcome<T>>;
+  /** The preparer's signal: aborted `{ code: 'preparation_deadline' }` at the budget, or with `abort(reason)`'s reason. */
+  signal: AbortSignal;
+  /** Cancels the preparer for another reason (a lost claim, a stopping consumer); the outcome then follows the work. */
+  abort(reason: unknown): void;
+  /** Whether the budget has passed (by timer, or by `late()` when the work settled after it). */
+  readonly expired: boolean;
+  /** Whether the budget passed on the clock, for a synchronous preparation that outran the timer. */
+  late(): boolean;
+  /** Treats the preparation as over budget now (aborts it, runs `onDeadline`). */
+  expire(): void;
+}
 /**
- * Runs `work` with a signal that aborts `{ code: 'preparation_deadline' }` at
- * the budget and yields PREPARATION_DEADLINE then, whether or not the work
- * honours the signal; the work keeps running and the caller owns it (it must
- * never publish a late result). `signal` (an outer cancellation) aborts the
- * work's signal too and rejects the race with the outer reason. The budget is
- * measured by `now`, so a synchronous late preparation that outruns the timer
- * still reads as a deadline.
+ * Starts `work` under a budget. The budget wins the `outcome` race whether or
+ * not the preparer honours its signal (the deadline settles before the abort
+ * reaches the work, so a preparer that rejects on abort cannot win), and a
+ * result that lands after the budget on the clock still reads as a deadline.
+ * `budgetMs` undefined means no deadline: the outcome follows the work.
  */
-export async function racePreparation<T>(work: (signal: AbortSignal) => Promise<T>, budgetMs: number,
-  opts: { signal?: AbortSignal; now?: () => number; onDeadline?: () => void } = {}): Promise<{ result: T } | { deadline: typeof PREPARATION_DEADLINE; work: Promise<T> }> {
+export function startPreparation<T>(work: (signal: AbortSignal) => Promise<T>, budgetMs: number | undefined,
+  opts: { now?: () => number; onDeadline?: () => void } = {}): PreparationRun<T> {
   const now = opts.now ?? (() => performance.now());
   const abort = new AbortController();
-  const deadline = Promise.withResolvers<typeof PREPARATION_DEADLINE>();
+  const deadline = Promise.withResolvers<{ deadline: typeof PREPARATION_DEADLINE }>();
   let expired = false;
-  // The deadline settles before the abort reaches the work, so a preparer that rejects on abort never wins the race.
   const expire = () => {
     if (expired) return;
     expired = true;
-    deadline.resolve(PREPARATION_DEADLINE);
+    deadline.resolve({ deadline: PREPARATION_DEADLINE });
     if (!abort.signal.aborted) abort.abort({ code: 'preparation_deadline' });
     opts.onDeadline?.();
   };
-  const timer = setTimeout(expire, budgetMs);
-  const outer = Promise.withResolvers<never>();
-  const onOuter = () => { abort.abort(opts.signal?.reason); outer.reject(opts.signal?.reason); };
-  if (opts.signal?.aborted) onOuter(); else opts.signal?.addEventListener('abort', onOuter, { once: true });
-  outer.promise.catch(() => undefined);
+  const timer = budgetMs === undefined ? undefined : setTimeout(expire, budgetMs);
   const started = now();
+  const late = () => budgetMs !== undefined && (expired || now() - started >= budgetMs);
   const run = (async () => work(abort.signal))();
   run.catch(() => undefined);
-  const late = () => expired || now() - started >= budgetMs;
-  try {
-    const won = await Promise.race([run.then(result => ({ result })), deadline.promise.then(deadline => ({ deadline, work: run })), outer.promise]);
-    if ('result' in won && late()) { expire(); return { deadline: PREPARATION_DEADLINE, work: run }; }
-    return won;
-  } catch (error) {
-    if (!opts.signal?.aborted && late()) { expire(); return { deadline: PREPARATION_DEADLINE, work: run }; }
-    throw error;
-  } finally {
-    clearTimeout(timer);
-    opts.signal?.removeEventListener('abort', onOuter);
-  }
+  const outcome = (async (): Promise<PreparationOutcome<T>> => {
+    try {
+      const won = await Promise.race([run.then(result => ({ result })), deadline.promise]);
+      if ('result' in won && late()) { expire(); return { deadline: PREPARATION_DEADLINE }; }
+      return won;
+    } catch (error) {
+      if (late()) { expire(); return { deadline: PREPARATION_DEADLINE }; }
+      throw error;
+    } finally { if (timer) clearTimeout(timer); }
+  })();
+  outcome.catch(() => undefined);
+  return { work: run, outcome, signal: abort.signal, abort: reason => { if (!abort.signal.aborted) abort.abort(reason); }, get expired() { return expired; }, late, expire };
+}
+/** The outcome alone: the sync's out-of-consumer preparations (waivers, origin equivalence) race their work against the budget this way. */
+export function racePreparation<T>(work: (signal: AbortSignal) => Promise<T>, budgetMs: number, opts: { now?: () => number; onDeadline?: () => void } = {}): Promise<PreparationOutcome<T>> {
+  return startPreparation(work, budgetMs, opts).outcome;
 }
