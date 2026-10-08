@@ -1,11 +1,23 @@
 import { afterAll, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileBounded, isDurabilityHardenedAsync } from '../src/core/brain-repo-durability.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'gbrain-bounded-exec-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
+// Hardened two ways, so losing either probe's output reads as "not hardened": one hook sits in
+// core.hooksPath, the other in a separate git directory that `<checkout>/.git/hooks` does not reach.
+const hooksPathRepo = join(dir, 'hooks-path'), separateGitDirRepo = join(dir, 'separate-git-dir');
+const hook = '#!/bin/sh\n# gbrain brain-durability post-commit hook (v0.42.44+)\nexit 0\n';
+execFileSync('git', ['init', '-q', hooksPathRepo]);
+execFileSync('git', ['-C', hooksPathRepo, 'config', 'core.hooksPath', 'custom-hooks']);
+mkdirSync(join(hooksPathRepo, 'custom-hooks'));
+writeFileSync(join(hooksPathRepo, 'custom-hooks', 'post-commit'), hook, { mode: 0o755 });
+execFileSync('git', ['init', '-q', `--separate-git-dir=${join(dir, 'separate.git')}`, separateGitDirRepo]);
+mkdirSync(join(dir, 'separate.git', 'hooks'), { recursive: true });
+writeFileSync(join(dir, 'separate.git', 'hooks', 'post-commit'), hook, { mode: 0o755 });
 
 /**
  * Starts short-lived children whose first exit callback re-enters the event
@@ -50,6 +62,14 @@ test('bounded execution settles by its deadline when the runtime drops child eve
 test('the persistence durability probe settles when the runtime drops child events', async () => {
   const probes = await within(20_000, nestedTickDuring(() => Array.from({ length: 20 }, () => isDurabilityHardenedAsync(dir))));
   expect(probes).toEqual(Array(20).fill(false));
+  const repos = Array.from({ length: 20 }, (_, i) => i % 2 ? separateGitDirRepo : hooksPathRepo);
+  expect(await Promise.all([hooksPathRepo, separateGitDirRepo].map(repo => isDurabilityHardenedAsync(repo)))).toEqual([true, true]);
+  const outcomes = await within(20_000, nestedTickDuring(() => repos.map(repo => isDurabilityHardenedAsync(repo).catch((error: Error) => error))));
+  expect(outcomes).not.toBe('unsettled');
+  for (const outcome of outcomes as Array<boolean | Error>) {
+    if (outcome instanceof Error) expect(outcome).toMatchObject({ code: 'git_unavailable', suggestion: expect.stringContaining('(ETIMEDOUT)') });
+    else expect(outcome).toBe(true);
+  }
 }, 30_000);
 
 test('bounded execution keeps execFile exit codes and stdout', async () => {
