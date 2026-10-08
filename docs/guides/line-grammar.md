@@ -186,4 +186,4 @@ optional.
 
 ## Changelog
 
-- Q2 parser gaps: template, separator, placeholder and usage-label lines are no longer read as fact lines; decorated relation types are diagnosed; findings follow the agent operator contract and `get_page grammar_diagnostics` lists all of them; turning the grammar on or off re-extracts every page so the graph follows the setting.
+- Q2 parser gaps: template, separator, placeholder and usage-label lines are no longer read as fact lines; decorated relation types are diagnosed; findings follow the agent operator contract and `get_page grammar_diagnostics` lists all of them; turning the grammar on or off re-extracts every page so the graph follows the setting. The grammar stays off by default: its held-out natural-junk and decoy gates failed again.
