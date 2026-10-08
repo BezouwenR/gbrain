@@ -4,6 +4,7 @@ import { OperationError } from '../ops/contract.ts';
 import { LANE_BUSY, PersistenceConsumer, type PersistenceConsumerLike, type PrepareMutation } from './consumer.ts';
 import { WaiterOnlyConsumer, type ElectedOwner } from './consumer-election.ts';
 import { RESIDENT_CONSUMER_KINDS, startConsumerHeartbeat, type ConsumerHeartbeat } from './consumer-heartbeat.ts';
+import { enginePoolStats } from '../postgres-engine/pool-stats.ts';
 import { claimOwnerKind } from './claim-phase.ts';
 import { preparePageMutation } from './page-prepare.ts';
 import { prepareSemanticPageMutation } from './semantic-pages.ts';
@@ -108,9 +109,10 @@ export function startPersistenceConsumer(engine: BrainEngine, config: GBrainConf
     { onSettled: row => { recordSettlement(engine); for (const listener of settledWaiters.get(engine)?.get(row.id) ?? []) listener(row); } });
   const kind = claimOwnerKind();
   const service: Service = kind !== 'serve' && RESIDENT_CONSUMER_KINDS.includes(kind) && engine.kind === 'postgres'
-    ? { consumer: new WaiterOnlyConsumer(engine, config, full, { kind, hostId: localHostId() }), stopping: false }
+    ? { consumer: new WaiterOnlyConsumer(engine, config, full, { kind, hostId: localHostId(), pool: () => enginePoolStats(engine) }), stopping: false }
     : (() => { const consumer = full(); return { consumer, stopping: false, heartbeat: startConsumerHeartbeat(engine, consumer.hostId,
-        { kind, mode: 'full', report: () => ({ restart_required: consumer.restartRequired(), root_barrier_age_ms: consumer.oldestRootBarrierAgeMs() }) }) }; })();
+        // #6317 (C1): the row's pool numbers come from the vendored driver's own queues (postgres-engine/pool-stats.ts).
+        { kind, mode: 'full', report: () => ({ restart_required: consumer.restartRequired(), root_barrier_age_ms: consumer.oldestRootBarrierAgeMs(), pool: enginePoolStats(engine) }) }) }; })();
   const { consumer } = service;
   services.set(engine, service);
   const lifecycle = engine as BrainEngine & { registerBeforeDisconnect?: (run: () => Promise<void>) => unknown };

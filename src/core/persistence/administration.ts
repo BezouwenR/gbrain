@@ -230,7 +230,9 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       writer_versions: writerVersions, onboarding, shared_skills: sharedSkills, ...(native ? { native_lock: native } : {}),
       // #6317 (B3): every process holding a consumer on this host, from the heartbeat rows (kind, pid, nonce, mode, age, wedge report).
       host: { host_id: existingLocalHostId(), ...await (await import('./consumer-diagnostics.ts')).hostConsumersReport(engine, existingLocalHostId()) },
-      worktree_refreshes: await (await import('./worktree-refresh.ts')).activeWorktreeRefreshes(engine, params.source_id as string | undefined) };
+      worktree_refreshes: await (await import('./worktree-refresh.ts')).activeWorktreeRefreshes(engine, params.source_id as string | undefined),
+      // #6317 (B4): per managed source, whether sync data moves (shares the reader of sources status, doctor and writer movement).
+      movement: await (await import('./sync-movement.ts')).readSourceMovement(engine, params.source_id === undefined ? {} : { sourceIds: [source(params.source_id)] }).catch(() => []) };
   }
   if (operation === 'writer_claim') {
     keys(params, ['source_id', 'path', 'dry_run', 'admin_intent', 'expected_state']);
