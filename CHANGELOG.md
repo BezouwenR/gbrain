@@ -66,7 +66,7 @@ gbrain doctor --only fence_integrity --json                # legacy fact rows th
 
 Fixes #6278.
 
-## To take advantage of v0.60.109.0
+## To take advantage of v0.60.112.0
 
 `gbrain upgrade` applies migration v220 (one added column). Restart every long-running owner on the new version, then check:
 
