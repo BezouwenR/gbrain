@@ -1808,6 +1808,17 @@
         },
         {
           "category": "ops",
+          "details": {
+            "docs": "docs/guides/troubleshooting.md#persistence-pooler-transaction-mode"
+          },
+          "message": "PGLite has no pooler.",
+          "name": "persistence_pooler_transaction_mode",
+          "readiness_state": "not_applicable",
+          "severity": "info",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
           "message": "Mode: conservative (no per-key overrides — mode bundle is canonical).",
           "name": "search_mode",
           "status": "ok"

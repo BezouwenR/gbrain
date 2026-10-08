@@ -711,6 +711,10 @@
       },
       {
         "category": "ops",
+        "name": "persistence_pooler_transaction_mode"
+      },
+      {
+        "category": "ops",
         "name": "search_mode"
       },
       {

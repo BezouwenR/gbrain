@@ -571,6 +571,17 @@ function installFactsDrain(engine: BrainEngine, opts: ServeOptions, deps: StdioL
   });
 }
 
+/**
+ * #6317 (B4): the facts drain plus the movement watch (one `[gbrain notice]`
+ * when a managed source's sync data stops moving; reader in
+ * persistence/sync-movement.ts), stopped together at shutdown.
+ */
+function installResidentTickers(engine: BrainEngine, opts: ServeOptions, deps: StdioLifecycleDeps, shuttingDown: () => boolean): { stop(): Promise<void> } {
+  const factsDrain = installFactsDrain(engine, opts, deps, shuttingDown);
+  const movementWatch: MovementWatch = startMovementWatch(engine, { log: deps.log, setInterval: deps.setInterval as typeof setInterval, clearInterval: deps.clearInterval as typeof clearInterval });
+  return { stop: async () => { movementWatch.stop(); await factsDrain?.stop(); } };
+}
+
 function installStdioLifecycle(
   engine: BrainEngine,
   args: string[],
@@ -591,12 +602,10 @@ function installStdioLifecycle(
   let parentWatchdog: unknown = null;
   let idleSweepTimer: unknown = null;
   let activateIdleActivityTracking = (): void => {};
-  let factsDrain: FactsDrainScheduler | null = null;
-  let movementWatch: MovementWatch | null = null;
+  let factsDrain: { stop(): Promise<void> } | null = null;
   const beginShutdown = (reason: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    movementWatch?.stop();
 
     // Stop the parent-watchdog interval as soon as a shutdown begins so
     // it cannot fire a redundant 'parent-died' shutdown while the first
@@ -854,10 +863,8 @@ function installStdioLifecycle(
     (idleSweepTimer as { unref?: () => void } | null)?.unref?.();
   }
 
-  // Automatic facts drain (Lane D): see installFactsDrain.
-  factsDrain = installFactsDrain(engine, opts, deps, () => shuttingDown);
-  // #6317 (B4): one notice when a managed source's sync data stops moving (reader in persistence/sync-movement.ts).
-  movementWatch = startMovementWatch(engine, { log: deps.log, setInterval: deps.setInterval as typeof setInterval, clearInterval: deps.clearInterval as typeof clearInterval });
+  // Automatic facts drain (Lane D) and the #6317 movement watch: see installResidentTickers.
+  factsDrain = installResidentTickers(engine, opts, deps, () => shuttingDown);
 
   // Optional idle-timeout safety net. Default OFF; opt-in via
   // `--stdio-idle-timeout <seconds>`. The flag is for the rare case where
