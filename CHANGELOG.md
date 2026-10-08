@@ -10,7 +10,7 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
-## [0.60.109.0] - 2026-10-08
+## [0.60.111.0] - 2026-10-08
 
 **A managed catch-up no longer stalls on one stuck write: the write is cut off, its file is held, and the rest of the source keeps syncing.**
 
@@ -124,7 +124,38 @@ Same 16-core machine and same Postgres, 57 ms round trips, default settings, mas
 - A sync group member after an uncommitted member is cancelled, never published ahead of it (#6252).
 - Write receipts no longer call an ordinary publication in progress `blocked` / `recovery_required`: a request needs recovery only when it is recovering or holds a recovery record without a live claim, and the requests behind a live publication show as waiting (#6275).
 - Remote `put_page` skips the similar-pages advisory while `put_page.similar_pages` is off (the default) and runs it with JIT off when on; remote `get_page` / `fetch` read the page with JIT off, so brains past about 1,000 pages stop paying JIT compile time on every call (#6276).
+- `gbrain sources refresh` refuses `git_unavailable` when a git read of the checkout's branch or remote (`symbolic-ref`, `remote`, `config --get`) fails or times out, instead of reading it as a detached HEAD or no remote and skipping the fetch; a checkout that is not Git refuses `refresh_no_upstream` with its own message.
 - Bench: `scripts/bench/managed-sync-catchup.ts` reports feeder and lane timing, steady state, per-write foreground spans, an open-loop foreground row and `--pool-size`; results in `docs/eval/managed-sync-catchup.md`.
+
+## [0.60.110.0] - 2026-10-08
+
+**Reverts the Windows backup cold-start retry from v0.60.109.0, which turned master red.**
+
+The retry launched PowerShell a second time after any 15-second timeout. The Windows ARM backup controls deliberately run a PowerShell program that hangs, and they require every failing launch to be bounded to one attempt; with the retry each took two launches (30 s). A first Windows backup on a cold machine whose PowerShell start passes 15 s fails again, as before v0.60.109.0. The order hunt, the contract drain fix and the shard weights from v0.60.109.0 stay.
+
+## To take advantage of v0.60.110.0
+
+`gbrain upgrade` installs the binary. There are no schema migrations.
+
+## [0.60.109.0] - 2026-10-08
+
+**A Windows backup no longer fails on a cold machine's first PowerShell start, and a new nightly job catches tests that leak state into the next one.**
+
+On Windows, gbrain runs PowerShell to make a new backup folder owner-only, with a 15-second limit. On a freshly started machine PowerShell's first launch alone sometimes takes longer (measured 3.3 to 27.7 seconds on fresh CI runners; later launches take 0.2 to 1.5 seconds), so the first backup failed. A launch killed by that limit is now retried once. Any other failure, or a second timeout, still refuses with `private_backup_path_unavailable`. This is a single bounded retry on a classified timeout, not a longer limit: the script only sets and verifies the access rules of the same new empty path, so running it again is safe.
+
+| After upgrading | Before | After |
+| --- | --- | --- |
+| First Windows backup on a cold machine whose PowerShell start passes 15 s | fails with `private_backup_path_unavailable` | retried once and protected |
+
+For contributors and agents working on gbrain:
+
+- **Order hunt.** The nightly E2E workflow's new `order-hunt` job runs every E2E file in a seeded random order on one shared database per shard. A file that fails after the files before it but passes alone is reported as order-dependent, with the exact command to replay that order. It is keyless and outside `e2e-status`. Run it on demand with `gh workflow run e2e.yml -f order_hunt=true`. Runbook: `docs/ci-red-runbook.md#order-hunt`.
+- **Contract harness.** The managed connector job contract's queue drain registers only the drained jobs' handlers, so a page write's `facts-absorb` follow-up queued mid-drain is no longer claimed and counted as an extraction model call (the E2E nightly's `extract_conversation_facts_prose` failure).
+- **Shard weights.** Unit weights are re-mined from master push run 37737296716, so the scheduled `check:weight-coverage` passes.
+
+## To take advantage of v0.60.109.0
+
+`gbrain upgrade` installs the binary. There are no schema migrations.
 
 ## [0.60.108.0] - 2026-10-08
 

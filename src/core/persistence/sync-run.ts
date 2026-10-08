@@ -734,10 +734,8 @@ type FreezeAt = (base: Cursor) => (index: number) => Promise<Pending | null>;
 
 /** The most consecutive no-op entries one waiver transaction passes. */
 const WAIVER_RUN_MAX = 64;
-/** How many entries after a waived head are frozen and screened at once. */
-const WAIVER_SCREEN_WIDTH = 8;
 /**
- * #5984 Phase 3: when the frozen head would be waived, freezes and screens the entries after it eight at a time
+ * #5984 Phase 3: when the frozen head would be waived, freezes and screens the entries after it four at a time
  * (stopping at the first that would not be waived, is held, is overtaken, refuses to freeze, or at the checkpoint)
  * and waives the run in one transaction, without a `pending` cursor save per entry. Returns null to take the
  * per-entry path for the head (its screen admits it, or the run's transaction validated nothing or timed out);
@@ -751,19 +749,14 @@ async function waiveRun(engine: BrainEngine, cursor: Cursor, head: Pending, key:
   assertActive();
   const run: WaiverRunEntry[] = [{ pending: head, waived: first }];
   const max = Math.max(1, Math.min(WAIVER_RUN_MAX, limit));
-  // Each entry is frozen and screened in its own chain, WAIVER_SCREEN_WIDTH at a time (reads only, so the entries
-  // past the first that is not waived are discarded unused).
   extend: for (let next = cursor.index + 1; run.length < max && next < cursor.entries.length;) {
-    const batch = Array.from({ length: Math.min(WAIVER_SCREEN_WIDTH, max - run.length, cursor.entries.length - next) }, (_, i) => next + i);
-    const screened = await Promise.all(batch.map(async index => {
-      const entry = await freezeEntry(engine, { ...cursor, index }, key, assertActive, frozenRun).catch(() => null);
-      if (!entry || 'hold' in entry || entry.rebound) return null;
-      const waived = await screenWaiver(engine, { ...cursor, index }, entry, config, frozenRun.signal).catch(() => null);
-      return waived ? { pending: entry as Pending, waived } : null;
-    }));
-    for (const member of screened) {
-      if (!member) break extend;
-      run.push(member);
+    const batch = Array.from({ length: Math.min(4, max - run.length, cursor.entries.length - next) }, (_, i) => next + i);
+    const frozen = await Promise.all(batch.map(index => freezeEntry(engine, { ...cursor, index }, key, assertActive, frozenRun).catch(() => null)));
+    const screened = await Promise.all(frozen.map((entry, i) => entry && !('hold' in entry) && !entry.rebound
+      ? screenWaiver(engine, { ...cursor, index: batch[i]! }, entry, config, frozenRun.signal).catch(() => null) : null));
+    for (const [i, waived] of screened.entries()) {
+      if (!waived) break extend;
+      run.push({ pending: frozen[i] as Pending, waived });
     }
     next += batch.length;
   }
