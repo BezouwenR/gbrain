@@ -275,14 +275,14 @@ describe('doctor managed_sync_not_moving and the serve notice', () => {
     const ctx = { engine } as unknown as Parameters<typeof managedSyncMovementEntry.run>[0];
     const f = await managedSource();
     await cursor(f, 1, 9); await request(f, 'committed', { completedAt: ago(400_000) });
-    const [parked] = await managedSyncMovementEntry.run(ctx) as Array<Record<string, unknown>>;
+    const [parked] = await managedSyncMovementEntry.run(ctx) as unknown as Array<Record<string, unknown>>;
     expect(parked).toMatchObject({ name: 'managed_sync_not_moving', status: 'ok', severity: 'info' });
     expect(String(parked!.message)).toContain(`${f.id} is parked at 1/9`);
     const lines: string[] = [];
     const watch = startMovementWatch(engine, { log: line => lines.push(line), everyMs: 3_600_000 });
     const lock = await tryAcquireDbLock(engine, syncLockId(f.id));
     try {
-      const [warn] = await managedSyncMovementEntry.run(ctx) as Array<Record<string, unknown>>;
+      const [warn] = await managedSyncMovementEntry.run(ctx) as unknown as Array<Record<string, unknown>>;
       expect(warn).toMatchObject({ name: 'managed_sync_not_moving', status: 'warn', readiness_state: 'degraded', details: { count: 1 } });
       expect(warn!.fix).toMatchObject({ argv: ['gbrain', 'sources', 'writer', 'status', '--source', f.id, '--json'], actor: 'agent', consent: [] });
       await watch.tick(); await watch.tick();
@@ -291,7 +291,7 @@ describe('doctor managed_sync_not_moving and the serve notice', () => {
       await request(f, 'committed', { completedAt: ago(0) });
       await watch.tick();
       expect(lines[1]).toContain('moving again');
-      const [ok] = await managedSyncMovementEntry.run(ctx) as Array<Record<string, unknown>>;
+      const [ok] = await managedSyncMovementEntry.run(ctx) as unknown as Array<Record<string, unknown>>;
       expect(ok).toMatchObject({ status: 'ok' });
     } finally { watch.stop(); await lock!.release(); }
   }), 60_000);

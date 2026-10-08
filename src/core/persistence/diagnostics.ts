@@ -4,7 +4,7 @@ import type { JournalLimits } from './model.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
 import { WRITER_INSPECTION_HINT } from './admin-intent.ts';
 import { writeHealth } from './health.ts';
-import { claimStall, claimStateOf, isOwnerThisProcess, type ClaimRow, type ClaimState, type ClaimStall } from './claim-phase.ts';
+import { claimStall, claimStateOf, isOwnerThisProcess, sqlLabel, type ClaimRow, type ClaimState, type ClaimStall } from './claim-phase.ts';
 import { cliRenderContext, renderAction, type Action, type RenderedAction } from '../agent-output.ts';
 import { enginePoolStats, type DriverPoolStats } from '../postgres-engine/pool-stats.ts';
 import { consumerLive, listHostConsumers, type ConsumerRow } from './consumer-heartbeat.ts';
@@ -40,7 +40,7 @@ export function writerNextAction(reason: string | null | undefined): string {
 }
 
 /**
- * #6317 (C1): the one `next_action` envelope a running claim ends with, so the two-call journey (sources status → writer
+ * #6317 (C1): the one `next` envelope (`claim.next`: code, why, retry_after_ms, fix) a running claim ends with, so the two-call journey (sources status → writer
  * status) ends in an action: inside the allowance the agent reruns status after `retry_after_ms` (`next: run`); past the
  * ceiling or on `restart_required` the host admin restarts the named owner (`tell_user_to_run`); a lapsed claim resumes
  * on its own once its transaction ends or the owner exits, so the fix is the resume (`run`).
@@ -70,6 +70,43 @@ export function claimNextAction(claim: ClaimState, stall: ClaimStall | null, pol
     why: stall ? `${who} is past the ${Math.round(stall.budget_ms / 1000)}s preparation budget${where}; its own budget cuts the preparation off and frees the root by the ${Math.round(policy.ceilingMs / 1000)}s ceiling (${Math.round((budgetLeft ?? 0) / 1000)}s left). Nothing to do yet.`
       : `${who} is ${claim.phase === 'publishing' ? 'publishing' : 'preparing'} this write${where}${owner.live === false ? '; its heartbeat row is not live' : ''}. Nothing to do yet.`,
     fix: renderAction({ argv: status, consent: [], actor: 'agent', requires_exclusive: false, why: 'Read-only: rerun after retry_after_ms to see the step advance or the claim settle.', verify: { argv: status } }, ctx) };
+}
+/**
+ * #6317 (reporter ask 3): the owner process's database backends from `pg_stat_activity`, matched on the `application_name`
+ * every gbrain pool starts its connections with (`gbrain <kind>:<pid>:<nonce8>`, db.ts), so a round-trip that never
+ * returns (backend `active`, `wait_event` ClientRead, an old transaction) is visible in one command. Statement text never
+ * leaves: only its label (first keyword plus table). Through a transaction-mode pooler the server connection is shared
+ * and carries the pooler's own name or another client's, so the mapping is partial (`backend_visibility: 'pooled'`).
+ */
+export interface OwnerBackend { pid: number; state: string | null; wait_event_type: string | null; wait_event: string | null; statement: string | null;
+  query_age_ms: number | null; xact_age_ms: number | null; state_age_ms: number | null; application_name: string }
+export type BackendVisibility = 'session' | 'pooled' | 'unavailable';
+export async function readOwnerBackends(engine: BrainEngine, owners: Array<Pick<ClaimState['owner'] & object, 'kind' | 'pid' | 'nonce'>>): Promise<{ visibility: BackendVisibility; byOwner: Map<string, OwnerBackend[]> }> {
+  const byOwner = new Map<string, OwnerBackend[]>();
+  if (engine.kind !== 'postgres' || !owners.length) return { visibility: 'unavailable', byOwner };
+  const diagnostics = (engine as { getPoolDiagnostics?: () => { prepare?: boolean | null } | null }).getPoolDiagnostics?.();
+  const visibility: BackendVisibility = diagnostics?.prepare === false ? 'pooled' : 'session';
+  const names = owners.map(owner => `gbrain ${owner.kind}:${owner.pid}:${(owner.nonce ?? '').slice(0, 8)}`);
+  try {
+    const rows = await engine.executeRaw<{ pid: number; state: string | null; wait_event_type: string | null; wait_event: string | null; query: string | null;
+      query_age_ms: string | number | null; xact_age_ms: string | number | null; state_age_ms: string | number | null; application_name: string }>(
+      `SELECT pid, state, wait_event_type, wait_event, left(query, 300) AS query, application_name,
+         (EXTRACT(EPOCH FROM (now() - query_start)) * 1000)::bigint AS query_age_ms,
+         (EXTRACT(EPOCH FROM (now() - xact_start)) * 1000)::bigint AS xact_age_ms,
+         (EXTRACT(EPOCH FROM (now() - state_change)) * 1000)::bigint AS state_age_ms
+       FROM pg_stat_activity WHERE datname = current_database() AND backend_type = 'client backend' AND application_name = ANY($1::text[]) ORDER BY pid`,
+      [names], { timeoutMs: 2_000 });
+    for (const row of rows) {
+      const list = byOwner.get(row.application_name) ?? [];
+      list.push({ pid: Number(row.pid), state: row.state, wait_event_type: row.wait_event_type, wait_event: row.wait_event, statement: row.query ? sqlLabel(row.query) : null,
+        query_age_ms: row.query_age_ms === null ? null : Number(row.query_age_ms), xact_age_ms: row.xact_age_ms === null ? null : Number(row.xact_age_ms),
+        state_age_ms: row.state_age_ms === null ? null : Number(row.state_age_ms), application_name: row.application_name });
+      byOwner.set(row.application_name, list);
+    }
+    return { visibility, byOwner };
+  } catch {
+    return { visibility: 'unavailable', byOwner };
+  }
 }
 /** #6317 (C1): the pool numbers for a running claim: this process's driver when it owns the claim, else the owner's heartbeat row. */
 function claimPool(engine: BrainEngine, claim: ClaimState, row: ConsumerRow | null): { pool: DriverPoolStats | null; pool_source: 'driver' | 'heartbeat' | null } {
@@ -138,6 +175,8 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
   const hostId = existingLocalHostId();
   const consumerRows = hostId ? await listHostConsumers(engine, hostId) : [];
   const tracked = (engine as { getPoolDiagnostics?: () => { tracked?: unknown } | null }).getPoolDiagnostics?.()?.tracked ?? null;
+  const claimStates = blockers.map(row => claimStateOf({ state: row.state, claim_phase: row.claim_phase, execution_token: row.execution_token, claim_lapsed: row.claim_lapsed, publication_started: row.publication_started }));
+  const backends = await readOwnerBackends(engine, claimStates.flatMap(state => state?.owner ? [state.owner] : []));
   // C-NEW-4: the consumer is per process, so this is the answering process's own ingress, never proof the brain's owner is down.
   const local = persistenceConsumerStatus(engine);
   const local_process_ingress = { ...local, scope: local.state === 'not_running'
@@ -146,20 +185,23 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
   return { ...brain, sampled_at: new Date().toISOString(), publication_concurrency: publicationConcurrency(engine),
     local_process_ingress, worktrees, counters, queue, effects, limits, capacity: capacityDiagnostics(counters, limits), preparation_policy,
     recent_failures: failures.map(row => ({ ...row, next_action: row.error_detail?.origin === 'database_guard' ? DATABASE_REFUSAL_HINT : DATABASE_TRIGGER_HINT })),
-    blockers: blockers.map(({ claim_phase: _phase, execution_token: _token, claim_lapsed: _lapsed, publication_started: _started, ...row }) => {
+    backend_visibility: backends.visibility,
+    blockers: blockers.map(({ claim_phase: _phase, execution_token: _token, claim_lapsed: _lapsed, publication_started: _started, ...row }, index) => {
       const health = writeHealth(row);
       const advice = writerNextAction(row.blocked_reason ?? row.error_code);
       // #6176: a running request names the phase its claim is in and how long it has held it; #6278: its step, wait cause, owner
       // process and, past its budget, the `preparation_overdue` verdict (the running state; `preparation_stalled` is only the terminal give-up).
-      const state = claimStateOf({ state: row.state, claim_phase: _phase, execution_token: _token, claim_lapsed: _lapsed, publication_started: _started });
+      const state = claimStates[index] ?? null;
       const budget = snapshot ? preparationBudgetMs({ operation: row.operation, intent: row.intent_kind ? { kind: row.intent_kind } : null }, snapshot.preparation, 30_000) : null;
       const stall = state && budget !== null ? claimStall(state, budget) : null;
       // #6317 (C1): the owner's heartbeat row (liveness, pool), the last statement, and the one next_action envelope per running claim.
       const ownerRow = state?.owner ? consumerRows.find(r => r.pid === state.owner!.pid && (state.owner!.nonce === undefined || r.nonce === state.owner!.nonce)) ?? null : null;
       const ceilingMs = snapshot?.preparation.ceilingMs ?? 600_000;
-      const claim = state ? { ...state, ...(budget === null ? {} : { budget_ms: budget }), stall, ...claimPool(engine, state, ownerRow), pool_tracked_subset: tracked,
+      const ownerBackends = state?.owner ? backends.byOwner.get(`gbrain ${state.owner.kind}:${state.owner.pid}:${(state.owner.nonce ?? '').slice(0, 8)}`) ?? [] : [];
+      const claim = state ? { ...state, ...(state.owner ? { owner: { ...state.owner, backend: ownerBackends, backend_visibility: backends.visibility } } : {}),
+        ...(budget === null ? {} : { budget_ms: budget }), stall, ...claimPool(engine, state, ownerRow), pool_tracked_subset: tracked,
         owner_live: ownerRow ? consumerLive(ownerRow) : null, owner_mode: ownerRow?.mode ?? null,
-        next_action: claimNextAction(state, stall, { budgetMs: budget, ceilingMs }, row.source_id, { row: ownerRow, live: ownerRow ? consumerLive(ownerRow) : null }) } : undefined;
+        next: claimNextAction(state, stall, { budgetMs: budget, ceilingMs }, row.source_id, { row: ownerRow, live: ownerRow ? consumerLive(ownerRow) : null }) } : undefined;
       return { ...row, preparation_attempts: row.preparation_attempts ?? 0, ...health, ...(claim ? { claim } : {}), next_action: health.diagnostic?.next_action === 'inspect_owner' && advice !== WRITER_INSPECTION_HINT
         ? `${WRITER_INSPECTION_HINT} ${advice}` : advice };
     }) };

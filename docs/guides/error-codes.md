@@ -1888,6 +1888,16 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | This caller is not authorized for the operation. | Only the operator of the brain host can change what blocks this. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
 
+### persistence_pooler_transaction_mode
+
+<a id="persistence_pooler_transaction_mode"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The resident write consumer's ordinary pool goes through a transaction-mode pooler (prepared statements off), where a consumer round-trip can be lost and one claim then holds its root for as long as the process lives. | A transaction-mode pooler (PgBouncer, Supavisor on port 6543) assigns a server connection per transaction and can leave a client waiting for a reply that never arrives (the backend reads `active` in `ClientRead`); the owner's phase deadline fires but the awaited promise never settles, so the claim renews forever with nothing in flight at the database. The same catch-up on the session-mode URL (port 5432) or the direct URL drains. Short-lived readers on the pooler are unaffected; the finding is about the processes that hold write claims. | Set DATABASE_URL for gbrain serve, gbrain sync and the jobs worker to the session-mode pooler URL or the direct database URL on their supervisor, restart them, then verify with gbrain sources writer movement. Run: gbrain sources writer status --json | host_admin | `gbrain doctor --only persistence_pooler_transaction_mode --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#persistence-pooler-transaction-mode](../../docs/guides/troubleshooting.md#persistence-pooler-transaction-mode)
+
 ### persistence_write_stall
 
 <a id="persistence_write_stall"></a>

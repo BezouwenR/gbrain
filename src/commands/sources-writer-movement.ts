@@ -220,7 +220,7 @@ export async function runMovementCheck(engine: BrainEngine, opts: { sourceId?: s
   }
   const sources = after.map(m => movementReport(byId.get(m.source_id), m, window.window_ms));
   const failing = sources.find(r => r.exit !== 0);
-  const error = failing ? toAgentError(opError('managed_sync_not_moving', failing.why, `Run ${writerStatusCommand(failing.source_id)} and follow the running claim's next_action; verify with gbrain sources writer movement ${failing.source_id}.`,
+  const error = failing ? toAgentError(opError('managed_sync_not_moving', failing.why, `Run ${writerStatusCommand(failing.source_id)} and follow the running claim's next step; verify with gbrain sources writer movement ${failing.source_id}.`,
     { reason: failing.reason, fix: readFix('Read-only: the request at the head, its step, wait cause, owner and next action.', { argv: ['gbrain', 'sources', 'writer', 'status', '--source', failing.source_id, '--json'] }) }),
   { transport: 'cli', command: 'sources writer movement', render: cliRenderContext() }) : undefined;
   return { schema_version: 1, window_ms: window.window_ms, budget_ms: window.budget_ms, window_source: window.source, waited_ms: waited, sources, exit_code: failing ? 1 : 0, ...(error ? { error } : {}) };

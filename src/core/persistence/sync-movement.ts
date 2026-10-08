@@ -197,7 +197,7 @@ export function startMovementWatch(engine: BrainEngine, opts: { log: (line: stri
       for (const m of await readSourceMovement(engine)) {
         if (m.movement_state === 'not_moving' && !flipped.has(m.source_id)) {
           flipped.add(m.source_id);
-          opts.log(`[gbrain notice managed_sync_not_moving kind=degraded] ${formatSourceMovement(m)}\nnext: run ${m.writer_status_command} (read-only) and act on the running claim's next_action.`);
+          opts.log(`[gbrain notice managed_sync_not_moving kind=degraded] ${formatSourceMovement(m)}\nnext: run ${m.writer_status_command} (read-only) and act on the running claim's next step.`);
         } else if (m.movement_state !== 'not_moving' && flipped.delete(m.source_id)) {
           opts.log(`[gbrain notice managed_sync_not_moving kind=info] ${m.source_id}: managed sync data is moving again (${m.movement_state}).`);
         }

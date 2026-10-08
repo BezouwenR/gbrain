@@ -31,7 +31,7 @@ async function runManagedSyncMovementCheck(ctx: DoctorContext): Promise<Check[]>
         message: `${stuck.map(m => `${m.source_id} (since ${m.not_moving_since}${m.head?.step ? `, head at step ${m.head.step}` : ''}${m.head?.owner ? `, ${m.head.owner.kind} pid ${m.head.owner.pid}` : ''})`).join('; ')}: `
           + `managed sync data has not moved for longer than the ${Math.round(first.ceiling_ms / 1000)}s ceiling while a sync or consumer is live. The health signals are green; the data is not.`,
         fix: agentFix(['gbrain', 'sources', 'writer', 'status', '--source', first.source_id, '--json'],
-          'Read-only: names the request at the head, its step, what it waits on, the owner process and the next action on the running claim.', 'managed_sync_not_moving', { docs: DOCS }) });
+          'Read-only: names the request at the head, its step, what it waits on, the owner process and the next step (`claim.next`) on the running claim.', 'managed_sync_not_moving', { docs: DOCS }) });
     } else if (pending.length) {
       checks.push({ name: 'managed_sync_not_moving', status: 'ok', severity: 'info', details,
         message: `Managed sync data is moving${parked.length ? `; ${parked.map(m => `${m.source_id} is parked at ${m.cursor!.index}/${m.cursor!.total} (no sync or consumer live; resume: ${m.cursor!.resume_command})`).join('; ')}` : ''}.` });
