@@ -398,15 +398,7 @@ async function setConfigWithDecideHooks(engine: BrainEngine, key: string, value:
     const err = validateMaxClaimConfigValue(key, value);
     if (err) { console.error(`[config] ${err}`); process.exit(1); }
   }
-  if (key.startsWith('persistence.') && (key.endsWith('_preparation_ms') || key === 'persistence.preparation_ceiling_ms' || key === 'persistence.max_preparation_attempts')) {
-    const { readPreparationConfigValues, validatePreparationConfigValue } = await import('../core/persistence/preparation-budget.ts');
-    const refusal = validatePreparationConfigValue(key, value, await readPreparationConfigValues(engine));
-    if (refusal) {
-      const { exitCliError, usageError } = await import('../cli/cli-error.ts');
-      exitCliError(usageError(refusal.message, refusal.suggestion,
-        { fix: { argv: ['gbrain', 'config', 'get', key], consent: [], actor: 'agent', why: 'Shows the value in effect; nothing was written.', requires_exclusive: false } }), 'config');
-    }
-  }
+  if (key.startsWith('persistence.')) await (await import('./config/preparation-keys.ts')).refuseInvalidPreparationValue(engine, key, value);
   if (key.startsWith('facts.')) await (await import('./config/facts-values.ts')).refuseInvalidFactsConfigValue(key, value);
   await engine.setConfig(key, value);
   if (key === 'auto_chronicle') await acknowledgeAutoChronicle(engine, value);

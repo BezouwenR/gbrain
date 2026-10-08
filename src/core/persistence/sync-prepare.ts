@@ -230,6 +230,39 @@ function companyWritebackRefusal(row: WriteRequest, p: SyncIntent, fenceFixes: r
 }
 
 /**
+ * The entry's recorded origin, checked against the checkout (`git rev-parse`, the entry's path under the root) and the
+ * accepted page (its origin, and the rename source's); a checkpoint has none. `clock` names the steps (#6278).
+ */
+async function resolveSyncOrigin(engine: BrainEngine, row: WriteRequest, p: SyncIntent, root: string, originPageId: number | null, clock: ClaimPhaseClock | undefined):
+  Promise<{ origin?: Parameters<typeof assertSyncEntryOrigin>[1]; originContext?: Parameters<typeof assertSyncEntryOrigin>[0]; originScope?: SyncOriginScope }> {
+  if (p.kind === 'managed_sync_checkpoint') return {};
+  if (typeof p.path !== 'string' || typeof p.sourcePath !== 'string') throw syncPublicationRefusal('storage_error', 'The accepted sync origin is missing.', row, p,
+    'The stored intent has no recorded file path for this page.');
+  let working = p.working;
+  if (p.kind === 'managed_sync_delete' && working === undefined) {
+    enterClaimStep(clock, 'manifest_entry', undefined, 'db');
+    const [manifest] = await engine.executeRaw<{ entry: { path: string; sourcePath: string; action: string; working: boolean; pageId?: number | null } }>(
+      "SELECT completed_keys->$2::integer AS entry FROM op_checkpoints WHERE op='managed-sync-manifest' AND fingerprint=$1", [p.runId, p.index]);
+    const entry = manifest?.entry;
+    if (!entry || entry.path !== p.path || entry.sourcePath !== p.sourcePath || entry.action !== 'delete' ||
+        typeof entry.working !== 'boolean' || (entry.pageId ?? null) !== row.page_id) {
+      throw new OperationError('page_identity_changed', 'The legacy deletion has no matching immutable origin manifest.',
+        'Inspect the source identity and explicitly retry failed sync discovery; the accepted request has not been rewritten.');
+    }
+    working = entry.working;
+  }
+  const origin = { path: p.path, sourcePath: p.sourcePath, action: p.kind === 'managed_sync_delete' ? 'delete' as const : 'import' as const, working };
+  enterClaimStep(clock, 'git_rev_parse', undefined, 'git');
+  const originContext = { root, gitRoot: realpathSync(syncGit(root, ['rev-parse', '--show-toplevel']).trim()), target: p.target, slugMode: p.slugMode };
+  assertSyncEntryOrigin(originContext, origin);
+  const originScope = syncOriginScope({ ...originContext, sourceId: row.source_id });
+  enterClaimStep(clock, 'origin_check', undefined, 'db');
+  await assertSyncPageOrigin(engine, row.source_id, p.sourcePath, originPageId, p.kind === 'managed_sync_delete', originScope);
+  if (p.renameFrom) await assertSyncPageOrigin(engine, row.source_id, p.renameFrom.sourcePath, p.renameFrom.pageId, true, originScope);
+  return { origin, originContext, originScope };
+}
+
+/**
  * `clock` (#6278): the claim's phase clock. Each await boundary below names its step and what it waits on
  * (`enterClaimStep`), which also throws the preparation's abort reason once its budget cut it off. No
  * statement here takes the member's signal: the reads a group memoizes (preparationReads) must stay shared,
@@ -269,34 +302,7 @@ export async function prepareManagedSyncMutation(engine: BrainEngine, row: Write
     enterClaimStep(clock, 'knowledge_publication', undefined, 'db');
     await assertKnowledgePublicationAllowed(engine, row, p.path === null ? undefined : { root, path: join(root, p.path) });
   }
-  let origin: Parameters<typeof assertSyncEntryOrigin>[1] | undefined;
-  let originContext: Parameters<typeof assertSyncEntryOrigin>[0] | undefined;
-  let originScope: SyncOriginScope | undefined;
-  if (p.kind !== 'managed_sync_checkpoint') {
-    if (typeof p.path !== 'string' || typeof p.sourcePath !== 'string') throw syncPublicationRefusal('storage_error', 'The accepted sync origin is missing.', row, p,
-      'The stored intent has no recorded file path for this page.');
-    let working = p.working;
-    if (p.kind === 'managed_sync_delete' && working === undefined) {
-      enterClaimStep(clock, 'manifest_entry', undefined, 'db');
-      const [manifest] = await engine.executeRaw<{ entry: { path: string; sourcePath: string; action: string; working: boolean; pageId?: number | null } }>(
-        "SELECT completed_keys->$2::integer AS entry FROM op_checkpoints WHERE op='managed-sync-manifest' AND fingerprint=$1", [p.runId, p.index]);
-      const entry = manifest?.entry;
-      if (!entry || entry.path !== p.path || entry.sourcePath !== p.sourcePath || entry.action !== 'delete' ||
-          typeof entry.working !== 'boolean' || (entry.pageId ?? null) !== row.page_id) {
-        throw new OperationError('page_identity_changed', 'The legacy deletion has no matching immutable origin manifest.',
-          'Inspect the source identity and explicitly retry failed sync discovery; the accepted request has not been rewritten.');
-      }
-      working = entry.working;
-    }
-    origin = { path: p.path, sourcePath: p.sourcePath, action: p.kind === 'managed_sync_delete' ? 'delete' : 'import', working };
-    enterClaimStep(clock, 'git_rev_parse', undefined, 'git');
-    originContext = { root, gitRoot: realpathSync(syncGit(root, ['rev-parse', '--show-toplevel']).trim()), target: p.target, slugMode: p.slugMode };
-    assertSyncEntryOrigin(originContext, origin);
-    originScope = syncOriginScope({ ...originContext, sourceId: row.source_id });
-    enterClaimStep(clock, 'origin_check', undefined, 'db');
-    await assertSyncPageOrigin(engine, row.source_id, p.sourcePath, originPageId, p.kind === 'managed_sync_delete', originScope);
-    if (p.renameFrom) await assertSyncPageOrigin(engine, row.source_id, p.renameFrom.sourcePath, p.renameFrom.pageId, true, originScope);
-  }
+  const { origin, originContext, originScope } = await resolveSyncOrigin(engine, row, p, root, originPageId, clock);
   const moved = p.kind === 'managed_sync_import' ? p.renameFrom : undefined;
   const assertRenameSource = async (tx: BrainEngine) => {
     if (!moved || moved.slug === row.slug) return;
