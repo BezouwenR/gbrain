@@ -10,6 +10,49 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.110.0] - 2026-10-08
+
+**Fence repair and chronicle now run while a sync is in progress, and a refused owner check says exactly which host or state is in the way.**
+
+On a managed brain, `gbrain repair fences` used to skip a whole source as soon as one managed sync of it was unfinished, and a long catch-up is unfinished for most of an hour. The held fences it should have cleared stayed held until the sync ended. Now the repair looks at each file on its own: only a file that a write in flight or the running sync's frozen list still names waits, and every other candidate, held files included, is repaired and committed during the catch-up. A file the sync held earlier is never considered busy, because the sync retries a held file only once its bytes change, and the repair is what changes them.
+
+The other refusal from the same report, `fence_repair` and chronicle saying `owner_unavailable` with no further word, now names the condition. The common one on a single machine is `host_mismatch`: a maintenance worker started with a different `GBRAIN_HOME` or user than the shell that ran the sync reads a different identity file and is, to the brain, another host. The message prints both host ids and, for a local caller, the identity file this process read, and tells the agent not to retry. A worktree draining for a transfer or recovering from a clone is a short wait and says so.
+
+### How to use it
+
+```bash
+gbrain repair fences --source <id>                         # preview: files a running sync still names are listed as sync_in_progress, the rest are planned
+gbrain repair fences --source <id> --apply --expect <hash> # applies the previewed set while the sync runs; a file the sync froze since the preview is skipped, not written
+gbrain errors owner_unavailable                            # the reasons and what each one asks of you
+gbrain sources writer status --source <id> --json          # read-only: the owner host id, the worktree state and this host's registration
+```
+
+### What you see
+
+| Where | What changed |
+|---|---|
+| `gbrain repair fences` during a sync | Per-file `sync_in_progress` instead of a source-wide skip. Busy: a file a queued, running or recovering write names (both ends of a rename, and a finished write whose recovery is still open), and a file still ahead in the running sync's frozen manifest. Not busy: a held file. When the busy set cannot be read at all, every candidate waits and the hold's text says why. |
+| The busy check | Runs when the plan is made, again when each item is applied, and once more when the file write is admitted, because a sync can start while the repair waits on its model call. A write caught there is skipped, nothing is written, and the model attempt is not counted against the file. |
+| `owner_unavailable` | Carries `reason`: `host_mismatch` (both ids' first 8 characters; local callers also see the `host.json` path; `retryable: false`), `transfer_in_progress` and `clone_in_progress` (`fix.next: wait`, 30 s), `binding_missing`, `incarnation_changed`, `local_path_missing`, `coordination_path_missing`. The fix is always the read-only writer status; nothing claims or transfers ownership to run maintenance. Remote callers get the ids, never a local path. |
+| Fence holds | A hold the owner check refused records the reason (`host_mismatch`, `transfer_in_progress`, ...) instead of a bare `owner_unavailable`; `gbrain sources status` and doctor route all of them as owner-host holds with the exact command. |
+| The maintenance `fence_repair` phase, chronicle, fact-fence adoption | The phase repairs under the same per-file rule while a sync runs; every maintenance writer's owner check refuses with the same reasons when this is not the owner host. |
+
+### Things to watch
+
+- **A file still ahead in the sync waits on purpose.** Repairing it would change the bytes the sync is about to admit, and the sync would then refuse that entry. The next repair run, or the maintenance phase, picks it up once the sync has passed it.
+- **`host_mismatch` is not a retry.** If the sync shell and the maintenance worker report different host ids, point both at one `GBRAIN_HOME`. Do not copy or regenerate `host.json`; a new identity orphans the ownership recorded for the old one.
+- **A doctor check for a split host identity is not in this release.** It waits on evidence from the field; the refusal text already carries both ids.
+
+### Itemized changes
+
+- `src/core/persistence/owner-refusal.ts`: the `owner_unavailable` reasons matrix. `checkOwner` names the first failing condition in a fixed order or returns the usable binding; `ownerRefusal` / `ownerUnavailableError` give each reason its message, `why`, actor (`provider` for the two in-progress reasons, so `fix.next` renders `wait`; `host_admin` otherwise), the read-only `gbrain sources writer status --source <id> --json` as fix and verify, and `retryable` (`host_mismatch` false). `maintenancePreflight` (`prepared-maintenance.ts`), `loadFenceSource` (`fence-repair/repair-io.ts`) and `managedRepairRoot` (`file-repair.ts`) refuse through it. `OperationError` and `opError` gain a site-level `retryable` the envelope carries.
+- `src/core/persistence/repair-busy.ts`: `loadRepairBusySet` (in-flight requests with rename endpoints and open recoveries, plus the not-yet-admitted entries of every unfinished `managed-sync` cursor of the incarnation from its frozen manifest, held paths excluded; fails closed), `repairBusy`, `repairBusyMessage`, `repairBusyError` (`sync_in_progress`, reasons `candidate_in_flight` / `busy_set_unreadable`). `repair/fences.ts` drops the source-wide `syncUnfinished` skip and checks the set at plan and apply; `submitManagedFileRepair` checks it again at admission and `writeFenceRepair` reports that refusal as `sync_in_progress` (the Tier 3 attempt memo records it as transient).
+- Registry: `owner_unavailable` gains `reasons`, `why`, a docs anchor (`troubleshooting.md#owner-unavailable`) and a suggestion; `sync_in_progress` gains `reasons` and `why`. `FENCE_REASONS` and the hold-fix OWNER list gain `host_mismatch`, `transfer_in_progress`, `clone_in_progress`, `incarnation_changed`, `local_path_missing`, `coordination_path_missing` (`owner_unavailable` stays the fallback for a source with no binding).
+- Docs: `docs/guides/repair.md` (fence repair during a sync, owner reasons), `docs/guides/troubleshooting.md` (the `owner_unavailable` table and symptom rows), `docs/guides/write-refusals.md` rows, regenerated `docs/guides/error-codes.md`, KEY_FILES entries, two behavior-change rows.
+- Tests: `test/owner-refusal.test.ts` (the matrix, every preflight condition on a claimed worktree, the HTTP envelope without a local path), `test/repair-busy.test.ts`, `test/repair-fences.test.ts` (far-ahead manifest, held path not busy, admission race during the model wait, host mismatch and worktree states), `test/repair-fences-during-catchup.test.ts` with its Postgres arm `test/e2e/repair-fences-during-catchup-postgres.test.ts` (a real catch-up paused at a sync member's preparation and between two entries).
+
+Fixes the third problem of #6278 (`fence_repair` and chronicle refusing with `owner_unavailable` while a sync runs); the first two, the stalled preparation and the fact-fence adoption failures, shipped in the previous release.
+
 ## [0.60.109.0] - 2026-10-08
 
 **A managed catch-up no longer stalls on one stuck write: the write is cut off, its file is held, and the rest of the source keeps syncing.**
