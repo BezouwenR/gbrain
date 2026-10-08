@@ -64,14 +64,18 @@ export function consumerWedged(row: Pick<ConsumerRow, 'restart_required' | 'root
   return row.restart_required || (row.root_barrier_age_ms !== null && row.root_barrier_age_ms > ceilingMs);
 }
 
-/** Every heartbeat row of `hostId`, newest renewal first; empty when the table is absent or the read fails. */
+const ABSENT_RECHECK_MS = 60_000;
+const absentUntil = new WeakMap<object, number>();
+/** Every heartbeat row of `hostId`, newest renewal first; empty when the table is absent (remembered for a minute per engine) or the read fails. */
 export async function listHostConsumers(engine: Pick<BrainEngine, 'executeRaw'>, hostId: string): Promise<ConsumerRow[]> {
+  if ((absentUntil.get(engine) ?? 0) > Date.now()) return [];
   try {
     return await engine.executeRaw<ConsumerRow>(
       `SELECT host_id::text AS host_id, pid, nonce, pid_ns, kind, mode, started_at::text AS started_at, renewed_at::text AS renewed_at,
          restart_required, root_barrier_age_ms, pool, host_json_path, persistence_home, minted_under, version
        FROM persistence_consumers WHERE host_id = $1::uuid ORDER BY renewed_at DESC`, [hostId]);
-  } catch {
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === '42P01') absentUntil.set(engine, Date.now() + ABSENT_RECHECK_MS);
     return [];
   }
 }
