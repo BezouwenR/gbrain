@@ -7,7 +7,7 @@
  *   bun scripts/bench/managed-sync-stall-repro.ts [--files 15000] [--history 1500] [--legacy-facts 1000]
  *     [--marker-pages 20] [--doomed-pages 12] [--drip-rows 20] [--backlog-marker-pages 20] [--rtt 57] [--pool-size 10] [--pooler pgbouncer|none]
  *     [--cli-repo <checkout>] [--max-minutes 90] [--passes 3] [--sample-seconds 30] [--adoption-interval 60]
- *     [--stall-minutes 5] [--stall-kill-minutes 15] [--seed 1] [--label <name>] [--out <dir>] [--keep] [--inspect] [--inspect-port 6499]
+ *     [--stall-minutes 5] [--stall-kill-minutes 15] [--stall-signal SIGUSR2] [--seed 1] [--label <name>] [--out <dir>] [--keep] [--inspect] [--inspect-port 6499]
  *     [--pg-port 55432] [--proxy-port 55433] [--api-port 58474] [--pooler-port 55434]
  *
  * Topology: pgvector Postgres in Docker, a transaction-mode PgBouncer in front
@@ -101,6 +101,8 @@ const KEEP = process.argv.includes('--keep');
 /** `--inspect`: start each sync pass with Bun's inspector on 127.0.0.1:<--inspect-port> so a stalled process can be examined in place (Runtime.evaluate). */
 const INSPECT = process.argv.includes('--inspect');
 const INSPECT_PORT = Number(flag('inspect-port', '6499'));
+/** `--stall-signal SIGUSR2`: sent to the sync process on every sample while it is stalled; with scripts/bench/stall-debug-instrument.py applied to the checkout under test, each signal dumps the in-flight preparations to the pass's stderr. Default: no signal. */
+const STALL_SIGNAL = flag('stall-signal', '');
 const LABEL = flag('label', `${gitDescribe(CLI_REPO)}-pool${POOL_SIZE}-${POOLER}`).replace(/[^\w.-]/g, '_');
 const OUT = resolve(flag('out', join(REPO, '.context', 'bench', `stall-repro-${LABEL}-${Date.now()}`)));
 if (POOLER !== 'pgbouncer' && POOLER !== 'none') { console.error(`--pooler takes pgbouncer or none; got ${POOLER}`); process.exit(2); }
@@ -382,6 +384,13 @@ async function sampler(row: Row, stop: () => boolean): Promise<void> {
       const pass = state.pass;
       if (pass && !pass.endedAt && stale >= STALL_MS) {
         if (!pass.stallAt) { pass.stallAt = Date.now() - stale; log(`STALL: no committed sync request for ${Math.round(stale / 1000)} s in pass ${pass.pass} (pid ${pass.pid})`); }
+        if (STALL_SIGNAL) {
+          try { process.kill(pass.pid, STALL_SIGNAL as NodeJS.Signals); } catch { /* gone */ }
+          await Bun.sleep(1500);
+          const dump = readFileSync(join(OUT, `pass-${pass.pass}.stderr`), 'utf8').split('\n').filter(l => l.startsWith('[stall-debug]')).at(-1);
+          if (dump) { append('stall-debug.jsonl', { pass: pass.pass, t: Date.now(), dump: safeJson(dump.slice('[stall-debug] '.length)) }); log(`stall-debug: ${dump.slice(0, 600)}`); }
+          else log('stall-debug: no dump line in the pass stderr (checkout not instrumented?)');
+        }
         if (!pass.stallCaptured) {
           pass.stallCaptured = true;
           const capture: Record<string, unknown> = { ...await sampleOnce(row, true), stall_since: new Date(pass.stallAt).toISOString(), trace: traceTail(row.trace, pass.pid),
@@ -406,6 +415,8 @@ async function sampler(row: Row, stop: () => boolean): Promise<void> {
     while (!stop() && Date.now() < until) await Bun.sleep(500);
   }
 }
+
+function safeJson(text: string): unknown { try { return JSON.parse(text); } catch { return text; } }
 
 function summarizeActivity(activity: unknown): unknown {
   if (!Array.isArray(activity)) return activity;
