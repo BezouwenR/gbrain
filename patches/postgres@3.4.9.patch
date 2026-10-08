@@ -146,10 +146,31 @@ index 07f6716..f6d76e5 100644
    }
  
 diff --git a/cjs/src/index.js b/cjs/src/index.js
-index f09c61c..ac84375 100644
+index f09c61c..694550b 100644
 --- a/cjs/src/index.js
 +++ b/cjs/src/index.js
-@@ -200,40 +200,134 @@ function Postgres(a, b) {
+@@ -68,6 +68,20 @@ function Postgres(a, b) {
+ 
+   Object.assign(sql, {
+     get parameters() { return options.parameters },
++    // GBrain: the pool's own queue lengths, read-only, for the consumer's pool diagnostics (#6317).
++    get pool() {
++      return {
++        max: options.max,
++        open: open.length,
++        busy: busy.length,
++        full: full.length,
++        reserved: reserved.length,
++        connecting: connecting.length,
++        closed: closed.length,
++        ended: ended.length,
++        queued: queries.length
++      }
++    },
+     largeObject: largeObject.bind(null, sql),
+     subscribe,
+     CLOSE,
+@@ -200,40 +214,134 @@ function Postgres(a, b) {
      return await sql`select pg_notify(${ channel }, ${ '' + payload })`
    }
  
@@ -303,7 +324,7 @@ index f09c61c..ac84375 100644
      let savepoints = 0
        , connection
        , prepare = null
-@@ -249,9 +343,13 @@ function Postgres(a, b) {
+@@ -249,9 +357,13 @@ function Postgres(a, b) {
      }
  
      async function scope(c, fn, name) {
@@ -317,7 +338,7 @@ index f09c61c..ac84375 100644
        let uncaughtError
          , result
  
-@@ -281,6 +379,8 @@ function Postgres(a, b) {
+@@ -281,6 +393,8 @@ function Postgres(a, b) {
        return result
  
        function savepoint(name, fn) {
@@ -326,7 +347,7 @@ index f09c61c..ac84375 100644
          if (name && Array.isArray(name.raw))
            return savepoint(sql => sql.apply(sql, arguments))
  
-@@ -290,18 +390,16 @@ function Postgres(a, b) {
+@@ -290,18 +404,16 @@ function Postgres(a, b) {
  
        function handler(q) {
          q.catch(e => uncaughtError || (uncaughtError = e))
@@ -349,7 +370,7 @@ index f09c61c..ac84375 100644
      }
    }
  
-@@ -351,7 +449,7 @@ function Postgres(a, b) {
+@@ -351,7 +463,7 @@ function Postgres(a, b) {
      return new Promise((resolve, reject) => {
        query.state
          ? query.active
@@ -358,7 +379,7 @@ index f09c61c..ac84375 100644
            : query.cancelled = { resolve, reject }
          : (
            queries.remove(query),
-@@ -362,6 +460,25 @@ function Postgres(a, b) {
+@@ -362,6 +474,25 @@ function Postgres(a, b) {
      })
    }
  
@@ -384,7 +405,7 @@ index f09c61c..ac84375 100644
    async function end({ timeout = null } = {}) {
      if (ending)
        return ending
-@@ -398,7 +515,14 @@ function Postgres(a, b) {
+@@ -398,7 +529,14 @@ function Postgres(a, b) {
      move(c, ended)
    }
  
@@ -400,7 +421,7 @@ index f09c61c..ac84375 100644
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +542,32 @@ function Postgres(a, b) {
+@@ -418,12 +556,32 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -434,7 +455,7 @@ index f09c61c..ac84375 100644
    }
  }
  
-@@ -491,6 +635,8 @@ function parseOptions(a, b) {
+@@ -491,6 +649,8 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
@@ -647,10 +668,31 @@ index 1b1cccd..792c83d 100644
    }
  
 diff --git a/src/index.js b/src/index.js
-index c7fba3d..9030be5 100644
+index c7fba3d..fc9f766 100644
 --- a/src/index.js
 +++ b/src/index.js
-@@ -200,40 +200,134 @@ function Postgres(a, b) {
+@@ -68,6 +68,20 @@ function Postgres(a, b) {
+ 
+   Object.assign(sql, {
+     get parameters() { return options.parameters },
++    // GBrain: the pool's own queue lengths, read-only, for the consumer's pool diagnostics (#6317).
++    get pool() {
++      return {
++        max: options.max,
++        open: open.length,
++        busy: busy.length,
++        full: full.length,
++        reserved: reserved.length,
++        connecting: connecting.length,
++        closed: closed.length,
++        ended: ended.length,
++        queued: queries.length
++      }
++    },
+     largeObject: largeObject.bind(null, sql),
+     subscribe,
+     CLOSE,
+@@ -200,40 +214,134 @@ function Postgres(a, b) {
      return await sql`select pg_notify(${ channel }, ${ '' + payload })`
    }
  
@@ -804,7 +846,7 @@ index c7fba3d..9030be5 100644
      let savepoints = 0
        , connection
        , prepare = null
-@@ -249,9 +343,13 @@ function Postgres(a, b) {
+@@ -249,9 +357,13 @@ function Postgres(a, b) {
      }
  
      async function scope(c, fn, name) {
@@ -818,7 +860,7 @@ index c7fba3d..9030be5 100644
        let uncaughtError
          , result
  
-@@ -281,6 +379,8 @@ function Postgres(a, b) {
+@@ -281,6 +393,8 @@ function Postgres(a, b) {
        return result
  
        function savepoint(name, fn) {
@@ -827,7 +869,7 @@ index c7fba3d..9030be5 100644
          if (name && Array.isArray(name.raw))
            return savepoint(sql => sql.apply(sql, arguments))
  
-@@ -290,18 +390,16 @@ function Postgres(a, b) {
+@@ -290,18 +404,16 @@ function Postgres(a, b) {
  
        function handler(q) {
          q.catch(e => uncaughtError || (uncaughtError = e))
@@ -850,7 +892,7 @@ index c7fba3d..9030be5 100644
      }
    }
  
-@@ -351,7 +449,7 @@ function Postgres(a, b) {
+@@ -351,7 +463,7 @@ function Postgres(a, b) {
      return new Promise((resolve, reject) => {
        query.state
          ? query.active
@@ -859,7 +901,7 @@ index c7fba3d..9030be5 100644
            : query.cancelled = { resolve, reject }
          : (
            queries.remove(query),
-@@ -362,6 +460,25 @@ function Postgres(a, b) {
+@@ -362,6 +474,25 @@ function Postgres(a, b) {
      })
    }
  
@@ -885,7 +927,7 @@ index c7fba3d..9030be5 100644
    async function end({ timeout = null } = {}) {
      if (ending)
        return ending
-@@ -398,7 +515,14 @@ function Postgres(a, b) {
+@@ -398,7 +529,14 @@ function Postgres(a, b) {
      move(c, ended)
    }
  
@@ -901,7 +943,7 @@ index c7fba3d..9030be5 100644
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +542,32 @@ function Postgres(a, b) {
+@@ -418,12 +556,32 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -935,7 +977,7 @@ index c7fba3d..9030be5 100644
    }
  }
  
-@@ -491,6 +635,8 @@ function parseOptions(a, b) {
+@@ -491,6 +649,8 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
@@ -1001,7 +1043,7 @@ index c4ef971..8fba891 100644
        const out = xs[index++]
  
 diff --git a/types/index.d.ts b/types/index.d.ts
-index 13c3432..460ffc7 100644
+index 13c3432..03f1ddf 100644
 --- a/types/index.d.ts
 +++ b/types/index.d.ts
 @@ -119,6 +119,18 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
@@ -1040,7 +1082,16 @@ index 13c3432..460ffc7 100644
      /**
       * When executes query as prepared statement.
       * @default false
-@@ -717,10 +730,11 @@ declare namespace postgres {
+@@ -705,6 +718,8 @@ declare namespace postgres {
+ 
+     options: ParsedOptions<TTypes>;
+     parameters: ConnectionParameters;
++    /** GBrain: the pool's own queue lengths at this instant (`queued` = queries waiting for a connection). */
++    pool: { max: number; open: number; busy: number; full: number; reserved: number; connecting: number; closed: number; ended: number; queued: number };
+ 
+     end(options?: { timeout?: number | undefined } | undefined): Promise<void>;
+ 
+@@ -717,10 +732,11 @@ declare namespace postgres {
      begin<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      begin<T>(options: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
@@ -1053,7 +1104,7 @@ index 13c3432..460ffc7 100644
      savepoint<T>(cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
      savepoint<T>(name: string, cb: (sql: TransactionSql<TTypes>) => T | Promise<T>): Promise<UnwrapPromiseArray<T>>;
  
-@@ -728,6 +742,7 @@ declare namespace postgres {
+@@ -728,6 +744,7 @@ declare namespace postgres {
    }
  
    interface ReservedSql<TTypes extends Record<string, unknown> = {}> extends Sql<TTypes> {
