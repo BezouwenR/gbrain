@@ -108,7 +108,7 @@ async function forgetCliRegistration(id: string): Promise<void> {
 const serveRow = (over: Partial<ConsumerRow> = {}): ConsumerRow => ({
   host_id: 'host', pid: 4242, nonce: 'n1', pid_ns: null, kind: 'serve', mode: 'full', started_at: new Date().toISOString(),
   renewed_at: new Date().toISOString(), restart_required: false, root_barrier_age_ms: null, pool: null,
-  host_json_path: null, persistence_home: null, minted_under: null, version: 'test', ...over,
+  host_json_path: '/tmp/host.json', persistence_home: '/tmp', minted_under: null, version: 'test', ...over,
 });
 
 const captured: string[] = [];
