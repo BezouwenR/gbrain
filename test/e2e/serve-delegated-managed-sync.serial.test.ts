@@ -167,6 +167,10 @@ describeWithDb('serve-delegated managed sync on Postgres (#6317 D1 a′)', () =>
   });
 
   test('the CLI hands the managed catch-up to the resident serve and prints the in-process result; MCP latency under the drain is measured', async () => {
+    // Baseline: the same call against the idle serve, so the drain's cost reads as a delta.
+    const idle: number[] = [];
+    for (let i = 0; i < 12; i++) { const at = performance.now(); await serve!.call('get_stats', {}); idle.push(performance.now() - at); await Bun.sleep(100); }
+    idle.sort((a, b) => a - b);
     const latencies: number[] = [];
     let stopProbing = false;
     const probing = (async () => {
@@ -197,7 +201,8 @@ describeWithDb('serve-delegated managed sync on Postgres (#6317 D1 a′)', () =>
     expect(stamped.map(o => Number(o.pid))).toEqual([serve!.pid]);
     const finite = latencies.filter(Number.isFinite).sort((a, b) => a - b);
     const line = `[measure] serve-delegated drain of ${PAGES} pages in ${Math.round(elapsedMs / 1000)}s: ${latencies.length} MCP get_stats calls during it, ` +
-      `p50 ${percentile(finite, 0.5).toFixed(0)}ms p95 ${percentile(finite, 0.95).toFixed(0)}ms max ${(finite.at(-1) ?? NaN).toFixed(0)}ms, ${latencies.length - finite.length} timed out`;
+      `p50 ${percentile(finite, 0.5).toFixed(0)}ms p95 ${percentile(finite, 0.95).toFixed(0)}ms max ${(finite.at(-1) ?? NaN).toFixed(0)}ms, ${latencies.length - finite.length} timed out; ` +
+      `idle serve baseline p50 ${percentile(idle, 0.5).toFixed(0)}ms p95 ${percentile(idle, 0.95).toFixed(0)}ms`;
     console.error(line);
     expect(latencies.length).toBeGreaterThan(0);
   }, 900_000);
