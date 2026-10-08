@@ -5,8 +5,7 @@
       17,
       18,
       19,
-      100,
-      220
+      100
     ],
     "helpers": {
       "ALIAS_TABLES": "cddd37c636af42d862c08ca7754a57dfe9d12576b769fa8f74a5f02c803f67a0",
@@ -37,7 +36,7 @@
       "sqlQueryForEngine": "71fb1ccec1b22cdc1662876dbd8c17ed81e9ab83485c6965cdf5caa4fc4a4ab5",
       "verifyProjectionStatistics": "59d9ccfea1c53384d8607874a51209a9c2dfd51b2b85a2cb6269fa4120faf1f3"
     },
-    "latest": 221,
+    "latest": 220,
     "records": [
       {
         "handler": {
@@ -3267,7 +3266,7 @@
         "sqlFor": "absent",
         "transaction": "absent",
         "verify": "absent",
-        "version": 221
+        "version": 220
       }
     ],
     "versions": [
@@ -3485,7 +3484,7 @@
       217,
       218,
       219,
-      221
+      220
     ]
   },
   "normalizer": "migrations-record-v1"
