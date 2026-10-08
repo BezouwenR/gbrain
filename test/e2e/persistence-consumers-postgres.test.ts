@@ -13,7 +13,7 @@
  * when two `GBRAIN_HOME`s mint two `host.json` files on one machine against
  * one brain, and flags the container shape (no machine id, worktree at the
  * binding's path, identity minted later under another home); `writer status
- * --json` carries `host.consumers`; the v221 table has PGLite/Postgres parity.
+ * --json` carries `host.consumers`; the v222 table has PGLite/Postgres parity.
  * Fails on the base branch: the table, the module and the checks do not exist.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';

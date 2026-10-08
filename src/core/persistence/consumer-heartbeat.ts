@@ -2,7 +2,7 @@
  * #6317 (B1a, B3): the per-process heartbeat of a full persistence consumer and
  * the probe a resident process runs before starting its own.
  *
- * One row per process in `persistence_consumers` (migration v221), keyed by
+ * One row per process in `persistence_consumers` (migration v222), keyed by
  * `(host_id, pid, nonce)`: the nonce is random per process and `pid_ns` is the
  * pid-namespace inode, so a reused pid after a container restart, or the same
  * pid in two namespaces sharing one `GBRAIN_HOME`, is never mistaken for the

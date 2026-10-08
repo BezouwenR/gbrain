@@ -22,7 +22,7 @@ export const PERSISTENCE_SYNC_RUN_INDEXES = [
  * #6317: the movement watermark (the newest committed receipt of a worktree)
  * that `writer movement`, `data_moving` and doctor `managed_sync_not_moving`
  * read; the baseline indexes cover pending, recovery and principal reads
- * only. Postgres builds it CONCURRENTLY in migration v221; PGLite inline.
+ * only. Postgres builds it CONCURRENTLY in migration v222; PGLite inline.
  */
 export const PERSISTENCE_COMMITTED_WATERMARK_INDEX_SQL = `CREATE INDEX IF NOT EXISTS persistence_requests_committed_watermark
   ON persistence_requests(worktree_id,completed_at DESC) WHERE state='committed'`;
