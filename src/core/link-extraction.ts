@@ -100,10 +100,8 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
 // 2026-10-02: hyphen-run basenames resolve (#5623); 2026-10-05: temporal edges derive dated evidence on extraction.
 // 2026-10-05T03: typed relation lines (core/line-grammar.ts) state their link's type; a per-edge verb that
 // belongs to another link in the window no longer types this one; "joined [X] as <role>" reads as works_at.
-// Re-extract so existing pages pick these up.
-// 2026-10-08: adviser wording and local negation (U1), board/observer/investor wording never types works_at (U3)
-// and advisory/board/investor roles are not employment starts (U4), each confirmed on held-out data (Q2).
-export const LINK_EXTRACTOR_VERSION_TS = '2026-10-08T20:00:00Z';
+// 2026-10-08: held-out-confirmed Q2 units U1, U3, U4 (core/link-typing-units.ts). Re-extract so pages pick these up.
+export const LINK_EXTRACTOR_VERSION_TS = '2026-10-08T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
