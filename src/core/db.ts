@@ -6,6 +6,7 @@ import { applyPostgresForwardReferenceBootstrap } from './engine-sql/bootstrap.t
 import type { BrainEngine } from './engine.ts';
 import { verifySchema } from './schema-verify.ts';
 import { isConnectTimeoutError, isRetryableConnError } from './retry-matcher.ts';
+import { loadSharedParameterTypes, sharedParameterTypes, type SharedParameterTypes } from './pg-type-cache.ts';
 
 let sql: ReturnType<typeof postgres> | null = null;
 let connectedUrl: string | null = null;
@@ -122,18 +123,37 @@ const FALLBACK_CONNECT_TIMEOUT_S = 10;
 const MAX_CONNECT_TIMEOUT_S = Math.floor(0x7fffffff / 1000);
 
 /**
- * #5984: whether a pool shares the parameter types of a described statement
- * across its connections (the vendored driver's `shared_types`), so a
- * connection running a statement for the first time skips the describe round
- * trip and keeps pipelining. On by default; GBRAIN_PG_TYPE_CACHE=0 turns it off.
+ * #5984: the store a pool shares described parameter types in (the vendored
+ * driver's `shared_types`): one per database target in this process, saved for
+ * the next process (src/core/pg-type-cache.ts). A connection running a statement
+ * for the first time then skips the describe round trip and keeps pipelining.
+ * On by default; GBRAIN_PG_TYPE_CACHE=0 turns it off.
  */
-export function resolveSharedTypes(): boolean {
-  const value = process.env.GBRAIN_PG_TYPE_CACHE?.trim().toLowerCase();
-  return value !== '0' && value !== 'false';
+export function resolveSharedTypes(url?: string): SharedParameterTypes | false {
+  return sharedParameterTypes(url);
 }
 /** Forgets the shared parameter types of these pools; a schema change may have changed them. */
 export function clearSharedTypes(...pools: unknown[]): void {
   for (const pool of pools) (pool as { options?: { shared_types?: Map<string, number[]> | null } } | null)?.options?.shared_types?.clear();
+}
+
+/**
+ * A new pool's connection check. It also reads the scope of the saved parameter
+ * types (server version, schema version and the database as the server names
+ * it) in the same round trip and loads them; a database without a `config`
+ * table falls back to `SELECT 1`.
+ */
+export async function checkPoolAndLoadSharedTypes(pool: ReturnType<typeof postgres>, url: string): Promise<void> {
+  let rows: Array<{ server: string; schema: string | null; database: string | null }>;
+  try {
+    rows = await pool.unsafe(`SELECT current_setting('server_version_num') AS server, (SELECT value FROM config WHERE key='version') AS schema,
+      current_database() || '@' || coalesce(host(inet_server_addr()), '') || ':' || coalesce(inet_server_port()::text, '') || '?' || current_user AS database`) as unknown as typeof rows;
+  } catch (err) {
+    if ((err as { code?: string }).code !== '42P01') throw err;
+    await pool`SELECT 1`;
+    return;
+  }
+  loadSharedParameterTypes(url, String(rows[0]?.server ?? ''), rows[0]?.schema ?? null, rows[0]?.database ?? null);
 }
 
 /**
@@ -357,7 +377,7 @@ export async function connect(config: EngineConfig, hooks: { onpoisoned?: (statu
       // `gbrain jobs submit --json | ...`). Opt back in with GBRAIN_PG_NOTICES=1.
       onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
       onpoisoned: hooks.onpoisoned,
-      shared_types: resolveSharedTypes(),
+      shared_types: resolveSharedTypes(url),
     };
     if (Object.keys(timeouts).length > 0) {
       opts.connection = timeouts;
@@ -373,7 +393,7 @@ export async function connect(config: EngineConfig, hooks: { onpoisoned?: (statu
     sql = postgres(url, traceSqlOptions(opts, 'module'));
 
     // Test connection
-    await sql`SELECT 1`;
+    await checkPoolAndLoadSharedTypes(sql, url);
     connectedUrl = url;
 
     await setSessionDefaults(sql);

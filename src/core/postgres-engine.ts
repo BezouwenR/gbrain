@@ -376,7 +376,7 @@ export class PostgresEngine implements BrainEngine {
         // GBRAIN_PG_NOTICES=1.
         onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
         onpoisoned: (status: string) => this.onPoisoned('read', status),
-        shared_types: db.resolveSharedTypes(),
+        shared_types: db.resolveSharedTypes(url),
       };
       if (Object.keys(timeouts).length > 0) {
         opts.connection = timeouts;
@@ -385,7 +385,7 @@ export class PostgresEngine implements BrainEngine {
         opts.prepare = prepare;
       }
       this._sql = postgres(url, traceSqlOptions(opts, 'instance'));
-      await this._sql`SELECT 1`;
+      await db.checkPoolAndLoadSharedTypes(this._sql, url);
       await db.setSessionDefaults(this._sql);
       this._connectionStyle = 'instance';
 
