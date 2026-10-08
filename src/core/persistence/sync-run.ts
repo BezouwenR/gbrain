@@ -17,7 +17,7 @@ import { assertSyncPageOrigin, sameSyncOrigin, syncOriginScope } from './sync-or
 import { assertManagedSyncActive, assertSyncDispatchActive, managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, syncProcessingOptions, SYNC_PROCESSING_KEYS, type SyncAuthority, type SyncProcessingOptions } from './sync-authority.ts';
 import { prepareManagedSyncMutation, type SyncCursorOptions, type SyncIntent } from './sync-prepare.ts';
 import { screeningRequest } from './noop-kernel.ts';
-import { noopWaiversEnabled, screenWaiver, unfinishedPageRequestParams, UNFINISHED_PAGE_REQUEST_SQL, waiveNoopEntry, waiveNoopRun, waiverBatchEnabled, type NoopWaiver, type WaiverRunEntry } from './sync-waivers.ts';
+import { noopWaiversEnabled, raceSyncBudget, screenWaiver, syncPreparationBudgetMs, unfinishedPageRequestParams, UNFINISHED_PAGE_REQUEST_SQL, waiveNoopEntry, waiveNoopRun, waiverBatchEnabled, type NoopWaiver, type WaiverRunEntry } from './sync-waivers.ts';
 import { resolve } from 'node:path';
 import { currentCompanyBrainSync, getCompanyBrainProfile, readCompanyBrainPlan } from '../company-brain/profile.ts';
 import { readCommittedBlob } from '../company-brain/revision.ts';
@@ -313,7 +313,7 @@ function writeDiagnostic(cursor: Cursor, pending: Pending, row: WriteRequest): M
   return diagnostic;
 }
 async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, assertActive: () => void,
-  run: { syncOptions: SyncCursorOptions; repoPath?: string; screen?: SyncScreenRun | null; observedAt?: string }): Promise<Pending | Held> {
+  run: { syncOptions: SyncCursorOptions; repoPath?: string; screen?: SyncScreenRun | null; observedAt?: string; signal?: AbortSignal }): Promise<Pending | Held> {
   assertActive();
   const entry = cursor.entries[cursor.index];
   const retry = { sourceId: cursor.sourceId, processingOptions: cursor.processingOptions, syncOptions: cursor.syncOptions ?? run.syncOptions, repoPath: run.repoPath };
@@ -358,7 +358,7 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
     slug = entry.slug!; pageId = occupant?.page.id ?? entry.pageId ?? null; revision = occupant ? occupant.revision : entry.revision ?? null;
     const snapshot = await engine.readPageSnapshot(slug, { sourceId: cursor.sourceId, includeDeleted: true });
     assertActive();
-    if (occupant && (content === null || !await sameContentAtOrigin(engine, cursor, entry, key, snapshot, content, rawHash, lineEndingOnly))) {
+    if (occupant && (content === null || !await sameContentAtOrigin(engine, cursor, entry, key, snapshot, content, rawHash, lineEndingOnly, run.signal))) {
       throw syncRunRefusal('page_identity_changed', 'The imported origin no longer identifies exactly the accepted page.', retry,
         `Page ${slug} was imported from ${entry.path} by another run of source ${cursor.sourceId} with different content after this run enumerated it, so the run stopped before admitting it.`);
     }
@@ -683,18 +683,22 @@ async function alreadyImportedAtOrigin(engine: BrainEngine, cursor: Cursor, entr
   }
 }
 
-/** #5522: the page now at the origin already holds exactly the content this entry would import (the preparer's own no-op verdict). */
+/**
+ * #5522: the page now at the origin already holds exactly the content this entry would import (the preparer's own no-op verdict).
+ * #6278: the preparation races the sync budget; past it the origin refusal stands, and a cancelled run propagates.
+ */
 async function sameContentAtOrigin(engine: BrainEngine, cursor: Cursor, entry: Cursor['entries'][number], key: string,
-  snapshot: Awaited<ReturnType<BrainEngine['readPageSnapshot']>>, content: string, rawHash: string | null, lineEndingOnly: boolean): Promise<boolean> {
+  snapshot: Awaited<ReturnType<BrainEngine['readPageSnapshot']>>, content: string, rawHash: string | null, lineEndingOnly: boolean, signal?: AbortSignal): Promise<boolean> {
   if (!snapshot || snapshot.page.deleted_at != null) return false;
   const intent: SyncIntent = { kind: 'managed_sync_import', expected_revision: snapshot.revision, sourcePath: entry.sourcePath, path: entry.path, rawHash, content, lineEndingOnly,
     processingOptions: cursor.processingOptions, ownerEpoch: String(cursor.binding.owner_epoch), syncAuthority: cursor.authority,
     cursorKey: key, runId: cursor.runId, slugMode: cursor.slugMode, index: cursor.index, total: cursor.entries.length, from: cursor.from, target: cursor.target, working: entry.working ?? false };
   try {
-    const prepared = await prepareManagedSyncMutation(engine, screeningRequest({ source_id: cursor.sourceId, source_incarnation: cursor.incarnation, slug: snapshot.page.slug,
-      page_id: snapshot.page.id, worktree_id: cursor.binding.worktree_id, authority: cursor.authority.writer, intent }), { engine: engine.kind });
+    const prepared = await raceSyncBudget(prepareManagedSyncMutation(engine, screeningRequest({ source_id: cursor.sourceId, source_incarnation: cursor.incarnation, slug: snapshot.page.slug,
+      page_id: snapshot.page.id, worktree_id: cursor.binding.worktree_id, authority: cursor.authority.writer, intent }), { engine: engine.kind }), await syncPreparationBudgetMs(engine), signal);
     return (prepared.contentUnchanged === true || prepared.noop === true) && !prepared.file && prepared.observedRevision === snapshot.revision;
-  } catch {
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return false;
   }
 }
@@ -737,7 +741,7 @@ const WAIVER_RUN_MAX = 64;
  */
 async function waiveRun(engine: BrainEngine, cursor: Cursor, head: Pending, key: string, config: GBrainConfig, assertActive: () => void,
   frozenRun: Parameters<typeof freezeEntry>[4], drainStartedAt: number, limit: number, onProgress: SyncOpts['onProgress']): Promise<Cursor | null> {
-  const first = await screenWaiver(engine, cursor, head, config);
+  const first = await screenWaiver(engine, cursor, head, config, frozenRun.signal);
   if (!first) return null;
   assertActive();
   const run: WaiverRunEntry[] = [{ pending: head, waived: first }];
@@ -746,7 +750,7 @@ async function waiveRun(engine: BrainEngine, cursor: Cursor, head: Pending, key:
     const batch = Array.from({ length: Math.min(4, max - run.length, cursor.entries.length - next) }, (_, i) => next + i);
     const frozen = await Promise.all(batch.map(index => freezeEntry(engine, { ...cursor, index }, key, assertActive, frozenRun).catch(() => null)));
     const screened = await Promise.all(frozen.map((entry, i) => entry && !('hold' in entry) && !entry.rebound
-      ? screenWaiver(engine, { ...cursor, index: batch[i]! }, entry, config).catch(() => null) : null));
+      ? screenWaiver(engine, { ...cursor, index: batch[i]! }, entry, config, frozenRun.signal).catch(() => null) : null));
     for (const [i, waived] of screened.entries()) {
       if (!waived) break extend;
       run.push({ pending: frozen[i] as Pending, waived });
@@ -1091,7 +1095,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
   const company = currentCompanyBrainSync(context.sourceId);
   const processingOptions = syncProcessingOptions(opts);
   const syncOptions = cursorSyncOptions(opts);
-  const frozenRun: { syncOptions: SyncCursorOptions; repoPath?: string; screen?: SyncScreenRun | null; observedAt?: string } = { syncOptions, ...(opts.repoPath ? { repoPath: resolve(opts.repoPath) } : {}) };
+  const frozenRun: { syncOptions: SyncCursorOptions; repoPath?: string; screen?: SyncScreenRun | null; observedAt?: string; signal?: AbortSignal } = { syncOptions, ...(opts.repoPath ? { repoPath: resolve(opts.repoPath) } : {}) };
   const runStartedAt = new Date().toISOString();
   const key = managedCursorKey(context.incarnation, authority, company, syncOptions);
   let cursor: Cursor | null = null;
@@ -1103,6 +1107,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
   const discoveryRun = randomUUID();
   const inheritedSignal = currentSourceFilesystemSignal();
   const signal = opts.signal && inheritedSignal ? AbortSignal.any([opts.signal, inheritedSignal]) : opts.signal ?? inheritedSignal;
+  if (signal) frozenRun.signal = signal;
   const assertActive = () => {
     assertSyncDispatchActive();
     throwIfAborted(signal);
@@ -1267,7 +1272,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
       const screened: Cursor = cursor;
       const waived: Cursor | null = prior ? null : await waiveNoopEntry(engine, screened, pending, config, key,
         (tx, noop) => writeCursor(tx, key, screened, { ...waivedCursor(screened, noop), progress: stampProgress(screened.progress, screened.index, screened.index + 1, drainStartedAt) },
-          holdClear(screened, pending.intent.path, observedAt)), tx => currentCursor(tx, key, screened));
+          holdClear(screened, pending.intent.path, observedAt)), tx => currentCursor(tx, key, screened), signal);
       if (waived) {
         cursor = waived;
         opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, total: cursor.entries.length, waived: true });
