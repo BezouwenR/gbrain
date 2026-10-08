@@ -6,7 +6,8 @@ import { opError, type OperationContext } from '../ops/contract.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
-import { serializePageToMarkdown } from '../markdown.ts';
+import { parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
+import { fenceOperationError, scanCanonicalFences } from '../fence-repair/refusal.ts';
 import { normalizeClaimWhitespace, parseFactsFence } from '../facts-fence.ts';
 import { submissionAuthority, authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { currentVerifiedLocalWriter, localHostId, registerLocalWriter } from './identity.ts';
@@ -129,6 +130,17 @@ async function submitMaintenance(engine: BrainEngine, authority: MaintenanceAuth
   }
   if ((snapshot?.revision ?? null) !== intent.expected_revision) throw opError('revision_conflict', 'The maintenance target changed before admission.',
     `Page ${slug} in '${authority.writer.sourceId}' changed after maintenance read it; nothing was submitted. Run maintenance again so it works from the current revision.`);
+  // #6278: the same fence scan the canonical projection runs, over the whole
+  // submitted body and timeline, before a request exists. A fence defect the
+  // write would not clear (a second facts fence in the timeline survives
+  // every adoption, which replaces only the first fence) is refused here with
+  // its fence reason, so maintenance skips the page instead of admitting a
+  // request that fails at preparation; the census already lists the stored
+  // defect as a repair candidate. A repair whose postimage is clean passes.
+  if (typeof intent.content === 'string') {
+    const scan = scanCanonicalFences(parseMarkdown(intent.content, slug));
+    if (scan.defects.length) throw fenceOperationError(scan.defects[0]!, slug, authority.writer.sourceId);
+  }
   const row = await admitWrite(engine, { principal: authority.writer.principal, requestId, operation: 'submit_job',
     sourceId: authority.writer.sourceId, sourceIncarnation: authority.writer.sourceIncarnation, slug,
     pageId: snapshot?.page.id ?? null, authority: authority.writer, callerIntent: intent, intent,
