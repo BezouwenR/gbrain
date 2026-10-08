@@ -825,13 +825,17 @@ ran to completion. **Steady** is pages/min between the 10% and 90% commits;
 | G1 steady, 10k corpus | 174.8 | 372.7 | >= 300 | met |
 | G2 10k backlog wall | 74.5 min | 33.5 min | <= 40 min | met |
 | G3 first commit, 1,500 files (34 waived first) | 78.9 s | 20.3 s | <= 15 s | missed |
-| G4 steady at 4 / 6 / 8 / 12 / 16 lanes, pool 20 | falls past 6 | 333.5 / 369.4 / 418.1 / 418.8 / 409.3 | non-decreasing within the 6-lane spread | see below |
+| G4 steady at 4 / 6 / 8 / 12 / 16 lanes, pool 20 | falls past 6 | 333.5 / 369.4 / 399.9 / 406.6 / 408.5 (8 to 16: mean of 3 runs) | non-decreasing within the 6-lane spread | met |
 | G5 `put_page` idle p50 / p95 | 8.6 / 11.6 s | 2.53 / 2.78 s | <= 3 / 4 s | met |
 | G6 `put_page` during catch-up p50 / p95 | 11.3 / 17.1 s | 6.9 / 8.4 s | <= idle + 1 s (provisional) | missed |
 | G7 catch-up while a write arrives every 5 s | 4.6 | 58.2 (15% of idle) | >= 50% of idle | missed |
 | G8 steady at ~0 ms | 2,404 | 2,862 | >= 700 | met |
 
 The three repeated default (6-lane) runs gave 381.3, 378.9 and 374.5 pages/min.
+The 8, 12 and 16 lane rows ran three times each: 418.1 / 384.8 / 396.9, 418.8 /
+392.5 / 408.4 and 409.3 / 398.5 / 417.6. A single 16-lane run first measured below
+the 12-lane run (409.3 against 418.8); the repeats show runs at one lane count
+spread by about 30 pages/min, and the means rise with the lane count.
 
 **G3.** Of the 20 s before the first commit, about 5.4 s is startup reads (90
 serial round trips: configuration, source, writer and checkpoint reads), 5.6 s

@@ -41,7 +41,7 @@ Same 16-core machine and same Postgres, 57 ms round trips, default settings, mas
 
 ### Things to watch
 
-- **More publishers help up to a point.** With a 20-connection pool, 8 to 16 publishers all run at about 410 to 420 pages/min against 375 at the default 6. The drain prints a `[sync] lanes:` line saying what limited it (the pool, the server's free connections or your setting).
+- **More publishers help up to a point.** With a 20-connection pool, 8 to 16 publishers all run at about 400 to 410 pages/min against 378 at the default 6. The drain prints a `[sync] lanes:` line saying what limited it (the pool, the server's free connections or your setting).
 - **Writes during a catch-up still cost something.** A page write waits for the sync batches already publishing, so during a catch-up it takes about 7 s, and a steady stream of writes slows the catch-up to about 15% of its idle speed.
 - **Every new path has a switch** that accepts `0` or `false`: `persistence.single_write_group`, `persistence.preadmit_cache`, `sync.waive_batch`, `sync.foreground_priority` (environment: `GBRAIN_SINGLE_WRITE_GROUP`, `GBRAIN_PREADMIT_CACHE`, `GBRAIN_SYNC_WAIVE_BATCH`, `GBRAIN_SYNC_FOREGROUND_PRIORITY`). A running `serve` picks up a config change within 5 seconds.
 
