@@ -146,10 +146,10 @@ describe.skipIf(!hasDatabase())('grouped preparation deadlines (Postgres, #6278)
       // The suffix is cut exactly as a timer deadline cuts it: released uncharged, never published ahead of k.
       await waitFor(async () => (await stateOf(engine, rows.slice(k + 1))).every(s => s.state === 'queued' && s.reason === 'group_member_waiting'), { timeoutMs: 15_000, label: 'the suffix is released waiting' });
       for (let i = 0; i < k; i++) await waitFor(async () => (await getWriteRequestById(engine, rows[i]!.id))?.state === 'committed', { timeoutMs: 15_000, label: `prefix member ${i} commits` });
-      // No terminal receipt was written from the raw error.
+      // No terminal receipt was written from the raw error, and k was charged once (it may already be claimed again by now).
       const states = await stateOf(engine, rows);
       expect(states.every(s => s.error === null)).toBe(true);
-      expect(states[k]).toMatchObject({ reason: 'preparation_deadline', attempts: 1 });
+      expect(states[k]!.attempts).toBe(1);
       expect(states.slice(0, k).map(s => s.state)).toEqual(['committed', 'committed']);
       for (const row of rows) await waitFor(async () => (await getWriteRequestById(engine, row.id))?.state === 'committed', { timeoutMs: 20_000, label: `${row.slug} commits after the retry` });
       expect(attempts.get(rows[k]!.id)).toBe(2);

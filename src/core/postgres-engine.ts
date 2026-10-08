@@ -16,6 +16,7 @@ import postgres from '#postgres'
 import { reservedTransactions, type ReservedTransactions } from './postgres-engine/reserved-transactions.ts';
 import { traceSqlOptions } from './sql-trace.ts';
 import { hasPostgresCancellationCapability, postgresCancellationUnavailable, reserveWithCancellation } from './postgres-engine/cancellation.ts';
+import { runBoundedStatement } from './postgres-engine/bounded-statement.ts';
 export { hasPostgresCancellationCapability } from './postgres-engine/cancellation.ts';
 import type {
   BrainEngine,
@@ -2746,37 +2747,6 @@ export class PostgresEngine implements BrainEngine {
     })();
   }
 
-  /**
-   * #6278: `executeRaw` with `timeoutMs`. The session's `statement_timeout` is a
-   * startup parameter a transaction-mode pooler drops, so a preparation read
-   * outside the publication transaction had no server-side bound and a
-   * relation lock held elsewhere pinned its connection for as long as the lock
-   * lasted. A reserved connection runs `BEGIN; SET LOCAL statement_timeout`,
-   * the statement and `COMMIT` as one pipelined round trip: the pooler pins
-   * the transaction to one server connection, `SET LOCAL` ends with it, and a
-   * statement past the bound ends server-side with 57014 (a lock wait counts
-   * toward it). `COMMIT` after a failed statement is a rollback, never an
-   * error of its own. `signal` covers only the wait for a free connection (a
-   * saturated pool must not hold the bound off); the statement itself ends at
-   * the bound, never by a cancel request.
-   */
-  private async runBounded<T>(conn: ReturnType<typeof postgres>, sql: string, params: unknown[] | undefined,
-    opts: { timeoutMs: number; signal?: AbortSignal }): Promise<T[]> {
-    const ms = Math.max(1, Math.ceil(opts.timeoutMs));
-    const reserved = opts.signal ? await reserveWithCancellation(reserve => conn.reserve(reserve), opts.signal) : await conn.reserve();
-    this.checkoutGauge.checkedOut();
-    try {
-      const open = reserved.unsafe(`BEGIN; SET LOCAL statement_timeout = ${ms}`).simple().execute();
-      const read = reserved.unsafe(sql, params as Parameters<typeof reserved.unsafe>[1], { prepare: true }).execute();
-      const close = reserved.unsafe('COMMIT').execute();
-      const settled = await Promise.allSettled([open, read, close]);
-      for (const outcome of settled) if (outcome.status === 'rejected') throw outcome.reason;
-      return (settled[1] as PromiseFulfilledResult<unknown>).value as T[];
-    } finally {
-      reserved.release();
-    }
-  }
-
   async executeRaw<T = Record<string, unknown>>(
     sql: string,
     params?: unknown[],
@@ -2787,7 +2757,10 @@ export class PostgresEngine implements BrainEngine {
     // .finally and leak the counter.
     this.checkoutGauge.acquire('raw');
     try {
-      if (opts?.timeoutMs !== undefined && !this._pageTransaction) return await this.runBounded<T>(this.sql, sql, params, { ...opts, timeoutMs: opts.timeoutMs });
+      // #6278: a transaction-local statement_timeout, which holds through a transaction-mode pooler (postgres-engine/bounded-statement.ts).
+      if (opts?.timeoutMs !== undefined && !this._pageTransaction) {
+        return await runBoundedStatement<T>(this.sql, sql, params, { ...opts, timeoutMs: opts.timeoutMs }, () => this.checkoutGauge.checkedOut());
+      }
       return await this.runUnsafe<T>(this.sql, sql, params, opts);
     } finally {
       this.checkoutGauge.release('raw');

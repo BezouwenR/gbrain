@@ -66,6 +66,46 @@ every number below comes from those captures.
   a claim, and the process has to be killed. Zero progress, but no
   `preparing` blocker.
 
+## Cause: what is bounded now, what stays unproven
+
+Status after Lane A9 (plan item 1.4, the cause-specific fix):
+
+- **The lock-wait class is bounded by the budget.** Every unmemoized raw
+  statement a managed write's preparation issues now runs under a
+  transaction-local `statement_timeout` of the write's remaining preparation
+  budget (`boundedReads` in `src/core/persistence/bounded-reads.ts`;
+  `executeRaw(sql, params, { timeoutMs })` runs `BEGIN; SET LOCAL
+  statement_timeout; <statement>; COMMIT` on a reserved connection as one
+  pipelined round trip, which holds through a transaction-mode pooler because
+  the pooler pins the transaction). The forced probe of this page, rerun as a
+  test (`test/e2e/persistence-preparation-lock-wait-postgres.test.ts`: a
+  second session holds `LOCK TABLE pages IN ACCESS EXCLUSIVE MODE`, budget
+  2 s), now ends with the member released `preparation_deadline` at the
+  budget, no origin-check statement left `active` on the server, the root
+  free, and the same member committing once the lock drops; before the
+  change the released member's statement stayed `active` / `Lock` until the
+  lock lifted and the root waited for the ceiling. A lock held past both
+  attempts finishes the member `preparation_stalled` within two budgets. The
+  single and the grouped route both classify the server's 57014 (or a 55P03
+  from a shorter session `lock_timeout`) as the member's own deadline, never
+  as a `storage_error` receipt or an uncharged `database_contention` release.
+  The bound reaches raw statements only: `readPageSnapshot` and the import
+  pipeline bypass `executeRaw`, so a lock arriving mid-preparation on one of
+  those still waits for the lock or the ceiling (the containment of Phase 1).
+  Doctor's `persistence_session_timeouts` reports
+  `session_timeouts_not_applied` when `SHOW statement_timeout` through the
+  configured URL reads `0` while gbrain configured one, naming the role-level
+  fix.
+- **The reporter's trigger stays unproven.** The lock probe reproduces the
+  signature; it does not show what held or queued an `ACCESS EXCLUSIVE` lock
+  on the reporter's Supavisor brain (a migration's `ALTER TABLE pages`
+  queued behind a long publication during the 0.60.99 → 0.60.105 upgrade is
+  the leading candidate). The 0.1 evidence ask on #6278 (`pg_stat_activity`
+  during the stall, `SHOW statement_timeout` through the pooler, the
+  blocker's operation and kind) decides it; until then the cause-specific
+  fix covers the one class that matches every piece of the reporter's
+  evidence, and the plan's containment covers the rest.
+
 ## Phase 0.5: which request fails with `repeated_marker`
 
 Every `repeated_marker` refusal at preparation came from
@@ -164,7 +204,8 @@ UBI_OWNER=gbra59 scripts/ubicloud/ubi-runner.sh run -s standard-16 --setup scrip
   holder is still there). The cause-specific fix the plan reserves for 1.4
   is therefore a transaction-local or per-statement timeout on preparation
   reads (`set_config('statement_timeout', …, true)` inside a transaction, or
-  the cancellation the Phase 1 deadline already adds), not a pool cap.
+  the cancellation the Phase 1 deadline already adds), not a pool cap. Lane A9
+  shipped the transaction-local timeout (see "Cause" above).
 - The adoption-flood starvation is a separate 0.60.105 behaviour the plan's
   Phase 2 (fewer doomed adoptions) and GBRA-45's throughput work both shrink;
   it needs its own note on the issue because the reporter's `queued=73`
