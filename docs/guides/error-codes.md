@@ -1890,6 +1890,16 @@ Reasons: `timeout`, `live_serve`.
 
 More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-connect.md#troubleshooting)
 
+### preparation_stalled
+
+<a id="preparation_stalled"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| The write's preparation did not finish within its attempts, so the owner gave it up; a managed sync holds the file and keeps going. | A preparation that never settles would hold its worktree root forever; after the attempt limit the request is finished failed and a new sync admits a new request. | Inspect the write owner with gbrain sources writer status --source <id> --json (step and wait cause), fix what it names or upgrade gbrain, then gbrain sources retry-held <id> and the same sync. Run: gbrain sources status '{source_id}' --json | agent | `gbrain doctor --json` | 1 | no |
+
+More: [docs/guides/write-refusals.md#preparation_stalled](../../docs/guides/write-refusals.md#preparation_stalled)
+
 ### preview_changed
 
 <a id="preview_changed"></a>
