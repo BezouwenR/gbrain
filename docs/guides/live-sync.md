@@ -35,6 +35,15 @@ every 10 seconds on stderr:
 [sync] 1240/9382 processed (1200 written, 40 waived this run) · 42.1 pages/min · indexing ETA 3h13m
 ```
 
+When nothing commits for 10 seconds while a write is unfinished, the line names
+the stall instead of an ETA: the head write's step, what it waits on, and how
+long a preparation is allowed. It reads the head's claim while the pass runs, so
+it prints during a stall inside a bulk group too:
+
+```
+[sync] 1240/9382 processed · stalled 95s on origin_check (waiting on db) · allowed 2m30s
+```
+
 On Postgres the drain publishes in **bulk groups** of up to 16 page imports and
 deletes, each admitted with the cursor step that records it and published in one
 transaction. Every page still gets its own write request, receipt, attribution

@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import postgres from '#postgres';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { PersistenceConsumer } from '../../src/core/persistence/consumer.ts';
+import { PreparationDeadlineError } from '../../src/core/persistence/bounded-reads.ts';
 import { admitWrite, getWriteRequestById } from '../../src/core/persistence/journal.ts';
 import type { PreparedMutation } from '../../src/core/persistence/coordinator.ts';
 import type { WriteRequest } from '../../src/core/persistence/model.ts';
@@ -127,6 +128,34 @@ describe.skipIf(!hasDatabase())('grouped preparation deadlines (Postgres, #6278)
       } finally { release.resolve(); await consumer.stop(); }
     }), 90_000);
   }
+
+  // #6278 (plan item 1.4): a bounded read the server ended inside the budget reports the deadline itself and cuts the group like the timer.
+  test('a member whose read the server ended inside the budget is released charged, the later members uncharged, and the prefix publishes', () => withBrain(async ({ engine, config, sources }) => {
+    const rows = await admitGroup(engine, config, sources[0]!, 'server-ended', 6, 'ordered');
+    const k = 2;
+    const attempts = new Map<string, number>();
+    const consumer = new PersistenceConsumer(engine, { engine: 'postgres' }, async (_engine: unknown, row: WriteRequest): Promise<PreparedMutation> => {
+      attempts.set(row.id, (attempts.get(row.id) ?? 0) + 1);
+      if (row.id === rows[k]!.id && attempts.get(row.id) === 1) throw new PreparationDeadlineError('origin_check', '57014', Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' }));
+      return prepared(row, sources);
+    }, { hostId: config.hostId, concurrency: 1, pollMs: 50, renewalIntervalMs: 20, phaseMs: 2_000, preparationMs: 5_000,
+      preparationBudgets: { maxAttempts: 5, ceilingMs: 60_000 }, onError: () => {} });
+    try {
+      consumer.start();
+      await waitFor(async () => (await getWriteRequestById(engine, rows[k]!.id))?.blocked_reason === 'preparation_deadline', { timeoutMs: 15_000, label: `member ${k} is released` });
+      // The suffix is cut exactly as a timer deadline cuts it: released uncharged, never published ahead of k.
+      await waitFor(async () => (await stateOf(engine, rows.slice(k + 1))).every(s => s.state === 'queued' && s.reason === 'group_member_waiting'), { timeoutMs: 15_000, label: 'the suffix is released waiting' });
+      for (let i = 0; i < k; i++) await waitFor(async () => (await getWriteRequestById(engine, rows[i]!.id))?.state === 'committed', { timeoutMs: 15_000, label: `prefix member ${i} commits` });
+      // No terminal receipt was written from the raw error, and k was charged once (it may already be claimed again by now).
+      const states = await stateOf(engine, rows);
+      expect(states.every(s => s.error === null)).toBe(true);
+      expect(states[k]!.attempts).toBe(1);
+      expect(states.slice(0, k).map(s => s.state)).toEqual(['committed', 'committed']);
+      for (const row of rows) await waitFor(async () => (await getWriteRequestById(engine, row.id))?.state === 'committed', { timeoutMs: 20_000, label: `${row.slug} commits after the retry` });
+      expect(attempts.get(rows[k]!.id)).toBe(2);
+      expect((await stateOf(engine, rows)).map(s => s.attempts)).toEqual(rows.map(() => 0));
+    } finally { await consumer.stop(); }
+  }), 90_000);
 
   test('an independent batch group releases only the expired member; its siblings publish', () => withBrain(async ({ engine, config, sources }) => {
     const rows = await admitGroup(engine, config, sources[0]!, 'batch', 4, 'batch');

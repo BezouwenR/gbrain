@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { prepareManagedSyncMutation, type SyncIntent } from './sync-prepare.ts';
+import { startClaimPhase } from './claim-phase.ts';
 import { inspectUnchanged, screeningRequest, type NoopKernelWaiver } from './noop-kernel.ts';
 import { validateSyncAuthority, type SyncAuthority } from './sync-authority.ts';
 import { readSyncFile } from './sync-discovery.ts';
@@ -131,20 +132,15 @@ export async function screenWaiver(engine: BrainEngine, cursor: WaiverCursor, pe
   const intent = pending.intent;
   if (intent.kind === 'managed_sync_delete') {
     if (intent.unownedDeletion || intent.renameFrom || intent.rawHash !== null || typeof intent.path !== 'string' || typeof intent.sourcePath !== 'string') return null;
-    // The authority check runs beside the snapshot read; its refusal counts only for an entry that would be waived.
-    const [snapshot, denied] = await Promise.all([engine.readPageSnapshot(pending.slug, { sourceId: cursor.sourceId, includeDeleted: true }), authorityRefusal(engine, cursor, pending)]);
+    const snapshot = await engine.readPageSnapshot(pending.slug, { sourceId: cursor.sourceId, includeDeleted: true });
     if (!softDeletedAt(snapshot, pending)) return null;
-    if (denied) throw denied.error;
+    await validateSyncAuthority(engine, cursor.authority, pending.slug);
     return { kind: 'delete', kernel: [] };
   }
-  const [kernel, denied] = await Promise.all([unchangedSyncImport(engine, cursor, pending, config, signal), authorityRefusal(engine, cursor, pending)]);
+  const kernel = await unchangedSyncImport(engine, cursor, pending, config, signal);
   if (!kernel) return null;
-  if (denied) throw denied.error;
+  await validateSyncAuthority(engine, cursor.authority, pending.slug);
   return { kind: 'import', kernel };
-}
-
-function authorityRefusal(engine: BrainEngine, cursor: WaiverCursor, pending: WaiverEntry): Promise<{ error: unknown } | null> {
-  return validateSyncAuthority(engine, cursor.authority, pending.slug).then(() => null, (error: unknown) => ({ error }));
 }
 
 /** #5984: `GBRAIN_SYNC_WAIVE_BATCH=0` (or `sync.waive_batch=false`) waives one entry per transaction, as before. */
@@ -239,7 +235,9 @@ export async function unchangedSyncImport(engine: BrainEngine, cursor: WaiverCur
     const snapshot = await engine.readPageSnapshot(pending.slug, { sourceId: cursor.sourceId, includeDeleted: true });
     const row = screeningRequest({ source_id: cursor.sourceId, source_incarnation: cursor.incarnation, slug: pending.slug, page_id: pending.pageId,
       worktree_id: cursor.binding.worktree_id, authority: cursor.authority.writer, intent, request_id: pending.requestId });
-    const prepared = await raceSyncBudget(prepareManagedSyncMutation(engine, row, config), await syncPreparationBudgetMs(engine), signal);
+    // #6278 (1.4): the clock carries the budget, so the preparation's lock-prone reads end on the server at it (boundedReads).
+    const budgetMs = await syncPreparationBudgetMs(engine);
+    const prepared = await raceSyncBudget(prepareManagedSyncMutation(engine, row, config, startClaimPhase(Date.now(), undefined, budgetMs)), budgetMs, signal);
     if (prepared.file || prepared.target === 'skill_bundle') return null;
     const file = { root: cursor.root, path: join(cursor.root, intent.path), content: intent.content };
     const inspected = await inspectUnchanged(engine, { prepared: { ...prepared, target: 'page', file }, snapshot, sourcePath: intent.sourcePath, databaseOnly: false,

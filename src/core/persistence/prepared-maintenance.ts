@@ -1,5 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
+import { boundedReads } from './bounded-reads.ts';
 import { join } from 'node:path';
 import type { BrainEngine, FactRow } from '../engine.ts';
 import { loadConfig, type GBrainConfig } from '../config.ts';
@@ -303,8 +304,12 @@ export async function submitFactFenceAdoption(engine: BrainEngine, authority: Ma
   }
 }
 
-/** `clock` (#6278): the claim's phase clock; the adoption's await boundaries (read facts, parse, occupied rows, the page) name their step. */
-async function prepareFactFenceAdoption(engine: BrainEngine, row: WriteRequest, config: GBrainConfig, clock?: ClaimPhaseClock): Promise<PreparedMutation> {
+/**
+ * `clock` (#6278): the claim's phase clock; the adoption's await boundaries (read facts, parse, occupied rows, the page) name
+ * their step, and its preparation reads of `facts` run bounded by the remaining budget (`boundedReads`).
+ */
+async function prepareFactFenceAdoption(unbounded: BrainEngine, row: WriteRequest, config: GBrainConfig, clock?: ClaimPhaseClock): Promise<PreparedMutation> {
+  const engine = boundedReads(unbounded, clock);
   const p = row.intent!;
   const facts = p.facts as FactFenceAssignment[];
   if (p.source_incarnation !== row.source_incarnation) throw opError('source_changed', 'The fact adoption source changed.',
@@ -348,7 +353,7 @@ async function prepareFactFenceAdoption(engine: BrainEngine, row: WriteRequest, 
       { fix: receiptFix(row) });
   };
   await check(engine, false);
-  const prepared = await preparePageMutation(engine, { ...row, intent: { kind: 'managed_maintenance_page', content: p.content,
+  const prepared = await preparePageMutation(unbounded, { ...row, intent: { kind: 'managed_maintenance_page', content: p.content,
     expected_revision: p.expected_revision } }, config, undefined, undefined, { clock });
   return { ...prepared, validate: async tx => { await prepared.validate?.(tx); await check(tx, true); }, apply: async tx => {
     // Runs ahead of the page import and its canonical projection, so the

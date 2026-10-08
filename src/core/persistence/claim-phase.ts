@@ -50,12 +50,20 @@ export interface ClaimPhaseClock {
    * (a signalled statement reserves its own connection and skips the memo).
    */
   signal?: AbortSignal;
+  /**
+   * #6278: when the preparation's budget runs out (`claimedAt` plus the
+   * budget), so a read that can wait on a relation lock runs under a
+   * transaction-local `statement_timeout` of the time left (`boundedReads`).
+   * Absent with the deadlines switch off.
+   */
+  deadlineAt?: number;
 }
 /** The process that holds a claim, as the stamp records it. */
 export interface ClaimOwner { kind: string; pid: number; version: string }
 
-export function startClaimPhase(now = Date.now(), signal?: AbortSignal): ClaimPhaseClock {
-  return { phase: 'preparing', claimedAt: now, since: now, step: null, stepSince: now, waitingOn: 'unknown', ...(signal ? { signal } : {}) };
+export function startClaimPhase(now = Date.now(), signal?: AbortSignal, budgetMs?: number): ClaimPhaseClock {
+  return { phase: 'preparing', claimedAt: now, since: now, step: null, stepSince: now, waitingOn: 'unknown', ...(signal ? { signal } : {}),
+    ...(budgetMs !== undefined ? { deadlineAt: now + budgetMs } : {}) };
 }
 export function enterClaimPhase(clock: ClaimPhaseClock, phase: ClaimPhaseName, now = Date.now()): void {
   if (clock.phase === phase) return;

@@ -182,6 +182,8 @@ export interface StallProbe {
    * columns a renewal bumps, so a renewed-forever claim still reads as no progress. `claim` describes the head's claim.
    */
   fingerprint(result: SyncResult): Promise<{ key: string; stall: Omit<DrainStall, 'stalled_seconds'>; claim?: DrainClaim | null } | null>;
+  /** #6278: the source's head while a pass runs (its oldest running request, else its oldest queued one); null when nothing is unfinished. Bounded; may reject. */
+  head?(): Promise<{ head_state: string; claim: DrainClaim | null } | null>;
 }
 
 export interface DrainInput {
@@ -193,10 +195,18 @@ export interface DrainInput {
   announce?: boolean;
   /** Publication mode for the report and the start line. */
   bulk?: { enabled: boolean; reason: string | null; lanes?: number; lanesMax?: number; lanesReason?: string | null; lanesCap?: LanesCap };
-  /** Test seams: the no-progress window, the pause after a pending write and the transient backoff base. */
+  /** Test seams: the no-progress window, the pause after a pending write, the transient backoff base and the progress-line interval. */
   stallMs?: number;
   pauseMs?: number;
   backoffMs?: number;
+  progressMs?: number;
+}
+
+/** #6278: the line the drain prints while nothing commits, naming the head's step, wait cause and allowance. */
+function stallText(index: number, total: number | null, stalledMs: number, claim: DrainClaim | null, headState: string | null): string {
+  return `[sync] ${index}/${total ?? '?'} processed · stalled ${Math.round(stalledMs / 1000)}s on ${claim?.step ?? claim?.phase ?? headState ?? 'the writer head'}`
+    + `${claim?.waiting_on && claim.waiting_on !== 'unknown' ? ` (waiting on ${claim.waiting_on})` : ''}${claim?.lapsed ? ' (claim lapsed: owner missing)' : ''}`
+    + `${claim && !claim.lapsed && claim.phase === 'preparing' ? ` · allowed ${formatDuration(Math.round(claim.allowance_ms / 1000))}` : ''}`;
 }
 
 /** Re-enter `pass` until the managed cursor is done, the caller stops it, or it is blocked. */
@@ -208,18 +218,29 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
   let announcedStart = false, lastLine = 0, groups = 0, groupedPages = 0, largestGroup = 0, admittedAhead = 0;
   let lanes: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number } | null = null;
   let stall: { key: string; since: number; passes: number; claim: DrainClaim | null; stallInfo: Omit<DrainStall, 'stalled_seconds'> } | null = null;
-  let lastCommitAt = startedAt;
+  let lastCommitAt = startedAt, inPass = false, readingHead = false;
   const remaining = () => total === null ? null : Math.max(0, total - index);
+  const every = input.progressMs ?? PROGRESS_EVERY_MS;
   // #6278: the progress line prints on commits; while nothing commits, a timer names the stall instead of an ETA that assumes none.
+  // Between passes the stall comes from the probe's fingerprint; inside a pass (a grouped publish parked in preparation never
+  // returns to this loop) the timer reads the source's head claim itself, bounded, and prints nothing when nothing is unfinished.
   const stallLine = input.announce ? setInterval(() => {
-    if (!stall || Date.now() - lastCommitAt < PROGRESS_EVERY_MS || Date.now() - lastLine < PROGRESS_EVERY_MS) return;
-    lastLine = Date.now();
-    const claim = stall.claim;
-    const seconds = Math.round(Math.max(Date.now() - stall.since, claim?.step_age_ms ?? 0) / 1000);
-    serr(`[sync] ${index}/${total ?? '?'} processed · stalled ${seconds}s on ${claim?.step ?? claim?.phase ?? stall.stallInfo.head_state ?? 'the writer head'}`
-      + `${claim?.waiting_on && claim.waiting_on !== 'unknown' ? ` (waiting on ${claim.waiting_on})` : ''}${claim?.lapsed ? ' (claim lapsed: owner missing)' : ''}`
-      + `${claim && !claim.lapsed && claim.phase === 'preparing' ? ` · allowed ${formatDuration(Math.round(claim.allowance_ms / 1000))}` : ''}`);
-  }, PROGRESS_EVERY_MS) : null;
+    const tickAt = Date.now();
+    if (tickAt - lastCommitAt < every || tickAt - lastLine < every) return;
+    if (stall) {
+      lastLine = tickAt;
+      serr(stallText(index, total, Math.max(tickAt - stall.since, stall.claim?.step_age_ms ?? 0), stall.claim, stall.stallInfo.head_state));
+      return;
+    }
+    if (!inPass || !input.probe?.head || readingHead) return;
+    readingHead = true;
+    const probe = input.probe;
+    Promise.resolve().then(() => probe.head!()).then(head => {
+      if (!head || !inPass || stall || Date.now() - lastCommitAt < every || tickAt - lastLine < every) return;
+      lastLine = tickAt;
+      serr(stallText(index, total, head.claim?.step_age_ms ?? Date.now() - lastCommitAt, head.claim, head.head_state));
+    }).catch(() => undefined).finally(() => { readingHead = false; });
+  }, every) : null;
   stallLine?.unref?.();
   const onProgress: NonNullable<SyncOpts['onProgress']> = event => {
     input.onProgress?.(event);
@@ -259,7 +280,8 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
       passes++;
       let result: SyncResult;
       try {
-        result = await input.pass(signal, onProgress);
+        inPass = true;
+        try { result = await input.pass(signal, onProgress); } finally { inPass = false; }
         attempt = 0;
       } catch (error) {
         const delay = transientDelay(error, ++attempt, refreshWaitedMs, input.backoffMs ?? 250);
@@ -331,11 +353,17 @@ export function drainClaimOf(row: { head_state: string | null; head_claim_phase:
   const waiting = own ? stamp!.waiting_on : null;
   return { phase, step: own && typeof stamp!.step === 'string' ? stamp!.step : null,
     waiting_on: typeof waiting === 'string' && ['git', 'fs', 'db', 'pool', 'unknown'].includes(waiting) ? waiting as DrainClaim['waiting_on'] : own ? 'unknown' : null,
-    step_age_ms: own ? age(stamp!.since) : null, claim_age_ms: own ? age(stamp!.claimed_at) : null, lapsed: row.head_lapsed === true,
-    owner_pid: own && typeof stamp!.pid === 'number' ? stamp!.pid : null,
+    step_age_ms: own ? age(stamp!.step_since ?? stamp!.since) : null, claim_age_ms: own ? age(stamp!.claimed_at) : null, lapsed: row.head_lapsed === true,
+    owner_pid: own ? ownerPid(stamp!) : null,
     allowance_ms: Math.min(budgets.ceilingMs + STALL_GRACE_MS, budget + STALL_GRACE_MS) };
 }
 function safeJson(text: string): unknown { try { return JSON.parse(text); } catch { return null; } }
+/** The stamp stores the owner as `owner: { kind, pid, version }` (claim-phase.ts); a top-level `pid` is the pre-release shape test fixtures used. */
+function ownerPid(stamp: Record<string, unknown>): number | null {
+  const owner = stamp.owner && typeof stamp.owner === 'object' ? stamp.owner as Record<string, unknown> : null;
+  const pid = owner && typeof owner.pid === 'number' ? owner.pid : stamp.pid;
+  return typeof pid === 'number' ? pid : null;
+}
 /** The preparation budgets the drain's allowance reads (Lane A defines and validates the keys; defaults are the documented ones). */
 async function readPreparationBudgets(engine: Pick<BrainEngine, 'getConfig'>): Promise<{ syncMs: number; maintenanceMs: number; ceilingMs: number }> {
   const read = async (key: string, fallback: number) => { const n = Number((await engine.getConfig(key).catch(() => null))?.trim()); return Number.isInteger(n) && n > 0 ? n : fallback; };
@@ -343,8 +371,11 @@ async function readPreparationBudgets(engine: Pick<BrainEngine, 'getConfig'>): P
     ceilingMs: await read('persistence.preparation_ceiling_ms', PREPARATION_CEILING_DEFAULT_MS) };
 }
 
-/** Engine-backed stall checks: the awaited request, the oldest unfinished request on its worktree, and claimability here. */
-export function engineStallProbe(engine: BrainEngine): StallProbe {
+/** The live head read's bound: the ticker must not hang on the lock that stalls the pass it reports on. */
+const HEAD_READ_TIMEOUT_MS = 2_000;
+
+/** Engine-backed stall checks: the awaited request, the oldest unfinished request on its worktree, and claimability here; with `sourceId`, the live head read. */
+export function engineStallProbe(engine: BrainEngine, sourceId?: string): StallProbe {
   const read = async (result: SyncResult) => {
     const requestId = result.managedWrite?.write_request.request_id;
     if (!requestId) return null;
@@ -387,6 +418,17 @@ export function engineStallProbe(engine: BrainEngine): StallProbe {
       return { key: [row.state, row.blocked_reason, row.head_id, row.head_state, claim?.phase ?? '', claim?.step ?? '', stamp?.since ?? '', row.head_lapsed ? 'lapsed' : ''].join('|'),
         stall: await describe(found.requestId, row), claim };
     },
+    ...(sourceId ? { async head() {
+      const [row] = await engine.executeRaw<{ head_state: string; head_claim_phase: unknown; head_token: string | null; head_lapsed: boolean | null; head_kind: string | null }>(
+        `SELECT h.state AS head_state, h.claim_phase AS head_claim_phase, h.execution_token::text AS head_token,
+           (h.claim_expires_at IS NOT NULL AND h.claim_expires_at < now()) AS head_lapsed, h.intent->>'kind' AS head_kind
+         FROM persistence_source_bindings b
+         JOIN sources s ON s.id = b.source_id AND s.incarnation = b.source_incarnation
+         JOIN LATERAL (SELECT e.state, e.claim_phase, e.execution_token, e.claim_expires_at, e.intent FROM persistence_requests e
+           WHERE e.worktree_id = b.worktree_id AND e.state IN ('queued','running','recovering') ORDER BY (e.state <> 'running'), e.sequence LIMIT 1) h ON true
+         WHERE b.source_id = $1`, [sourceId], { timeoutMs: HEAD_READ_TIMEOUT_MS, signal: AbortSignal.timeout(HEAD_READ_TIMEOUT_MS + 500) });
+      return row ? { head_state: row.head_state, claim: drainClaimOf(row, await (budgets ??= readPreparationBudgets(engine))) } : null;
+    } } : {}),
   };
 }
 
@@ -397,12 +439,15 @@ export async function drainManagedSync(engine: BrainEngine, opts: SyncOpts, anno
   const drainStartedAt = opts.drainStartedAt ?? Date.now();
   const { preparationConfigView } = await import('./config-snapshot.ts');
   const bulk = await resolveBulkSettings(await preparationConfigView(engine), opts.noBulk, opts.lanes);
+  // #5984 G3: open the pool's connections while the run's startup reads go one at a time, so the waiver screen and
+  // the first group do not wait for connection setup.
+  if (bulk.enabled) void Promise.all(Array.from({ length: Math.min(8, (bulk.lanes ?? 1) + 2) }, () => engine.executeRaw('SELECT 1').catch(() => undefined)));
   // #5984 lanes: one lane run per drain; its groups carry the id and this process claims them out of FIFO order.
   const laneRun = bulk.enabled && (bulk.lanes ?? 1) > 1 ? randomUUID() : undefined;
   const { closeLaneRun } = await import('./sync-lanes.ts');
   let result: SyncResult | undefined;
   try {
-    result = await runDrain({ signal: opts.signal, onProgress: opts.onProgress, probe: engineStallProbe(engine), announce,
+    result = await runDrain({ signal: opts.signal, onProgress: opts.onProgress, probe: engineStallProbe(engine, opts.sourceId), announce,
       bulk: { enabled: bulk.enabled, reason: bulk.reason, lanes: bulk.lanes ?? 1, lanesMax: bulk.lanesMax, lanesReason: bulk.lanesReason ?? null, lanesCap: bulk.lanesCap },
       pass: (signal, onProgress) => performManagedSync(engine, { ...opts, signal, onProgress, drainStartedAt, ...(bulk.enabled ? { bulk: { ...bulk, laneRun } } : {}) }) });
   } finally {

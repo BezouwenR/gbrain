@@ -833,6 +833,17 @@
           "status": "ok"
         },
         {
+          "category": "ops",
+          "details": {
+            "applied": "5min",
+            "configured": "5min",
+            "docs": "docs/guides/troubleshooting.md#session-timeouts-not-applied"
+          },
+          "message": "The session statement_timeout (5min) reaches the server.",
+          "name": "persistence_session_timeouts",
+          "status": "ok"
+        },
+        {
           "category": "brain",
           "details": {
             "docs": "docs/guides/repair.md#connector-held-items",

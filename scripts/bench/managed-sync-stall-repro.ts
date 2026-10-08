@@ -119,6 +119,13 @@ const CHAOS_FOR_MS = Number(flag('chaos-for', '0')) * 1000;
 const CHAOS_STREAM = flag('chaos-stream', 'downstream');
 /** `--chaos-kind lock`: instead of a toxic, one connection through the pooler opens a transaction, runs `--chaos-lock` and holds it (a leaked or pending table lock behind a pooler that dropped statement_timeout). */
 const CHAOS_LOCK = flag('chaos-lock', 'LOCK TABLE pages IN ACCESS EXCLUSIVE MODE');
+/** Phase 4.1: `--chaos-repeat N` holds the lock N times (default once), `--chaos-gap <seconds>` apart, so the second hold lands on a run that already recovered once. */
+const CHAOS_REPEAT = Number(flag('chaos-repeat', '1'));
+const CHAOS_GAP_MS = Number(flag('chaos-gap', '300')) * 1000;
+/** Phase 4.1: `--fence-repair-at <minutes>` (0 = off) runs `gbrain dream --phase fence_repair` once, that many minutes into pass 1, and records its verification block (`fence-repair.json`). */
+const FENCE_REPAIR_AT_MS = Number(flag('fence-repair-at', '0')) * 60_000;
+/** Phase 4.1: `--retry-held-after` runs `gbrain sources retry-held` plus the sync it prints once the passes end, and records what the held files did (`retry-held.json`). */
+const RETRY_HELD_AFTER = process.argv.includes('--retry-held-after');
 const LABEL = flag('label', `${gitDescribe(CLI_REPO)}-pool${POOL_SIZE}-${POOLER}`).replace(/[^\w.-]/g, '_');
 const OUT = resolve(flag('out', join(REPO, '.context', 'bench', `stall-repro-${LABEL}-${Date.now()}`)));
 if (POOLER !== 'pgbouncer' && POOLER !== 'none') { console.error(`--pooler takes pgbouncer or none; got ${POOLER}`); process.exit(2); }
@@ -434,6 +441,36 @@ async function sampler(row: Row, stop: () => boolean): Promise<void> {
 
 function safeJson(text: string): unknown { try { return JSON.parse(text); } catch { return text; } }
 
+/** Phase 4.1 (G2): every `preparing` blocker the deep samples saw in writer status, and how the overdue ones were named (`claim.stall` with a step, or only `diagnostic.reason`). */
+function preparingClaimsObserved(): Record<string, unknown> {
+  if (!existsSync(join(OUT, 'samples.jsonl'))) return { samples: 0 };
+  let observed = 0, overdue = 0, overdueWithStallStep = 0, overdueCauseUnknown = 0, overdueStallMissing = 0, maxPhaseAgeMs = 0, maxStepAgeMs = 0;
+  const steps = new Map<string, number>(), waiting = new Map<string, number>(), reasons = new Map<string, number>();
+  for (const line of readFileSync(join(OUT, 'samples.jsonl'), 'utf8').split('\n')) {
+    if (!line) continue;
+    let sample: Record<string, unknown>; try { sample = JSON.parse(line); } catch { continue; }
+    const blockers = ((sample.writer_status as { blockers?: Array<Record<string, unknown>> } | undefined)?.blockers) ?? [];
+    for (const b of blockers) {
+      const claim = b.claim as { phase?: string; phase_age_ms?: number | null; step?: string | null; step_age_ms?: number | null; waiting_on?: string; budget_ms?: number; stall?: { reason?: string; step?: string | null } | null } | undefined;
+      if (!claim || claim.phase !== 'preparing' || b.state !== 'running') continue;
+      observed++;
+      const reason = (b.diagnostic as { reason?: string } | undefined)?.reason ?? 'none';
+      reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+      if (claim.step) steps.set(claim.step, (steps.get(claim.step) ?? 0) + 1);
+      if (claim.waiting_on) waiting.set(claim.waiting_on, (waiting.get(claim.waiting_on) ?? 0) + 1);
+      maxPhaseAgeMs = Math.max(maxPhaseAgeMs, Number(claim.phase_age_ms ?? 0)); maxStepAgeMs = Math.max(maxStepAgeMs, Number(claim.step_age_ms ?? 0));
+      if (claim.budget_ms && Number(claim.phase_age_ms ?? 0) >= claim.budget_ms) {
+        overdue++;
+        if (claim.stall?.reason === 'preparation_overdue' && claim.stall.step) overdueWithStallStep++; else overdueStallMissing++;
+        if (reason === 'cause_unknown') overdueCauseUnknown++;
+      }
+    }
+  }
+  return { preparing_blockers_observed: observed, overdue, overdue_with_claim_stall_and_step: overdueWithStallStep, overdue_without_claim_stall_or_step: overdueStallMissing,
+    overdue_with_diagnostic_cause_unknown: overdueCauseUnknown, max_phase_age_ms: maxPhaseAgeMs, max_step_age_ms: maxStepAgeMs,
+    steps: Object.fromEntries(steps), waiting_on: Object.fromEntries(waiting), diagnostic_reasons: Object.fromEntries(reasons) };
+}
+
 function summarizeActivity(activity: unknown): unknown {
   if (!Array.isArray(activity)) return activity;
   return (activity as Array<Record<string, unknown>>).map(a => `${a.pid} ${a.application_name} ${a.state} ${a.wait_event_type ?? '-'}/${a.wait_event ?? '-'} xact=${a.xact_age_ms}ms q=${a.query_age_ms}ms blocked_by=${JSON.stringify(a.blocked_by)} :: ${String(a.query).slice(0, 120)}`);
@@ -465,7 +502,8 @@ async function adoptionLoop(row: Row, legacy: LegacyRow[], stop: () => boolean):
     const warnings = ((details.warnings as string[] | undefined) ?? (xf?.warnings as string[] | undefined) ?? []);
     const record = { i, t: Date.now(), at: new Date().toISOString(), code: r.code, wall_ms: round1(r.wallMs), dripped, status: xf?.status ?? null, summary: xf?.summary ?? null,
       unfenced_rows_fenced: details.unfencedRowsFenced ?? null, legacy_rows_pending: details.legacyRowsPending ?? null, pages_failed: details.pagesFailed ?? null,
-      fence_failed: warnings.filter(w => w.startsWith('FACTS_FENCE_FAILED')).length, warnings_sample: warnings.slice(0, 12), stderr_tail: r.stderr.slice(-1200), ...(r.json ? {} : { stdout_tail: r.stdout.slice(-1200) }) };
+      fence_failed: warnings.filter(w => w.startsWith('FACTS_FENCE_FAILED')).length, warnings_sample: warnings.slice(0, 12), stderr_tail: r.stderr.slice(-1200),
+      ...(r.json ? xf ? {} : { json_head: JSON.stringify(r.json).slice(0, 800) } : { stdout_tail: r.stdout.slice(-1200) }) };
     append('adoption.jsonl', record);
     log(`adoption ${i}: exit=${r.code} dripped=${dripped} status=${record.status} fenced=${record.unfenced_rows_fenced} pending=${record.legacy_rows_pending} fence_failed=${record.fence_failed} ${round1(r.wallMs / 1000)}s`);
     const until = Date.now() + ADOPTION_INTERVAL_MS;
@@ -480,23 +518,26 @@ async function chaos(stop: () => boolean): Promise<void> {
   while (!stop() && !(state.pass && state.pass.pass === 1 && Date.now() - state.pass.startedAt >= CHAOS_AT_MS)) await Bun.sleep(1000);
   if (stop()) return;
   if (CHAOS_KIND === 'lock') {
-    const via = chaosRow!.poolerUrl ?? chaosRow!.proxyUrl;
-    const sql = postgres(via, { max: 1, onnotice: () => {}, prepare: false, connect_timeout: 20 });
-    let release!: () => void;
-    const held = new Promise<void>(resolve => { release = resolve; });
-    const holder = sql.begin(async tx => {
-      await tx.unsafe(CHAOS_LOCK);
-      append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'lock_held', statement: CHAOS_LOCK, via: 'pooler', pass: state.pass?.pass ?? null, committed: state.committed });
-      log(`CHAOS: holding "${CHAOS_LOCK}" in an open transaction through the pooler${CHAOS_FOR_MS > 0 ? ` for ${CHAOS_FOR_MS / 1000} s` : ' for the rest of the run'}`);
-      await held;
-    }).catch(error => { append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'lock_error', error: String(error) }); log(`CHAOS: lock holder failed: ${error instanceof Error ? error.message : String(error)}`); });
-    const until = CHAOS_FOR_MS > 0 ? Date.now() + CHAOS_FOR_MS : Infinity;
-    while (!stop() && Date.now() < until) await Bun.sleep(1000);
-    release();
-    await holder;
-    await sql.end({ timeout: 5 }).catch(() => undefined);
-    append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'lock_released', committed: state.committed });
-    log('CHAOS: lock released');
+    for (let episode = 1; episode <= Math.max(1, CHAOS_REPEAT) && !stop(); episode++) {
+      if (episode > 1) { const gapUntil = Date.now() + CHAOS_GAP_MS; while (!stop() && Date.now() < gapUntil) await Bun.sleep(1000); if (stop()) return; }
+      const via = chaosRow!.poolerUrl ?? chaosRow!.proxyUrl;
+      const sql = postgres(via, { max: 1, onnotice: () => {}, prepare: false, connect_timeout: 20 });
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      const holder = sql.begin(async tx => {
+        await tx.unsafe(CHAOS_LOCK);
+        append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'lock_held', episode, statement: CHAOS_LOCK, via: 'pooler', pass: state.pass?.pass ?? null, committed: state.committed });
+        log(`CHAOS ${episode}/${CHAOS_REPEAT}: holding "${CHAOS_LOCK}" in an open transaction through the pooler${CHAOS_FOR_MS > 0 ? ` for ${CHAOS_FOR_MS / 1000} s` : ' for the rest of the run'}`);
+        await held;
+      }).catch(error => { append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'lock_error', episode, error: String(error) }); log(`CHAOS: lock holder failed: ${error instanceof Error ? error.message : String(error)}`); });
+      const until = CHAOS_FOR_MS > 0 ? Date.now() + CHAOS_FOR_MS : Infinity;
+      while (!stop() && Date.now() < until) await Bun.sleep(1000);
+      release();
+      await holder;
+      await sql.end({ timeout: 5 }).catch(() => undefined);
+      append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'lock_released', episode, pass: state.pass?.pass ?? null, committed: state.committed });
+      log(`CHAOS ${episode}/${CHAOS_REPEAT}: lock released`);
+    }
     return;
   }
   const api = `http://127.0.0.1:${flag('api-port', '58474')}/proxies/pg-${flag('proxy-port', '55433')}/toxics`;
@@ -513,6 +554,99 @@ async function chaos(stop: () => boolean): Promise<void> {
   const d = await fetch(`${api}/${toxic.name}`, { method: 'DELETE' });
   append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'remove', name: toxic.name, ok: d.ok, committed: state.committed });
   log(`CHAOS: toxic removed ok=${d.ok}`);
+}
+
+/** Phase 4.1 (plan 4.1, G4 evidence): one `fence_repair` phase run while pass 1 is draining; its verification block is the record. */
+async function fenceRepairOnce(row: Row, stop: () => boolean): Promise<void> {
+  if (FENCE_REPAIR_AT_MS <= 0) return;
+  while (!stop() && !(state.pass && state.pass.pass === 1 && Date.now() - state.pass.startedAt >= FENCE_REPAIR_AT_MS)) await Bun.sleep(1000);
+  if (stop()) return;
+  const t = Date.now();
+  log('fence_repair: running gbrain dream --phase fence_repair during pass 1');
+  const r = await runCli(row.home, ['dream', '--phase', 'fence_repair', '--source', SOURCE, '--json'], { GBRAIN_SQL_TRACE: row.trace, GBRAIN_SQL_TRACE_LABEL: 'fence-repair' }, 20 * 60_000);
+  const phases = (r.json?.phases as Array<Record<string, unknown>> | undefined) ?? (r.json?.phase_results as Array<Record<string, unknown>> | undefined) ?? [];
+  const phase = phases.find(p => p.phase === 'fence_repair') ?? null;
+  const record = { t, at: new Date(t).toISOString(), pass: state.pass?.pass ?? null, committed_at_start: state.committed, code: r.code, wall_ms: round1(r.wallMs), phase,
+    stderr_tail: r.stderr.slice(-2000), ...(r.json ? {} : { stdout_tail: r.stdout.slice(-2000) }) };
+  writeFileSync(join(OUT, 'fence-repair.json'), JSON.stringify(record, null, 2) + '\n');
+  log(`fence_repair: exit=${r.code} status=${phase?.status ?? '?'} ${round1(r.wallMs / 1000)}s: ${String(phase?.summary ?? '').slice(0, 300)}`);
+}
+
+/** Holds by code and reason, from the hold records themselves (the status listing is bounded). */
+async function holdSummary(row: Row): Promise<Record<string, unknown>> {
+  return admin(row.directUrl, async sql => {
+    const rows = await sql.unsafe(`${BENCH_SQL} SELECT completed_keys->0->>'code' AS code, completed_keys->0->'meta'->>'reason' AS reason,
+        completed_keys->0->'meta'->'stall'->>'step' AS step, count(*)::int AS n
+      FROM op_checkpoints WHERE op='sync-hold' AND completed_keys->0->>'source_id'=$1 GROUP BY 1,2,3 ORDER BY n DESC`, [SOURCE]);
+    const summary = await sql.unsafe(`${BENCH_SQL} SELECT completed_keys->0 AS record FROM op_checkpoints WHERE op='sync-hold-summary' AND fingerprint LIKE $1`, [`${SOURCE}:%`]);
+    const paths = await sql.unsafe(`${BENCH_SQL} SELECT completed_keys->0->>'path' AS path, completed_keys->0->>'code' AS code, completed_keys->0->'meta'->>'reason' AS reason
+      FROM op_checkpoints WHERE op='sync-hold' AND completed_keys->0->>'source_id'=$1 ORDER BY 1 LIMIT 200`, [SOURCE]);
+    return { by_code_reason: rows, summary: summary[0]?.record ?? null, paths };
+  });
+}
+
+/** After each pass: `sources status --json`, `writer status --json` and the hold records, so holds and stalled receipts are known per pass. */
+async function postPass(row: Row, pass: number): Promise<Record<string, unknown>> {
+  const status = await runCli(row.home, ['sources', 'status', SOURCE, '--json'], { GBRAIN_SQL_TRACE: row.trace, GBRAIN_SQL_TRACE_LABEL: 'sources-status' }, 120_000);
+  const writer = await runCli(row.home, ['sources', 'writer', 'status', '--json'], { GBRAIN_SQL_TRACE: row.trace, GBRAIN_SQL_TRACE_LABEL: 'writer-status' }, 120_000);
+  const holds = await holdSummary(row).catch(e => ({ error: String(e) }));
+  const stalled = await admin(row.directUrl, sql => sql.unsafe(`${BENCH_SQL} SELECT request_id, operation, intent->>'kind' AS kind, slug, state, error_code, blocked_reason, preparation_attempts,
+      left(error_message, 300) AS error_message, completed_at FROM persistence_requests WHERE error_code='preparation_stalled' OR blocked_reason IN ('preparation_deadline','preparation_stalled') ORDER BY sequence`)).catch(e => [{ error: String(e) }]);
+  const attempts = await admin(row.directUrl, sql => sql.unsafe(`${BENCH_SQL} SELECT preparation_attempts, state, count(*)::int AS n FROM persistence_requests WHERE preparation_attempts > 0 GROUP BY 1,2 ORDER BY 1,2`)).catch(e => [{ error: String(e) }]);
+  const record = { pass, at: new Date().toISOString(), sources_status: status.json ?? { exit: status.code, stdout: status.stdout.slice(-3000), stderr: status.stderr.slice(-2000) },
+    writer_status: writer.json ?? { exit: writer.code, stdout: writer.stdout.slice(-3000), stderr: writer.stderr.slice(-2000) }, holds, preparation_stalled_receipts: stalled, preparation_attempts: attempts };
+  writeFileSync(join(OUT, `post-pass-${pass}.json`), JSON.stringify(record, null, 2) + '\n');
+  const byCode = Array.isArray((holds as { by_code_reason?: unknown[] }).by_code_reason) ? (holds as { by_code_reason: Array<Record<string, unknown>> }).by_code_reason : [];
+  log(`post-pass ${pass}: holds=[${byCode.map(h => `${h.code}/${h.reason ?? '-'}${h.step ? '@' + h.step : ''}:${h.n}`).join(', ')}] stalled_receipts=${Array.isArray(stalled) ? stalled.length : '?'}`);
+  return { holds_by_code_reason: byCode, stalled_receipts: Array.isArray(stalled) ? stalled.length : null };
+}
+
+/** The managed drain's closing lines and the `stalled <N>s on <step>` progress lines of a pass. */
+function passLines(pass: number): Record<string, unknown> {
+  const stdout = readFileSync(join(OUT, `pass-${pass}.stdout`), 'utf8');
+  const stderr = readFileSync(join(OUT, `pass-${pass}.stderr`), 'utf8');
+  const lines = (stdout + '\n' + stderr).split('\n');
+  const drain = lines.filter(l => /Managed sync (synced|resumable|blocked)|^\s*(Next|Why|Oldest unfinished request):|Oldest unfinished request/.test(l)).slice(0, 12);
+  const stalled = lines.filter(l => /stalled \d+s on /.test(l));
+  const steps = new Map<string, { n: number; max_s: number }>();
+  for (const l of stalled) { const m = l.match(/stalled (\d+)s on (\S+)/); if (!m) continue; const e = steps.get(m[2]!) ?? { n: 0, max_s: 0 }; e.n++; e.max_s = Math.max(e.max_s, Number(m[1])); steps.set(m[2]!, e); }
+  const outcome = (stdout + stderr).match(/Managed sync (synced|resumable|blocked)/)?.[1] ?? null;
+  const sync_deadline_stop = /sync_deadline_stop/.test(stdout + stderr);
+  return { outcome, sync_deadline_stop, drain_lines: drain, stalled_progress_lines: stalled.length, stalled_by_step: Object.fromEntries(steps), stalled_sample: stalled.slice(0, 3).concat(stalled.length > 3 ? stalled.slice(-2) : []),
+    persistence_lines: lines.filter(l => l.includes('[persistence]')).slice(0, 40), restart_required: /restart_required/.test(stdout + stderr) };
+}
+
+/** Phase 4.1: what each seeded legacy row did (adopted under its id with its row number, or still pending), by shape; the drip's control rows are their own class. */
+async function legacyOutcome(row: Row, legacy: LegacyRow[]): Promise<Record<string, unknown>> {
+  const norm = (s: string) => s.replace(/\r\n?/g, '\n').trim();
+  const byFact = new Map<string, string>(), byNorm = new Map<string, string>();
+  for (const r of legacy) { byFact.set(r.fact, r.shape); if (!byNorm.has(norm(r.fact))) byNorm.set(norm(r.fact), r.shape); }
+  const rows = await admin(row.directUrl, sql => sql.unsafe<Array<{ fact: string; row_num: number | null; expired_at: string | null }>>(
+    `${BENCH_SQL} SELECT fact, row_num, expired_at FROM facts WHERE source_id=$1 AND source='mcp:remember'`, [SOURCE]));
+  const out: Record<string, { adopted: number; pending: number; expired: number }> = {};
+  for (const r of rows) {
+    const shape = byFact.get(r.fact) ?? byNorm.get(norm(r.fact)) ?? (/Legacy fact 1\d{5} /.test(r.fact) ? 'drip_control' : 'unmatched');
+    const e = out[shape] ?? (out[shape] = { adopted: 0, pending: 0, expired: 0 });
+    if (r.expired_at) e.expired++; else if (r.row_num !== null) e.adopted++; else e.pending++;
+  }
+  return out;
+}
+
+/** Phase 4.1: `gbrain sources retry-held` and the sync it prints, with the holds before and after. */
+async function retryHeldAfter(row: Row): Promise<Record<string, unknown>> {
+  const before = await holdSummary(row).catch(e => ({ error: String(e) }));
+  const retry = await runCli(row.home, ['sources', 'retry-held', SOURCE, '--json'], { GBRAIN_SQL_TRACE: row.trace, GBRAIN_SQL_TRACE_LABEL: 'retry-held' }, 120_000);
+  const fix = (retry.json?.fix as { argv?: string[] } | undefined)?.argv ?? null;
+  const argv = fix && fix[0] === 'gbrain' ? fix.slice(1) : null;
+  log(`retry-held: exit=${retry.code} scheduled=${retry.json?.scheduled ?? '?'} fix=${argv ? argv.join(' ') : '(none)'}`);
+  const sync = argv ? await runCli(row.home, argv, { GBRAIN_SQL_TRACE: row.trace, GBRAIN_SQL_TRACE_LABEL: 'retry-sync' }, 60 * 60_000) : null;
+  if (sync) log(`retry-held sync: exit=${sync.code} in ${round1(sync.wallMs / 1000)} s; tail: ${(sync.stdout + sync.stderr).slice(-300).replace(/\n/g, ' | ')}`);
+  const after = await holdSummary(row).catch(e => ({ error: String(e) }));
+  const record = { at: new Date().toISOString(), holds_before: before, retry: retry.json ?? { exit: retry.code, stdout: retry.stdout.slice(-3000), stderr: retry.stderr.slice(-2000) }, sync_argv: argv,
+    sync: sync ? { code: sync.code, wall_ms: round1(sync.wallMs), stdout_tail: sync.stdout.slice(-3000), stderr_tail: sync.stderr.slice(-3000) } : null, holds_after: after,
+    committed_after: await committedCount(row) };
+  writeFileSync(join(OUT, 'retry-held.json'), JSON.stringify(record, null, 2) + '\n');
+  return { scheduled: retry.json?.scheduled ?? null, sync_argv: argv, sync_code: sync?.code ?? null, holds_before: (before as { by_code_reason?: unknown }).by_code_reason ?? before, holds_after: (after as { by_code_reason?: unknown }).by_code_reason ?? after };
 }
 
 async function committedCount(row: Row): Promise<number> {
@@ -592,23 +726,30 @@ try {
   save();
   const stop = () => stopped;
   chaosRow = row;
-  const background = Promise.allSettled([sampler(row, stop), adoptionLoop(row, built.legacy, stop), chaos(stop)]);
+  const background = Promise.allSettled([sampler(row, stop), adoptionLoop(row, built.legacy, stop), chaos(stop), fenceRepairOnce(row, stop)]);
   const passes: SyncPass[] = [];
+  const passExtras = new Map<number, Record<string, unknown>>();
   const started = Date.now();
   for (let pass = 1; pass <= PASSES && Date.now() - started < MAX_MS; pass++) {
     const result = await syncPass(row, pass);
     passes.push(result);
     const status = statusOf(pass);
     log(`pass ${pass} status: ${status}`);
+    passExtras.set(pass, { ...passLines(pass), ...await postPass(row, pass).catch(e => ({ post_pass_error: String(e) })) });
     report.passes = passes.map(p => ({ ...p, status: statusOf(p.pass), wall_s: p.endedAt ? round1((p.endedAt - p.startedAt) / 1000) : null,
       pages_per_min: p.endedAt && p.committedAtEnd !== undefined ? round1((p.committedAtEnd - p.committedAtStart) / ((p.endedAt - p.startedAt) / 60_000)) : null,
-      time_to_stall_s: p.stallAt ? round1((p.stallAt - p.startedAt) / 1000) : null }));
+      time_to_stall_s: p.stallAt ? round1((p.stallAt - p.startedAt) / 1000) : null, ...passExtras.get(p.pass) }));
     save();
     if (status && ['synced', 'up_to_date', 'up to date', 'first_sync'].includes(status)) break;
     await Bun.sleep(5000);
   }
   stopped = true;
   await background;
+  if (RETRY_HELD_AFTER) report.retry_held = await retryHeldAfter(row).catch(e => ({ error: String(e) }));
+  const doctorFences = await runCli(row.home, ['doctor', '--only', 'fence_integrity', '--json'], { GBRAIN_SQL_TRACE: row.trace, GBRAIN_SQL_TRACE_LABEL: 'doctor' }, 10 * 60_000);
+  writeFileSync(join(OUT, 'doctor-fence-integrity.json'), (doctorFences.json ? JSON.stringify(doctorFences.json, null, 2) : JSON.stringify({ exit: doctorFences.code, stdout: doctorFences.stdout, stderr: doctorFences.stderr }, null, 2)) + '\n');
+  report.legacy_outcome = await legacyOutcome(row, built.legacy).catch(e => ({ error: String(e) }));
+  report.fence_repair = existsSync(join(OUT, 'fence-repair.json')) ? JSON.parse(readFileSync(join(OUT, 'fence-repair.json'), 'utf8')) : null;
   const final = await sampleOnce(row, true);
   const failed = (final.failed as Array<Record<string, unknown>> | undefined) ?? [];
   const failedAll = await admin(row.directUrl, sql => sql.unsafe(`${BENCH_SQL} SELECT operation, intent->>'kind' AS kind, error_code, state,
@@ -617,7 +758,14 @@ try {
   const adoption = existsSync(join(OUT, 'adoption.jsonl')) ? readFileSync(join(OUT, 'adoption.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
   const chaosEvents = existsSync(join(OUT, 'chaos.jsonl')) ? readFileSync(join(OUT, 'chaos.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
   const stallDebug = existsSync(join(OUT, 'stall-debug.jsonl')) ? readFileSync(join(OUT, 'stall-debug.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
+  const doctorChecks = (doctorFences.json?.checks as Array<Record<string, unknown>> | undefined) ?? [];
+  const fenceCheck = doctorChecks.find(c => c.name === 'fence_integrity' || c.check === 'fence_integrity' || c.id === 'fence_integrity') ?? doctorChecks[0] ?? null;
+  const unrenderable = ((fenceCheck?.details ?? fenceCheck?.data ?? fenceCheck ?? {}) as Record<string, unknown>).unrenderable_legacy_facts as { total?: number; complete?: boolean; pages?: Array<{ slug: string; rows: Array<{ class: string; reason: string }> }> } | undefined;
   report.result = { committed_sync_requests: state.committed, chaos: chaosEvents, stall_debug_last: stallDebug.at(-1) ?? null, backlog_entries: backlogPages.length, states: final.states, stalls: state.stalls,
+    preparing_claims_observed: preparingClaimsObserved(),
+    doctor_fence_integrity: { exit: doctorFences.code, status: fenceCheck?.status ?? null, unrenderable_total: unrenderable?.total ?? null, unrenderable_complete: unrenderable?.complete ?? null,
+      unrenderable_by_class: Object.fromEntries([...(unrenderable?.pages ?? []).flatMap(p => p.rows).reduce((m, r) => m.set(`${r.class}/${r.reason}`, (m.get(`${r.class}/${r.reason}`) ?? 0) + 1), new Map<string, number>())]),
+      unrenderable_pages: (unrenderable?.pages ?? []).length },
     failed_receipts_by_kind_and_error: failedAll, failed_receipts_recent: failed, holds: final.holds, samples: state.samples,
     adoption_runs: adoption.length, adoption_summary: adoption.map((a: Record<string, unknown>) => ({ i: a.i, status: a.status, dripped: a.dripped, fenced: a.unfenced_rows_fenced, pending: a.legacy_rows_pending, fence_failed: a.fence_failed, code: a.code })),
     legacy_pending_at_end: await admin(row.directUrl, async sql => Number((await sql.unsafe(`SELECT count(*)::int AS n FROM facts WHERE source_id=$1 AND row_num IS NULL AND expired_at IS NULL`, [SOURCE]))[0]!.n)) };

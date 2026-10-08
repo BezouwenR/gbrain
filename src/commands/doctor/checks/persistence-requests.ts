@@ -5,6 +5,7 @@ import { oneYearCapacity, readJournalLimits, journalLimitKey } from '../../../co
 import { claimStall, claimStateOf, MAX_CLAIM_CONFIG_KEY, readMaxClaimMs } from '../../../core/persistence/claim-phase.ts';
 import { preparationBudgetMs } from '../../../core/persistence/preparation-budget.ts';
 import { readPreparationPolicy } from '../../../core/persistence/switches.ts';
+import { resolveSessionTimeouts } from '../../../core/db.ts';
 import { agentFix, checkError } from '../check-fix.ts';
 
 const WINDOW_DAYS = 7;
@@ -151,5 +152,37 @@ export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
         'Read-only: shows the owner, the stuck request\'s claim phase and every write waiting behind it on that root.', 'persistence_write_stall', { docs }) };
   } catch (error) {
     return checkError('persistence_write_stall', 'inspect running write requests', error, { details: { health: 'unknown', docs } });
+  }
+}
+
+/**
+ * #6278 (plan item 1.4): whether the session timeouts gbrain configures as
+ * connection startup parameters (`GBRAIN_STATEMENT_TIMEOUT`, default 5min)
+ * actually reach the server through the configured URL. A transaction-mode
+ * pooler (PgBouncer, Supavisor) drops or ignores startup parameters, so `SHOW
+ * statement_timeout` through the pool reads `0`: statements outside a
+ * transaction then have no server-side bound. Preparation reads carry their
+ * own transaction-local bound (bounded-reads.ts), so this is a warning about
+ * every other autocommit statement, not a stall by itself.
+ */
+export async function sessionTimeoutsCheck(engine: BrainEngine): Promise<Check> {
+  const docs = 'docs/guides/troubleshooting.md#session-timeouts-not-applied';
+  const configured = resolveSessionTimeouts().statement_timeout ?? null;
+  if (engine.kind !== 'postgres' || configured === null) {
+    return { name: 'persistence_session_timeouts', status: 'ok', details: { configured, applied: null, docs },
+      message: configured === null ? 'No session statement_timeout is configured (GBRAIN_STATEMENT_TIMEOUT=0).' : 'PGLite has no session to time out.' };
+  }
+  try {
+    const [row] = await engine.executeRaw<{ statement_timeout: string }>('SHOW statement_timeout');
+    const applied = row?.statement_timeout ?? null;
+    const details = { configured, applied, docs };
+    if (applied !== '0') return { name: 'persistence_session_timeouts', status: 'ok', details, message: `The session statement_timeout (${applied}) reaches the server.` };
+    return { name: 'persistence_session_timeouts', status: 'warn', details: { ...details, reason: 'session_timeouts_not_applied' },
+      message: `session_timeouts_not_applied: gbrain configured statement_timeout=${configured} as a connection startup parameter, but SHOW statement_timeout through the configured URL `
+        + 'reads 0. A transaction-mode pooler (PgBouncer, Supavisor) drops startup parameters, so statements outside a transaction have no server-side bound; GBRAIN_STATEMENT_TIMEOUT is '
+        + 'ignored there. Preparation reads are bounded by their own transaction-local timeout (the preparation budget covers the gap); a long autocommit statement elsewhere still runs '
+        + `until it finishes. To restore the session default, set it on the role: ALTER ROLE <gbrain role> SET statement_timeout = '${configured}' (the pooler cannot be told to keep it).` };
+  } catch (error) {
+    return checkError('persistence_session_timeouts', 'read the session statement_timeout', error, { details: { configured, health: 'unknown', docs } });
   }
 }

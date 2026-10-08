@@ -121,7 +121,9 @@ test('a lease is shared by lanes; an exclusive writer drains and wounds it and g
 test('a background writer never wounds the lanes: the lease drains for it after the defer wait, and no new lease starts until it has the lock', async () => {
   const native = (): Promise<NativeLockHandle> => { let done = false; return Promise.resolve({ get released() { return done; }, async release() { done = true; } }); };
   const path = join(home, 'lease-defer');
+  // The clock is pinned before the writer defers, so the defer wait is measured from a known instant.
   const start = Date.now();
+  setSystemTime(new Date(start));
   try {
     const lane = (await acquireShared(path, native))!;
     expect(deferToLease(path)).toBe(false);

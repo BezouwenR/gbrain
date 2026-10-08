@@ -1,5 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
+import { boundedReads } from './bounded-reads.ts';
 import { basename, join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
@@ -266,9 +267,12 @@ async function resolveSyncOrigin(engine: BrainEngine, row: WriteRequest, p: Sync
  * `clock` (#6278): the claim's phase clock. Each await boundary below names its step and what it waits on
  * (`enterClaimStep`), which also throws the preparation's abort reason once its budget cut it off. No
  * statement here takes the member's signal: the reads a group memoizes (preparationReads) must stay shared,
- * and the step boundaries are where cancellation lands.
+ * and the step boundaries are where cancellation lands. The preparation's raw reads run through
+ * `boundedReads`: a relation lock held elsewhere ends the statement on the server at the budget (plan 1.4),
+ * so the member is released without a zombie statement pinning a connection until the ceiling.
  */
-export async function prepareManagedSyncMutation(engine: BrainEngine, row: WriteRequest, _config: GBrainConfig, clock?: ClaimPhaseClock): Promise<PreparedMutation> {
+export async function prepareManagedSyncMutation(unbounded: BrainEngine, row: WriteRequest, _config: GBrainConfig, clock?: ClaimPhaseClock): Promise<PreparedMutation> {
+  const engine = boundedReads(unbounded, clock);
   const p = row.intent as SyncIntent | null;
   if (!p || !['managed_sync_import', 'managed_sync_delete', 'managed_sync_checkpoint'].includes(p.kind)) throw syncPublicationRefusal('invalid_params', 'Unsupported internal sync intent.', row, p,
     'The request does not carry a managed sync intent this release can publish.');

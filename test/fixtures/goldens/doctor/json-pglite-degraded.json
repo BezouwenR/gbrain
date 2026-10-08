@@ -756,6 +756,17 @@
           "status": "ok"
         },
         {
+          "category": "ops",
+          "details": {
+            "applied": null,
+            "configured": "5min",
+            "docs": "docs/guides/troubleshooting.md#session-timeouts-not-applied"
+          },
+          "message": "PGLite has no session to time out.",
+          "name": "persistence_session_timeouts",
+          "status": "ok"
+        },
+        {
           "category": "brain",
           "details": {
             "docs": "docs/guides/repair.md#connector-held-items",
