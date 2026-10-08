@@ -6,7 +6,7 @@ import { localHostId } from './identity.ts';
 import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
 import { preparationConfigView } from './config-snapshot.ts';
 import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
-import { claimPhaseStamp, claimStateOf, EXPIRED_PREPARING_CHARGE_SQL, enterClaimPhase, startClaimPhase, type ClaimPhaseClock, type WaitingOn } from './claim-phase.ts';
+import { claimPhaseStamp, claimStateOf, claimTripleText, EXPIRED_PREPARING_CHARGE_SQL, enterClaimPhase, startClaimPhase, type ClaimPhaseClock, type WaitingOn } from './claim-phase.ts';
 import { DEFAULT_PREPARATION_POLICY, preparationBudgetMs, preparationKind, startPreparation, type PreparationPolicy } from './preparation-budget.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { ownerExceptionLogText } from './publication-failure.ts';
@@ -689,7 +689,7 @@ export class PersistenceConsumer {
       this.zombies.set(row.id, { request_id: row.request_id, operation: row.operation, step: clock.step, waiting_on: clock.waitingOn,
         claimed_at: new Date(clock.claimedAt).toISOString(), abandoned_at: at, outlived_ceiling_at: at });
       void settled.then(() => { this.zombies.delete(row.id); });
-      this.log('preparation', 'ceiling_exceeded', `request ${row.request_id} step=${clock.step ?? 'none'} waiting_on=${clock.waitingOn}${this.restartRequired() ? ' restart_required' : ''}`);
+      this.log('preparation', 'ceiling_exceeded', `request ${row.request_id}${claimTripleText(clock)}${this.restartRequired() ? ' restart_required' : ''}`);
       await floorPreparationAttempts(this.engine, row.id, this.policy.maxAttempts).catch(error => this.report(error));
     });
   }
@@ -711,7 +711,7 @@ export class PersistenceConsumer {
       try {
         const previous = claimStateOf({ state: 'running', claim_phase: row.previous_claim_phase, execution_token: previousToken(row.previous_claim_phase) });
         const done = await finishPreparationStalled(this.engine, row, { step: previous?.step ?? null, waiting_on: previous?.waiting_on ?? 'unknown', limit: policy.maxAttempts }, false);
-        this.log('preparation', 'preparation_stalled', failureLogText(done));
+        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText({ step: previous?.step ?? null, waitingOn: previous?.waiting_on ?? 'unknown' })}`);
         return this.settled(done);
       } finally { this.preparing.delete(row.id); this.executing.delete(row.id); }
     }
@@ -722,7 +722,7 @@ export class PersistenceConsumer {
       return this.prepare(this.engine.kind === 'postgres' && singleWrite(row)
         && await writeSwitchOn(this.engine, 'single_write_group').catch(() => true) ? await preparationConfigView(this.engine) : this.engine,
       row, this.config, budget !== undefined && preparationKind(row) === 'foreground' ? signal : undefined, clock);
-    }, budget, { onDeadline: () => { observation.deadline_exceeded = true; this.log('preparation', 'deadline_exceeded'); } });
+    }, budget, { onDeadline: () => { observation.deadline_exceeded = true; this.log('preparation', 'deadline_exceeded', `request ${row.request_id}${claimTripleText(clock)}`); } });
     const stop = () => prep.abort({ code: 'consumer_stopping' });
     this.abort.signal.addEventListener('abort', stop, { once: true });
     const lease = startClaimLease(
@@ -738,7 +738,7 @@ export class PersistenceConsumer {
       if (!lease.held || this.stopping) { await releaseUnpublishedClaim(this.engine, row, releaseReason()); return false; }
       if ((row.preparation_attempts ?? 0) + 1 >= policy.maxAttempts) {
         const done = await finishPreparationStalled(this.engine, row, stallInfo(), true);
-        this.log('preparation', 'preparation_stalled', failureLogText(done));
+        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText(clock)}`);
         return this.settled(done);
       }
       await releaseUnpublishedClaim(this.engine, row, 'preparation_deadline', { charge: true });
