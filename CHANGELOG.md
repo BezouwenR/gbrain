@@ -10,7 +10,7 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
-## [0.60.110.0] - 2026-10-08
+## [0.60.111.0] - 2026-10-08
 
 **Managed Postgres sync catches up more than twice as fast, starts committing in about 20 seconds instead of 80, and a page you save during a catch-up no longer waits behind it.**
 
@@ -57,6 +57,16 @@ Same 16-core machine and same Postgres, 57 ms round trips, default settings, mas
 - Write receipts no longer call an ordinary publication in progress `blocked` / `recovery_required`: a request needs recovery only when it is recovering or holds a recovery record without a live claim, and the requests behind a live publication show as waiting (#6275).
 - Remote `put_page` skips the similar-pages advisory while `put_page.similar_pages` is off (the default) and runs it with JIT off when on; remote `get_page` / `fetch` read the page with JIT off, so brains past about 1,000 pages stop paying JIT compile time on every call (#6276).
 - Bench: `scripts/bench/managed-sync-catchup.ts` reports feeder and lane timing, steady state, per-write foreground spans, an open-loop foreground row and `--pool-size`; results in `docs/eval/managed-sync-catchup.md`.
+
+## [0.60.110.0] - 2026-10-08
+
+**Reverts the Windows backup cold-start retry from v0.60.109.0, which turned master red.**
+
+The retry launched PowerShell a second time after any 15-second timeout. The Windows ARM backup controls deliberately run a PowerShell program that hangs, and they require every failing launch to be bounded to one attempt; with the retry each took two launches (30 s). A first Windows backup on a cold machine whose PowerShell start passes 15 s fails again, as before v0.60.109.0. The order hunt, the contract drain fix and the shard weights from v0.60.109.0 stay.
+
+## To take advantage of v0.60.110.0
+
+`gbrain upgrade` installs the binary. There are no schema migrations.
 
 ## [0.60.109.0] - 2026-10-08
 
