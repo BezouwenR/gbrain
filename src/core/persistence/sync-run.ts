@@ -872,11 +872,10 @@ async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk
   assertActive: () => void): Promise<Cursor> {
   if (!bulk.settings.enabled || !cursor.group?.length) return cursor;
   const lane = laneRunOf(cursor, bulk);
-  // With lanes, twice the lane count stays admitted, so lanes never wait for the sync side to freeze the next group.
-  // Nothing is frozen ahead until the run's first page commits, so the first group publishes without competing for
-  // connections and the event loop (#5984 G3).
-  if (cursor.counts.added + cursor.counts.modified + cursor.counts.deleted === 0) return cursor;
-  const depth = lane ? 2 * Math.max(1, lanePolicy(cursor.binding.worktree_id)?.effective ?? 1) : 1;
+  // With lanes, twice the lane count stays admitted, so lanes never wait for the sync side to freeze the next group;
+  // until the run's first page commits only one, so freezing the window does not delay the first group (#5984 G3).
+  const committed = cursor.counts.added + cursor.counts.modified + cursor.counts.deleted > 0;
+  const depth = lane && committed ? 2 * Math.max(1, lanePolicy(cursor.binding.worktree_id)?.effective ?? 1) : 1;
   let current = cursor, foregroundChecked = false;
   for (let slot = 0; ; slot++) {
     const window = current.window ?? [];
