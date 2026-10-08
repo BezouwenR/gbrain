@@ -151,11 +151,12 @@ describe.skipIf(!hasDatabase())('a lock-blocked preparation read ends at the bud
     let lock: Awaited<ReturnType<typeof holdPagesLock>> | undefined;
     let lockedAt = 0;
     const observed: { releasedAt?: number; released?: ImportRow; leftover?: Array<Record<string, unknown>>; clearedAfterMs?: number } = {};
+    let watcher: Promise<void> = Promise.resolve();
     const intercept = interceptOriginChecks(engine, f.id, stuckPath, stuckSlug, async () => {
       lock = await holdPagesLock(databaseUrl);
       lockedAt = performance.now();
       // The watcher: once the member is released, nothing new reaches the server, the leftover statements are counted, then the lock drops.
-      void (async () => {
+      watcher = (async () => {
         const open = intercept.close();
         try {
           await waitFor(async () => { const row = await lock!.request(f.id, stuckSlug); if (row?.state === 'queued' && row.blocked_reason === 'preparation_deadline') { observed.released = row; return true; } return false; },
@@ -172,7 +173,7 @@ describe.skipIf(!hasDatabase())('a lock-blocked preparation read ends at the bud
     let result;
     try {
       result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true, lanes: 1 });
-    } finally { intercept.restore(); await lock?.drop().catch(() => undefined); await engine.unsetConfig('sync.holds'); }
+    } finally { intercept.restore(); await watcher.catch(() => undefined); await lock?.drop().catch(() => undefined); await engine.unsetConfig('sync.holds'); }
     expect(intercept.holds()).toBeGreaterThanOrEqual(1);
     // Released at the budget, charged once (the step reaches the stamp only on a renewal; the stalled receipt in the second variant names it).
     expect(observed.released).toMatchObject({ state: 'queued', blocked_reason: 'preparation_deadline', preparation_attempts: 1 });
@@ -197,18 +198,21 @@ describe.skipIf(!hasDatabase())('a lock-blocked preparation read ends at the bud
     const stuckSlug = 'notes/n024', stuckPath = 'notes/n024.md';
     let lock: Awaited<ReturnType<typeof holdPagesLock>> | undefined;
     let lockedAt = 0;
+    // The holder's poll is awaited before the holder ends, so no poll can land on an ended connection.
+    let terminal: Promise<unknown> = Promise.resolve();
     const intercept = interceptOriginChecks(engine, f.id, stuckPath, stuckSlug, async () => {
       lock = await holdPagesLock(databaseUrl);
       lockedAt = performance.now();
       // Dropped only after the terminal receipt lands, so the second attempt also waits on the lock.
-      void waitFor(async () => (await lock!.request(f.id, stuckSlug))?.state === 'failed',
-        { timeoutMs: BUDGET_MS * 2 + SLACK_MS * 2 + 10_000, intervalMs: 50, label: 'the member finishes preparation_stalled' }).finally(() => lock!.drop());
+      terminal = waitFor(async () => (await lock!.request(f.id, stuckSlug))?.state === 'failed',
+        { timeoutMs: BUDGET_MS * 2 + SLACK_MS * 2 + 10_000, intervalMs: 50, label: 'the member finishes preparation_stalled' })
+        .catch(() => undefined).then(() => lock!.drop());
     });
     await engine.setConfig('sync.holds', 'fail');
     let result;
     try {
       result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true, lanes: 1 });
-    } finally { intercept.restore(); await lock?.drop().catch(() => undefined); await engine.unsetConfig('sync.holds'); }
+    } finally { intercept.restore(); await terminal.catch(() => undefined); await lock?.drop().catch(() => undefined); await engine.unsetConfig('sync.holds'); }
     const ended = performance.now();
     expect(result.drain).toMatchObject({ outcome: 'blocked', stop_reason: 'blocked_by_failures' });
     expect(result.managedWrite?.slug).toBe(stuckSlug);
