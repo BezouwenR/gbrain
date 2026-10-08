@@ -10,6 +10,25 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.116.0] - 2026-10-08
+
+**A Windows backup no longer fails on a cold machine's first PowerShell start, and a hung PowerShell still fails after one bounded launch.**
+
+On Windows, gbrain runs PowerShell to make a new backup path owner-only, with a 15-second limit. On a freshly started machine PowerShell's first launch sometimes takes longer than that (3.3 to 27.7 seconds measured on fresh CI runners; later launches take 0.2 to 1.5 seconds), so the first backup failed. The v0.60.109.0 retry fixed that, but it also launched a hung PowerShell twice, which the Windows ARM controls refuse, so v0.60.110.0 reverted it.
+
+gbrain now warms PowerShell once per process before the protection step: a trivial `exit 0` launch with its own 30-second limit, whose result is ignored. The protection step itself is unchanged: one launch, a 15-second limit, no retry, and any failure refuses with `private_backup_path_unavailable`. The warm-up costs about half a second on the first Windows backup of a process and nothing on other platforms.
+
+| After upgrading | Before | After |
+| --- | --- | --- |
+| First backup on a cold Windows machine (PowerShell start over 15 s) | Fails with `private_backup_path_unavailable` | Succeeds |
+| PowerShell that hangs during protection | Fails after one 15 s launch | Fails after one 15 s launch (unchanged) |
+
+The `core-memory-locks-postgres` E2E test also stops failing intermittently: its source-topology step could wait out its 1-second lock limit behind 18 concurrent core writes and report the retryable `write_pending`, which the test did not retry. It now retries with the same `request_id`, as that error's fix text says. The deadlock and commit-count assertions are unchanged.
+
+## To take advantage of v0.60.116.0
+
+`gbrain upgrade` installs the binary. There are no schema migrations.
+
 ## [0.60.115.0] - 2026-10-08
 
 **Every install path now registers the full tool surface, new memory grants can write in bulk, an empty tool lookup returns the catalog, and the embed backlog warns when it is old.**
