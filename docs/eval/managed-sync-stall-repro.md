@@ -526,3 +526,39 @@ lock are the import pipeline's, the snapshot's, the projection's and the
 group memo's, none of which runs through `executeRaw` with the bound. The
 pass's `queue_capacity` exit and the re-held stalled file are the two new
 findings.
+
+### Lane B7: the two 4.1b findings, traced on the local probes
+
+- **The stalled file was never re-screened, not re-held.** Only discovery
+  reads the `sources retry-held` schedule (`sync-discovery.ts`,
+  `readGitHoldRetryPaths`), and `retry-held` against an unfinished cursor
+  prints that cursor's resume command (`sources-retry-held.ts`,
+  `gitFollowUpSync`: the backlog's `resume_args`). The printed sync resumed
+  the pass-1 cursor, finished its 2,755 remaining entries and reported
+  `synced` with the cursor's cumulative `counts.held` (20 fence holds plus the
+  one stalled hold from pass 1: "21 file(s) held this run", `summary.stalled:
+  1`); the schedule stayed pending for a run nobody was told to start.
+  `convertBlockedCursor` took no part (the entry pass 1 died on was never
+  admitted, so its receipt does not exist), and a re-screened entry starts
+  with `preparation_attempts` 0. Fixed in `sync-run.ts`: a checkpoint that
+  commits while re-screens are scheduled returns `partial` / `writer_yield`,
+  so the drain's next pass retires the cursor and discovers again (taking
+  them); discovery consumes the schedule inside the fresh cursor's save.
+  Probe: `test/managed-sync-preparation-stalled-holds.test.ts` ("retry-held
+  against an unfinished cursor"), sliced pass → hold → `retry-held` → the
+  printed sync drained: one `drainManagedSync` call imports the file, clears
+  the hold, `summary.stalled: 0`, attempts 0.
+- **`queue_capacity` at admission was uncaught on the base branch too.** The
+  admission path (`admitGroup` / `admitWriteInTransaction`,
+  `admissionRoom`) is identical to `origin/capy/sync-feeder-fast-writes`; the
+  refusal escaped `groupStep` → `performManagedSync`'s catch (which recorded a
+  `managed-sync-failure` naming `--retry-failed`) → `runDrain`, whose
+  `transientDelay` does not know the code, so the CLI exited 1 with no drain
+  summary. Whether a pass survives the 99+1 condition depends only on the
+  group size against the room left, which is why the previous head's run
+  did not hit it. Fixed in `sync-drain.ts`: the refusal (now carrying
+  `outstanding=N limit=M` on `detail`) is retried with backoff, prints
+  `waiting for write capacity (N outstanding of M)`, ends `blocked` /
+  `write_capacity` with `next` after the no-progress window, and is left out
+  of the failure ledger. Probe: `test/sync-drain-write-capacity.test.ts`
+  (the sync writer's own outstanding counter set to the cap).

@@ -21,6 +21,7 @@ import { currentRunDeadline, noteForwardProgress } from '../forward-progress.ts'
 import { serr } from '../console-prefix.ts';
 import { ERROR_CATALOGUE, type CatalogueName } from '../error-catalogue.ts';
 import { managedSyncResumeArgs, syncResumeCommand } from '../sync-reconcile.ts';
+import { isWriteCapacityWait, outstandingCapacityOf } from './admission-retry.ts';
 
 export type DrainOutcome = 'synced' | 'resumable' | 'blocked';
 /** Why a drain ended short of `synced`. Each value has an error-catalogue entry (DX-A4). */
@@ -29,7 +30,11 @@ export type DrainStopReason = 'deadline' | 'drain_stalled' | 'database_contentio
   /** #6278: a preparation this process owned outran its budget and allowance; exiting ended it, the same command resumes and the next pass holds the entry if it stalls again. */
   | 'preparation_abandoned'
   /** #6278: the run's breaker tripped on `preparation_stalled` receipts (one systemic diagnostic instead of a pile of holds). */
-  | 'preparation_systemic';
+  | 'preparation_systemic'
+  /** #6278 (B7): the sync's next admission was refused for the whole no-progress window because other requests held the writer's outstanding-request cap. */
+  | 'write_capacity';
+/** #6278 (B7): what the drain waited on when `write_capacity` stopped it: the counts the last refusal carried and how long it waited. */
+export interface DrainCapacityWait { outstanding: number | null; limit: number | null; scope: 'principal' | 'brain' | null; waited_seconds: number }
 /** #6278: what a stalled head's live claim says it is doing (`claim_phase`, stamped by its owner on every renewal). */
 export interface DrainClaim {
   phase: 'preparing' | 'publishing' | null;
@@ -75,6 +80,7 @@ export interface DrainReport {
   eta_seconds: number | null;
   retry_after_ms?: number;
   stall?: DrainStall;
+  capacity?: DrainCapacityWait;
   /** DX-A5: whether pages were published in bulk groups, and why not when they were not. */
   bulk?: { enabled: boolean; reason: string | null; groups: number; grouped_pages: number; largest_group: number;
     /** #5984 admit-ahead: groups admitted while the previous group was still publishing. */
@@ -100,6 +106,12 @@ const STALL_PASSES = 3;
 export const STALL_GRACE_MS = 30_000;
 const SYNC_PREPARATION_DEFAULT_MS = 120_000, MAINTENANCE_PREPARATION_DEFAULT_MS = 120_000, PREPARATION_CEILING_DEFAULT_MS = 600_000;
 const TRANSIENT_ATTEMPTS = 3;
+/** #6278 (B7): the longest pause between admission retries while other requests hold the writer's outstanding cap. */
+const CAPACITY_RETRY_MAX_MS = 5_000;
+/** #6278 (B7): the page counts of a run a drain finished before yielding for the next one. */
+type RunCounts = Pick<SyncResult, 'added' | 'modified' | 'deleted' | 'renamed' | 'chunksCreated'>;
+/** The result a drain reports when every pass was refused before it could read its cursor. */
+const NO_PASS_RESULT: SyncResult = { status: 'partial', reason: 'writer_pending', fromCommit: null, toCommit: '', added: 0, modified: 0, deleted: 0, renamed: 0, chunksCreated: 0, embedded: 0, pagesAffected: [] };
 const REFRESH_WAIT_MS = 5 * 60_000;
 const DEADLINE_MARGIN_MS = 15_000;
 const PROGRESS_EVERY_MS = 10_000;
@@ -219,6 +231,10 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
   let lanes: { effective: number; stepDown: string | null; overlapped: number; fallbacks: number } | null = null;
   let stall: { key: string; since: number; passes: number; claim: DrainClaim | null; stallInfo: Omit<DrainStall, 'stalled_seconds'> } | null = null;
   let lastCommitAt = startedAt, inPass = false, readingHead = false;
+  // #6278 (B7): a pass refused for write capacity keeps the last pass's result for the report; `capacity` spans the refusals since the last pass that ran.
+  let last: SyncResult | undefined, capacity: { since: number; attempts: number } | null = null;
+  // #6278 (B7): a pass may finish one run and yield for the next (re-screens scheduled while it ran); the counts of finished runs carry into the report.
+  let carried: RunCounts | null = null;
   const remaining = () => total === null ? null : Math.max(0, total - index);
   const every = input.progressMs ?? PROGRESS_EVERY_MS;
   // #6278: the progress line prints on commits; while nothing commits, a timer names the stall instead of an ETA that assumes none.
@@ -269,6 +285,8 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
     if (result.managedCursor) { index = result.managedCursor.index; total = result.managedCursor.total; }
     const left = outcome === 'synced' ? 0 : remaining();
     if (stopReason === 'deadline' && continues(result)) result = { ...result, reason: 'timeout' };
+    if (carried) result = { ...result, added: result.added + carried.added, modified: result.modified + carried.modified, deleted: result.deleted + carried.deleted,
+      renamed: result.renamed + carried.renamed, chunksCreated: result.chunksCreated + carried.chunksCreated };
     return { ...result, drain: { outcome, ...(stopReason ? { stop_reason: stopReason } : {}), passes, processed: written + waived, written, waived,
       remaining: left, ...drainEstimate(left, written + waived, Date.now() - startedAt),
       ...(input.bulk ? { bulk: { enabled: input.bulk.enabled, reason: input.bulk.reason, groups, grouped_pages: groupedPages, largest_group: largestGroup, admitted_ahead: admittedAhead,
@@ -282,8 +300,27 @@ export async function runDrain(input: DrainInput): Promise<SyncResult> {
       try {
         inPass = true;
         try { result = await input.pass(signal, onProgress); } finally { inPass = false; }
-        attempt = 0;
+        attempt = 0; capacity = null;
+        if (last?.runId && result.runId && result.runId !== last.runId) {
+          const sum: RunCounts = carried ?? { added: 0, modified: 0, deleted: 0, renamed: 0, chunksCreated: 0 };
+          carried = { added: sum.added + last.added, modified: sum.modified + last.modified, deleted: sum.deleted + last.deleted, renamed: sum.renamed + last.renamed, chunksCreated: sum.chunksCreated + last.chunksCreated };
+        }
+        last = result;
       } catch (error) {
+        // #6278 (B7): other requests (another writer on the same principal, or the brain) hold the outstanding-request cap, so the pass
+        // could not admit its next write. They settle on their own: wait with backoff, say so, and past the no-progress window stop
+        // `blocked` with the counts and the writer to inspect, never an uncaught exit without a drain summary.
+        if (isWriteCapacityWait(error) && !signal?.aborted) {
+          capacity ??= { since: Date.now(), attempts: 0 };
+          const counts = outstandingCapacityOf(error), waitedMs = Date.now() - capacity.since;
+          if (waitedMs >= (input.stallMs ?? STALL_MS)) return finish(last ?? NO_PASS_RESULT, 'blocked', 'write_capacity', { capacity: { ...counts, waited_seconds: Math.round(waitedMs / 1000) } });
+          if (input.announce && Date.now() - lastLine >= every) {
+            lastLine = Date.now();
+            serr(`[sync] ${index}/${total ?? '?'} processed · waiting for write capacity (${counts.outstanding ?? '?'} outstanding${counts.limit === null ? '' : ` of ${counts.limit}`})`);
+          }
+          await sleep(Math.min(CAPACITY_RETRY_MAX_MS, (input.backoffMs ?? 250) * 2 ** capacity.attempts++), signal);
+          continue;
+        }
         const delay = transientDelay(error, ++attempt, refreshWaitedMs, input.backoffMs ?? 250);
         if (delay === null || signal?.aborted) throw error;
         if (error instanceof OperationError && (error.code === 'worktree_refreshing' || error.detail === 'database_contention')) refreshWaitedMs += delay;
@@ -499,7 +536,7 @@ const STOP_DOCS: Record<DrainStopReason, CatalogueName> = {
   deadline: 'sync_drain_deadline', drain_stalled: 'sync_drain_stalled', database_contention: 'sync_drain_database_contention',
   recovery_required: 'sync_drain_writer_blocked', owner_unavailable: 'sync_drain_writer_blocked', unexpected_file_bytes: 'sync_drain_writer_blocked',
   unexpected_staging_bytes: 'sync_drain_writer_blocked', blocked_by_failures: 'sync_drain_blocked_by_failures',
-  preparation_abandoned: 'sync_drain_preparation_abandoned', preparation_systemic: 'sync_drain_preparation_systemic',
+  preparation_abandoned: 'sync_drain_preparation_abandoned', preparation_systemic: 'sync_drain_preparation_systemic', write_capacity: 'sync_drain_write_capacity',
 };
 
 /** What the agent runs next, or null when the sync is done (DX-A2). */
@@ -523,6 +560,15 @@ export function drainNext(result: SyncResult, resumeCommand: string, sourceId: s
       why: `${breaker?.stalled ?? 'Several'} writes of this sync could not finish preparing${breaker?.step ? ` at step ${breaker.step}` : ''}`
         + `${breaker?.rule === 'consecutive' ? ` (${breaker.consecutive} in a row with no page committed between them)` : ''}, so the run stopped instead of holding every file: the write owner, not the files, `
         + `is the likely cause. Inspect it (read-only), fix what it names or upgrade gbrain, then rerun: ${resumeCommand} (it re-freezes the stopped entry and re-screens the files this run held).`,
+      ...(docs ? { docs } : {}) };
+  }
+  if (d?.stop_reason === 'write_capacity') {
+    const c = d.capacity, scope = c?.scope ?? 'principal';
+    const key = scope === 'brain' ? 'persistence.limits.brain_outstanding' : 'persistence.limits.principal_outstanding';
+    return { command: `gbrain sources writer status --source ${sourceId} --json`, safe_to_loop: false, retry_after_ms: 0, ...estimate,
+      why: `The sync could not admit its next write for ${c?.waited_seconds ?? 30}s: ${c?.outstanding ?? 'other'} of the ${scope === 'brain' ? "brain's" : "write principal's"} ${c?.limit ?? ''} outstanding-request slots `
+        + 'were in use, most of them by another writer on this host (a maintenance run shares the CLI principal), so there was no room for a sync write. Nothing failed and the cursor is intact. '
+        + `Inspect them (read-only) and let them finish, or raise ${key}, then rerun: ${resumeCommand}`,
       ...(docs ? { docs } : {}) };
   }
   if (d?.stop_reason === 'database_contention') {
@@ -561,6 +607,7 @@ export function formatDrainSummary(result: SyncResult, resumeCommand: string, so
   const lines = [`Managed sync ${d.outcome}: ${d.processed} entries this run (${d.written} written, ${d.waived} waived)`
     + (d.remaining ? `, ${d.remaining} remaining` : '') + (d.rate_pages_per_min !== null ? `, ${d.rate_pages_per_min} pages/min` : '')
     + (d.remaining && d.eta_seconds !== null ? `, indexing ETA ${formatDuration(d.eta_seconds)}` : '') + '.'];
+  if (d.capacity) lines.push(`  Waited ${d.capacity.waited_seconds}s for write capacity: ${d.capacity.outstanding ?? '?'} of ${d.capacity.limit ?? '?'} ${d.capacity.scope ?? 'principal'} outstanding-request slots in use.`);
   if (d.stall) lines.push(`  Oldest unfinished request ${d.stall.head_request_id ?? d.stall.request_id} (${d.stall.head_state ?? d.stall.state})`
     + `${d.stall.blocked_reason ? `, blocked_reason=${d.stall.blocked_reason}` : ''}${d.stall.step ? `, step=${d.stall.step}` : ''}${d.stall.waiting_on ? `, waiting_on=${d.stall.waiting_on}` : ''}`
     + `${d.stall.cause ? `, cause=${d.stall.cause}` : ''}; claimable here: ${d.stall.claimable_here ? 'yes' : 'no'}.`);
