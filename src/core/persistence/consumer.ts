@@ -694,7 +694,9 @@ export class PersistenceConsumer {
     // #6278: every kind has a budget with the switch on; off, only remember and intent-less put_page/edit_page (#5616) keep the 30 s one.
     const foregroundMs = this.opts.preparationMs ?? 30_000;
     const budget = policy.deadlines ? preparationBudgetMs(row, policy, foregroundMs) : preparationKind(row) === 'foreground' ? foregroundMs : undefined;
-    const clock = startClaimPhase();
+    // #6278: the clock carries the preparation's cancellation for `enterClaimStep`; a query takes the signal only on the foreground path (as before).
+    const cancel = new AbortController();
+    const clock = startClaimPhase(Date.now(), cancel.signal);
     // #6278: a request already at the attempt limit (a kill loop charged it at each reclaim) is finished without preparing again.
     if (policy.deadlines && (row.preparation_attempts ?? 0) >= policy.maxAttempts) {
       try {
@@ -705,11 +707,12 @@ export class PersistenceConsumer {
       } finally { this.preparing.delete(row.id); this.executing.delete(row.id); }
     }
     const prep = startPreparation(async signal => {
+      signal.addEventListener('abort', () => cancel.abort(signal.reason), { once: true });
       await faultPoint('consumer:preparing', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation, signal });
       // Phase 4.3: a single page write prepares against one config read instead of one per key.
       return this.prepare(this.engine.kind === 'postgres' && singleWrite(row)
         && await writeSwitchOn(this.engine, 'single_write_group').catch(() => true) ? await preparationConfigView(this.engine) : this.engine,
-      row, this.config, budget === undefined ? undefined : signal, clock);
+      row, this.config, budget !== undefined && preparationKind(row) === 'foreground' ? signal : undefined, clock);
     }, budget, { onDeadline: () => { observation.deadline_exceeded = true; this.log('preparation', 'deadline_exceeded'); } });
     const stop = () => prep.abort({ code: 'consumer_stopping' });
     this.abort.signal.addEventListener('abort', stop, { once: true });
@@ -792,11 +795,15 @@ export class PersistenceConsumer {
     const rows = [row, ...followers];
     for (const member of rows) this.executing.add(member.id);
     try {
-      return await executeClaimedGroup(this.engine, rows, { hostId: this.hostId, lane, prepare: (member, engine) => this.prepare(engine, member, this.config),
-        lease: this.leaseTiming(),
-        leftRunning: (work, blocksRoot) => {
-          const settled = this.keepUntilSettled(work);
-          if (blocksRoot) root.until = settled;
+      return await executeClaimedGroup(this.engine, rows, { hostId: this.hostId, lane,
+        prepare: (member, engine, signal, clock) => this.prepare(engine, member, this.config, signal, clock),
+        lease: this.leaseTiming(), policy: this.policy, foregroundMs: this.opts.preparationMs ?? 30_000,
+        leftRunning: (work, blocksRoot, abandoned) => {
+          if (!blocksRoot) { this.keepUntilSettled(work); return; }
+          // #6278: an abandoned member blocks its root until it settles or the ceiling passes; several abandoned members all hold it.
+          const settled = this.keepAbandoned(work);
+          const block = abandoned ? this.abandonedRootBlock(abandoned.row, abandoned.clock, settled) : settled;
+          root.until = root.until ? Promise.all([root.until, block]).then(() => undefined) : block;
         },
         settled: done => {
           this.executing.delete(done.id);

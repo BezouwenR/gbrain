@@ -147,8 +147,8 @@ export function transientDatabaseFailure(error: unknown): boolean {
  * `storage_error` or an uncounted `database_contention`; classify it before
  * `finishUnpublishedFailure`. Null when the error is the preparer's own.
  */
-export type PreparationAbortReason = 'preparation_deadline' | 'consumer_stopping' | 'claim_lost';
-const ABORT_REASONS: ReadonlySet<string> = new Set<PreparationAbortReason>(['preparation_deadline', 'consumer_stopping', 'claim_lost']);
+export type PreparationAbortReason = 'preparation_deadline' | 'consumer_stopping' | 'claim_lost' | 'group_member_waiting';
+const ABORT_REASONS: ReadonlySet<string> = new Set<PreparationAbortReason>(['preparation_deadline', 'consumer_stopping', 'claim_lost', 'group_member_waiting']);
 export function preparationAbortReason(error: unknown, signal?: AbortSignal): PreparationAbortReason | null {
   const reason = signal?.aborted ? (signal.reason as { code?: unknown } | null)?.code : undefined;
   const own = typeof reason === 'string' && ABORT_REASONS.has(reason) ? reason as PreparationAbortReason : null;

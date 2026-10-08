@@ -721,7 +721,8 @@ export async function completeWrite(tx: SqlEngine, row: WriteRequest, state: 'co
       error_code=$4,error_message=$5,error_detail=COALESCE($8::text::jsonb,error_detail),completed_at=now(),updated_at=now(),claim_expires_at=NULL,blocked_reason=NULL,
       consumer_version=CASE WHEN $2='committed' THEN $6 ELSE consumer_version END,
       consumer_host_id=CASE WHEN $2='committed' THEN $7::uuid ELSE consumer_host_id END,
-      published_at=CASE WHEN $2='committed' THEN now() ELSE published_at END
+      published_at=CASE WHEN $2='committed' THEN now() ELSE published_at END,
+      preparation_attempts=CASE WHEN $2='committed' THEN 0 ELSE preparation_attempts END
       WHERE id=$1::uuid AND $9::bigint+(SELECT bytes FROM effects)<=terminal_reservation RETURNING *),
     released AS (UPDATE persistence_counters SET outstanding_count=outstanding_count-1,intent_bytes=intent_bytes-$11
       WHERE key=ANY($10::text[]) AND EXISTS (SELECT 1 FROM done))

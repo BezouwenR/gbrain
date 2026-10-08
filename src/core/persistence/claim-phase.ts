@@ -43,12 +43,19 @@ export interface ClaimPhaseClock {
   step: string | null;
   stepSince: number;
   waitingOn: WaitingOn;
+  /**
+   * #6278: the preparation's cancellation. `enterClaimStep` checks it at every
+   * boundary; a preparer passes it to a raw statement only when that statement
+   * can block on a lock or a pool reservation and is not a shared memo read
+   * (a signalled statement reserves its own connection and skips the memo).
+   */
+  signal?: AbortSignal;
 }
 /** The process that holds a claim, as the stamp records it. */
 export interface ClaimOwner { kind: string; pid: number; version: string }
 
-export function startClaimPhase(now = Date.now()): ClaimPhaseClock {
-  return { phase: 'preparing', claimedAt: now, since: now, step: null, stepSince: now, waitingOn: 'unknown' };
+export function startClaimPhase(now = Date.now(), signal?: AbortSignal): ClaimPhaseClock {
+  return { phase: 'preparing', claimedAt: now, since: now, step: null, stepSince: now, waitingOn: 'unknown', ...(signal ? { signal } : {}) };
 }
 export function enterClaimPhase(clock: ClaimPhaseClock, phase: ClaimPhaseName, now = Date.now()): void {
   if (clock.phase === phase) return;
@@ -60,11 +67,12 @@ export function enterClaimPhase(clock: ClaimPhaseClock, phase: ClaimPhaseName, n
 }
 /**
  * A preparer's step boundary: names the step and what its await waits on,
- * and throws the preparation's abort reason once the budget has cut it off.
- * `clock` is absent for a preparation outside the consumer (the sync's
- * waiver and origin checks), which still gets the cancellation check.
+ * and throws the preparation's abort reason once the budget has cut it off
+ * (`signal` defaults to the clock's). `clock` is absent for a preparation
+ * outside the consumer (the sync's waiver and origin checks), which still
+ * gets the cancellation check from its own signal.
  */
-export function enterClaimStep(clock: ClaimPhaseClock | undefined, step: string, signal?: AbortSignal, waitingOn: WaitingOn = 'unknown', now = Date.now()): void {
+export function enterClaimStep(clock: ClaimPhaseClock | undefined, step: string, signal: AbortSignal | undefined = clock?.signal, waitingOn: WaitingOn = 'unknown', now = Date.now()): void {
   signal?.throwIfAborted();
   if (!clock) return;
   if (clock.step !== step) { clock.step = step; clock.stepSince = now; }
