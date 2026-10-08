@@ -349,7 +349,9 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
     }
     const originScope = syncOriginScope(cursor);
     // #5522: another cursor of this source may have imported this new file since enumeration.
-    const occupant = await alreadyImportedAtOrigin(engine, cursor, entry, originScope);
+    // #5984 G3: the page snapshot is read beside the origin check (they are independent reads of committed state).
+    const [occupant, snapshot] = await Promise.all([alreadyImportedAtOrigin(engine, cursor, entry, originScope),
+      engine.readPageSnapshot(entry.slug!, { sourceId: cursor.sourceId, includeDeleted: true })]);
     assertActive();
     let bytes: Buffer | null = null;
     try { bytes = readSyncFile(cursor.root, entry.path); }
@@ -372,9 +374,7 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
     lineEndingOnly = bytes !== null && content !== null && bytes.equals(Buffer.from(bytes.toString('utf8'))) &&
       bytes.toString('utf8').replace(/\r\n/g, '\n') === content.replace(/\r\n/g, '\n');
     slug = entry.slug!; pageId = occupant?.page.id ?? entry.pageId ?? null; revision = occupant ? occupant.revision : entry.revision ?? null;
-    const snapshot = await engine.readPageSnapshot(slug, { sourceId: cursor.sourceId, includeDeleted: true });
     frozenSnapshot = snapshot;
-    assertActive();
     if (occupant && (content === null || !await sameContentAtOrigin(engine, cursor, entry, key, snapshot, content, rawHash, lineEndingOnly, run.signal))) {
       throw syncRunRefusal('page_identity_changed', 'The imported origin no longer identifies exactly the accepted page.', retry,
         `Page ${slug} was imported from ${entry.path} by another run of source ${cursor.sourceId} with different content after this run enumerated it, so the run stopped before admitting it.`);
