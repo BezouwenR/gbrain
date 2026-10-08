@@ -80,9 +80,9 @@ If a catch-up stops or files are held, follow [catch-up stuck](docs/guides/troub
 
 ## [0.60.111.0] - 2026-10-08
 
-**Managed Postgres sync catches up more than twice as fast, starts committing in about 20 seconds instead of 80, and a page you save during a catch-up no longer waits behind it.**
+**Managed Postgres sync catches up more than twice as fast, starts committing in about 18 seconds instead of 80, and a page you save during a catch-up no longer waits behind it.**
 
-When a git source falls behind on a managed brain whose database is far away (57 ms round trips in our test), `gbrain sync` used to spend most of its time with idle connections: one process prepared the next batch of pages one statement at a time while up to six publishers waited. A 10,000-page backlog took about 75 minutes, the first page landed after about 80 seconds, and a `put_page` from your agent took 9 to 12 seconds even when nothing else was running. Now batches are prepared in bulk, publishers stay busy, a single page write takes about 2.5 seconds, and a foreground write goes ahead of queued sync batches that don't touch the same page.
+When a git source falls behind on a managed brain whose database is far away (57 ms round trips in our test), `gbrain sync` used to spend most of its time with idle connections: one process prepared the next batch of pages one statement at a time while up to six publishers waited. A 10,000-page backlog took about 75 minutes, the first page landed after about 80 seconds, and a `put_page` from your agent took 9 to 12 seconds even when nothing else was running. Now batches are prepared in bulk, publishers stay busy, a single page write takes about 2.5 seconds, and a foreground write publishes beside the running sync batches when it doesn't touch the same page.
 
 ### How to use it
 
@@ -99,18 +99,18 @@ Same 16-core machine and same Postgres, 57 ms round trips, default settings, mas
 
 | What you do | Before | Now |
 |---|---|---|
-| Catch up a 10,000-page backlog | 74.5 min | 33.5 min |
-| Pages per minute once the catch-up is running | 175 | 373 |
-| Time until the first page is committed | 79 s | 20 s |
-| Save one page with nothing else running (typical / slow) | 8.6 s / 11.6 s | 2.5 s / 2.8 s |
-| Save one page during a catch-up (typical / slow) | 11.3 s / 17.1 s | 6.9 s / 8.4 s |
-| Catch-up speed while your agent saves a page every 5 s | 4.6 pages/min | 58 pages/min |
-| Catch-up next to the database (about 0 ms) | 2,404 pages/min | 2,862 pages/min |
+| Catch up a 10,000-page backlog | 74.5 min | 33.6 min |
+| Pages per minute once the catch-up is running | 175 | 368 |
+| Time until the first page is committed | 79 s | 18 s |
+| Save one page with nothing else running (typical / slow) | 8.6 s / 11.6 s | 2.5 s / 2.7 s |
+| Save one page during a catch-up (typical / slow) | 11.3 s / 17.1 s | 3.1 s / 4.1 s |
+| Catch-up speed while your agent saves a page every 5 s | 0.4 pages/min, 115 of 120 saves failed | 174 pages/min, no saves failed |
+| Catch-up next to the database (about 0 ms) | 2,404 pages/min | 3,332 pages/min |
 
 ### Things to watch
 
 - **More publishers help up to a point.** With a 20-connection pool, 8 to 16 publishers all run at about 400 to 410 pages/min against 378 at the default 6. The drain prints a `[sync] lanes:` line saying what limited it (the pool, the server's free connections or your setting).
-- **Writes during a catch-up still cost something.** A page write waits for the sync batches already publishing, so during a catch-up it takes about 7 s, and a steady stream of writes slows the catch-up to about 15% of its idle speed.
+- **Writes during a catch-up still cost something.** A page save takes about 1.5 s longer at the slow end than with nothing running, and a save every 5 s slows the catch-up to about 45% of its idle speed. With a save every 5 s the slowest saves (p95) take about 22 s.
 - **Every new path has a switch** that accepts `0` or `false`: `persistence.single_write_group`, `persistence.preadmit_cache`, `sync.waive_batch`, `sync.foreground_priority` (environment: `GBRAIN_SINGLE_WRITE_GROUP`, `GBRAIN_PREADMIT_CACHE`, `GBRAIN_SYNC_WAIVE_BATCH`, `GBRAIN_SYNC_FOREGROUND_PRIORITY`). A running `serve` picks up a config change within 5 seconds.
 
 ### Itemized changes
@@ -119,7 +119,7 @@ Same 16-core machine and same Postgres, 57 ms round trips, default settings, mas
 - Lanes: up to 16 (`sync.lanes`, `--lanes`), clamped by the pool and the server's free connections; groups are sized by measured apply time inside a 5 s budget (2 s while foreground writes are recent), and the first group is one or two pages. Group publication pipelines the page apply.
 - Startup: runs of entries that need no write (already-deleted files, unchanged imports) are waived in one transaction instead of one each.
 - Single page writes publish as a group of one on a warm reserved connection, with a per-process cache of pre-admission reads that admission rechecks under lock, and the writer's own admission claims the request directly.
-- Foreground priority: a page write passes queued, unstarted sync groups that don't name its page (slug, page id or rename source); a sync group naming the page keeps its place; after each foreground commit the drain may start a group, so a stream of writes can't stall it. Every reader of request sequence order was audited for writes committed out of order; receipt health now judges a claimed write only against earlier started writes.
+- Foreground priority: a page write that names no queued or running sync group's page (slug, page id or rename source) publishes beside the running lane groups in the sync process; new lane groups wait only while such a write waits to be claimed, and background effects defer to lanes instead of interrupting them. A sync group naming the page keeps its place. Every reader of request sequence order was audited for writes committed out of order; receipt health now judges a claimed write only against earlier started writes.
 - Postgres: described parameter types are shared across a pool's connections (patched `postgres@3.4.9`, `GBRAIN_PG_TYPE_CACHE=0` turns it off); managed link extraction derives four pages at once with one config read per run.
 - A sync group member after an uncommitted member is cancelled, never published ahead of it (#6252).
 - Write receipts no longer call an ordinary publication in progress `blocked` / `recovery_required`: a request needs recovery only when it is recovering or holds a recovery record without a live claim, and the requests behind a live publication show as waiting (#6275).
