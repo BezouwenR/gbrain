@@ -76,15 +76,20 @@ export async function screenWaiver(engine: BrainEngine, cursor: WaiverCursor, pe
   const intent = pending.intent;
   if (intent.kind === 'managed_sync_delete') {
     if (intent.unownedDeletion || intent.renameFrom || intent.rawHash !== null || typeof intent.path !== 'string' || typeof intent.sourcePath !== 'string') return null;
-    const snapshot = await engine.readPageSnapshot(pending.slug, { sourceId: cursor.sourceId, includeDeleted: true });
+    // The authority check runs beside the snapshot read; its refusal counts only for an entry that would be waived.
+    const [snapshot, denied] = await Promise.all([engine.readPageSnapshot(pending.slug, { sourceId: cursor.sourceId, includeDeleted: true }), authorityRefusal(engine, cursor, pending)]);
     if (!softDeletedAt(snapshot, pending)) return null;
-    await validateSyncAuthority(engine, cursor.authority, pending.slug);
+    if (denied) throw denied.error;
     return { kind: 'delete', kernel: [] };
   }
-  const kernel = await unchangedSyncImport(engine, cursor, pending, config);
+  const [kernel, denied] = await Promise.all([unchangedSyncImport(engine, cursor, pending, config), authorityRefusal(engine, cursor, pending)]);
   if (!kernel) return null;
-  await validateSyncAuthority(engine, cursor.authority, pending.slug);
+  if (denied) throw denied.error;
   return { kind: 'import', kernel };
+}
+
+function authorityRefusal(engine: BrainEngine, cursor: WaiverCursor, pending: WaiverEntry): Promise<{ error: unknown } | null> {
+  return validateSyncAuthority(engine, cursor.authority, pending.slug).then(() => null, (error: unknown) => ({ error }));
 }
 
 /** #5984: `GBRAIN_SYNC_WAIVE_BATCH=0` (or `sync.waive_batch=false`) waives one entry per transaction, as before. */

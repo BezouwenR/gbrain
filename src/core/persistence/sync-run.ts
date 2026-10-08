@@ -9,6 +9,7 @@ import { currentSourceFilesystemSignal } from '../minions/source-filesystem.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { digest, sha256 } from './digest.ts';
 import { getWriteRequest, admitWriteInTransaction, foregroundPriority, intentDigest, receiptFor } from './journal.ts';
+import { preparationConfigView } from './config-snapshot.ts';
 import { retryWriteAdmission } from './admission-retry.ts';
 import { assertPersistenceAccepting, awaitWrite, foregroundWriteCompletions, startPersistenceConsumer, type WriteWait } from './service.ts';
 import { assertSyncEntryOrigin, discoverManagedSync, resolveManagedSyncContext, readSyncContent, readSyncFile, syncGit, type SyncDiscovery } from './sync-discovery.ts';
@@ -661,7 +662,8 @@ async function admitAndSave(engine: BrainEngine, key: string, before: Cursor, ne
     return saved.length > 0;
   });
   if (!rows) return null;
-  startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake();
+  // The sync loop's own admission: the consumer's next tick claims it directly, leaving its scans to their cadence.
+  startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake(true);
   await faultPoint('sync:mid_checkpoint', { sourceId: next.sourceId });
   return next;
 }
@@ -768,7 +770,7 @@ async function admitWindowGroup(engine: BrainEngine, cursor: Cursor, key: string
     const [held] = await tx.executeRaw<{ request_id: string | null }>(`SELECT completed_keys->0->'window'->($3::int)->0->>'requestId' AS request_id FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 FOR SHARE`, [OP, key, slot]);
     return held?.request_id === members[0]!.requestId;
   }).catch(() => null);
-  if (rows) startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake();
+  if (rows) startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake(true);
   return rows !== null;
 }
 /**
@@ -1021,11 +1023,12 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
       return result(cursor, cursor.from === null ? 'first_sync' : 'synced');
     }
     if (cursor?.done) cursor = await retireCompletedCursor(engine, key, cursor, assertActive);
+    const startupConfig = await preparationConfigView(engine); // #5984 G3: one config read answers the startup's config reads
     if (!cursor) {
       assertActive();
       phase = 'discovery';
       discoveryTarget = company?.plan.revision?.commit ?? syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
-      const discovery = await discoverManagedSync(engine, opts, context);
+      const discovery = await discoverManagedSync(startupConfig, opts, context);
       assertActive();
       const fresh: Cursor = { ...discovery, authority, processingOptions, syncOptions, runId: discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 }, ...(company ? { companyReceiptId: company.receiptId } : {}) };
       if (opts.dryRun) return dryRun(fresh);
@@ -1054,19 +1057,18 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     }
     assertCursorProcessingOptions(cursor, processingOptions, opts.explicitProcessing);
     if (opts.dryRun) return dryRun(cursor);
-    frozenRun.screen = company ? null : await loadSyncScreenRun(engine, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote);
+    frozenRun.screen = company ? null : await loadSyncScreenRun(startupConfig, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote);
     const observedAt = frozenRun.observedAt = cursor.discoveredAt ?? runStartedAt;
     if (frozenRun.screen && !opts.retryFailed && cursor.pending && !cursor.done) {
       phase = 'freeze';
       cursor = await convertBlockedCursor(engine, cursor, key, assertActive, frozenRun);
     }
-    const config = loadConfig() ?? { engine: engine.kind };
-    const analyzeEvery = await importAnalyzeEveryPages(engine);
+    const config = loadConfig() ?? { engine: engine.kind }, analyzeEvery = await importAnalyzeEveryPages(engine);
     let batchStart = performance.now(), batchPages = 0, foregroundWaitStart = 0, foregroundBaseline = 0;
     let creditedPages = 0, creditStarted = 0, foregroundQueued = false;
     const sliceStarted = performance.now(), sliceFirstIndex = cursor.index, drainStartedAt = opts.drainStartedAt ?? Date.now();
     const bulk: BulkPass = { settings: opts.bulk && !company ? opts.bulk : { enabled: false, reason: null, size: 1, maxTxnMs: 0 }, perMemberMs: null, foregroundFirst: await foregroundPriority(engine) };
-    const waiveBatch = noopWaiversEnabled() && await waiverBatchEnabled(engine);
+    const waiveBatch = noopWaiversEnabled() && await waiverBatchEnabled(startupConfig);
     opts.onProgress?.({ phase: 'managed_sync.start', bankedFiles: cursor.index, total: cursor.entries.length });
     while (!cursor.done) {
       assertActive();
