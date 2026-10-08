@@ -1898,6 +1898,8 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | A managed write's preparation was cut off at its deadline persistence.max_preparation_attempts times (default 2), so the owner finished it failed instead of claiming it again. | One request whose preparation never finished used to hold its root for as long as its owner renewed the claim; now each attempt has a budget, a cut-off attempt is counted (a kill mid-preparation included), and at the limit the request is terminal so the rest of the root keeps moving. A sync holds that file with the same code; the receipt names the last recorded step and what it was waiting on. | Inspect the owner with gbrain sources writer status --source <id> --json (the step and its wait cause), fix or report the cause, then gbrain sources retry-held <id> and the same gbrain sync with the same options; a foreground write needs a new request_id. Run: gbrain sources status '{source_id}' --json | host_admin | `gbrain doctor --json` | 1 | no |
 
+More: [docs/guides/write-refusals.md#preparation_stalled](../../docs/guides/write-refusals.md#preparation_stalled)
+
 ### preview_changed
 
 <a id="preview_changed"></a>

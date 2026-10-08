@@ -269,6 +269,7 @@ export const CODES = {
   preparation_stalled: { class: 'server', retryable: false, actor: 'host_admin',
     summary: "A managed write's preparation was cut off at its deadline persistence.max_preparation_attempts times (default 2), so the owner finished it failed instead of claiming it again.",
     why: "One request whose preparation never finished used to hold its root for as long as its owner renewed the claim; now each attempt has a budget, a cut-off attempt is counted (a kill mid-preparation included), and at the limit the request is terminal so the rest of the root keeps moving. A sync holds that file with the same code; the receipt names the last recorded step and what it was waiting on.",
+    docs: 'docs/guides/write-refusals.md#preparation_stalled',
     suggestion: 'Inspect the owner with gbrain sources writer status --source <id> --json (the step and its wait cause), fix or report the cause, then gbrain sources retry-held <id> and the same gbrain sync with the same options; a foreground write needs a new request_id.',
     fix: { argv: ['gbrain', 'sources', 'status', '{source_id}', '--json'], consent: [], actor: 'host_admin', why: 'Read-only: lists the held files of the source with their repair route.', requires_exclusive: false } },
   preview_changed: { class: 'caller', summary: "The state changed since the approved preview." },
