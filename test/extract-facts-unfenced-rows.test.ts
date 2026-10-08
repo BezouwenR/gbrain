@@ -169,6 +169,7 @@ for (const backend of testBackends()) {
       const first = await extractFactsPhase(engine, root);
       expect(first.status).toBe('warn');
       expect(first.details).toMatchObject({ legacyRowsPending: 4, unfencedRowsFenced: 5 });
+      expect(first.summary).toMatch(new RegExp(`^[1-9]\\d* fact\\(s\\) reconciled across [1-9]\\d* page\\(s\\); skipped 1 page\\(s\\) holding 4 unfenced fact row\\(s\\) that could not be fenced: ${SLUG} `));
       const warnings = (first.details as { warnings: string[] }).warnings;
       expect(warnings).toContain(UNADOPTABLE_TOKEN(SLUG));
       // Location only: no rejected claim text reaches the warnings.
@@ -317,7 +318,7 @@ for (const backend of testBackends()) {
       const before = await factState(engine);
       const result = await extractFactsPhase(engine, root);
       expect(result.status).toBe('warn');
-      expect(result.summary).toBe('extract_facts skipped: 2 unfenced fact row(s) could not be fenced');
+      expect(result.summary).toBe(`0 fact(s) reconciled across 0 page(s); skipped 1 page(s) holding 2 unfenced fact row(s) that could not be fenced: ${SLUG} (2 warning(s))`);
       const warnings = (result.details as { warnings: string[] }).warnings;
       expect(warnings.some(w => w.startsWith(`FACTS_FENCE_FAILED: ${SLUG} (canonical file `) && w.includes('does not exist on this host'))).toBe(true);
       expect(warnings.some(w => w.includes('v0.31') || w.includes('force-retry'))).toBe(false);
