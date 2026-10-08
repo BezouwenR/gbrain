@@ -69,6 +69,7 @@ const NOT_PERFECT = String.raw`(?<!\b(?:has|have|'s|’s)\s+(?:\w+\s+)?)`;
 const OWNED = String.raw`(?:(?:her|his|their|my|the)\s+)?(?:time|stint|tenure|role|job|run)\s+`;
 
 /** Employment start cues; `notJob` guards the "became … at/of" and "took … role at" forms (U4). */
+// nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- notJob is only '' or the module-level literal U4_NOT_EMPLOYMENT_ROLE, both fixed at load; no caller input reaches the pattern
 const employmentStart = (notJob: string) => new RegExp(String.raw`\b(?:(?:re-?)?join(?:ed|s|ing)?(?:\s+${ROLE}(?:at|as))?|(?:was\s+)?hired\s+(?:by|at|as\s+${ROLE}at)|started\s+(?:at|with|working\s+(?:at|for)|(?:a\s+)?new\s+(?:role|job|position)\s+at)|became\s+${notJob}${ROLE}(?:at|of)|promoted\s+to\s+${ROLE}(?:at|of)|signed\s+on\s+(?:at|with)|named\s+${ROLE}(?:at|of)|accepted\s+(?:an?\s+)?(?:offer|role|position|job)\s+(?:at|with|from)|took\s+(?:an?\s+|the\s+)?${notJob}(?:\w+\s+){0,2}?(?:role|job|position)\s+(?:at|with)|came\s+(?:on\s+board|aboard)\s+(?:at|with)|went\s+to\s+work\s+(?:at|for)|returned\s+to)\s*$`, 'i');
 
 const EMPLOYMENT = {

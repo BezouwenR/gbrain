@@ -1310,7 +1310,7 @@ const coordinated = (between: string) => {
   const [lead, ...gaps] = between.split(INLINE_LINK_RE);
   return !lead.trim() && gaps.length > 0 && gaps.every(gap => CONNECTOR_RE.test(gap));
 };
-const GLOBAL_VERB_RULES = VERB_RULES.map(r => ({ ...r, re: new RegExp(r.re.source, `${r.re.flags.replace('g', '')}g`) }));
+const GLOBAL_VERB_RULES = VERB_RULES.map(r => ({ ...r, re: new RegExp(r.re.source, `${r.re.flags.replace('g', '')}g`) })); // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- recompiles the module's own literal VERB_RULES patterns
 interface Attachment { rule: VerbRule | null; suppressed: string[]; otherLink: boolean }
 function attachedVerb(context: string, targetSlug?: string, anchor?: number, explain = false, investorPrior: () => boolean = () => false, targetType?: string | null): Attachment | undefined {
   const fromAnchor = targetSlug && anchor !== undefined ? context.indexOf(targetSlug, anchor) : -1;
