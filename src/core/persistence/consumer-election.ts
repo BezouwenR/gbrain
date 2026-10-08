@@ -226,7 +226,7 @@ export class WaiterOnlyConsumer implements PersistenceConsumerLike {
       this.healthyOwnerTicks = 0;
       const inner = this.makeConsumer();
       this.inner = inner;
-      this.heartbeat = startConsumerHeartbeat(this.engine, this.opts.hostId, { kind: this.opts.kind, mode: () => this._mode, everyMs: this.opts.heartbeatEveryMs, deadlineMs: this.opts.phaseMs,
+      this.heartbeat = startConsumerHeartbeat(this.engine, this.opts.hostId, { kind: this.opts.kind, mode: () => this._mode, everyMs: this.opts.heartbeatEveryMs, deadlineMs: this.opts.phaseMs, identity: this.self,
         report: () => ({ restart_required: inner.restartRequired(), root_barrier_age_ms: inner.oldestRootBarrierAgeMs(), pool: this.opts.pool?.() ?? null }) });
       inner.start();
       if (mode === 'full') { if (this.timer) clearTimeout(this.timer); this.timer = undefined; }
