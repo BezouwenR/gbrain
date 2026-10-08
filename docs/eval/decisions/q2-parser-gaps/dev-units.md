@@ -413,3 +413,16 @@ bun scripts/q2-typing-dev.ts compare --base /tmp/none.json --arm /tmp/u2.json
 
 `--dev-phrasing-file` was patched into a local gbrain-evals copy the way the harness lane adds it (not yet pushed
 there when these runs were made). Zero model calls; no paid run.
+
+## Landing merge (master b5f12b12, v0.60.117.0)
+
+The landing merge brings in master's #6191 (no `works_at` or `founded` inferred toward person, meeting or calendar
+targets), which changes link typing for every build. On world-v1, the change from the confirmed package `afcec1ad`
+(723 lines, `1763359f…`) to the landing head (706 lines, `02b15d1b…`) is exactly the change from the master `afcec1ad`
+was built on (units off, 725 lines, `ce8f52bd…`) to master `b5f12b12` (708 lines, `3222513a…`): 22 lines removed and 5
+changed in both, every one a company-to-person `works_at` edge or its tense row, and no other line differs. With no
+unit, the landing head types world-v1 byte-identically to master `b5f12b12`. On temporal-edges phrasings A, A2 and A3
+(seeds 3 and 5, the harness's `--c-gate` settings) the landing head reproduces the pre-merge numbers exactly, with
+units off and with the shipped package: E5 false starts 48/48/37 → 0, E5 wrong closures 24/24/8 → 0, wrong
+transitions by identity 89/89/59 → 17/17/14, live recall and traps unchanged, A3 as-of 0.619 → 0.650.
+

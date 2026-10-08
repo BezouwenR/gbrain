@@ -9,13 +9,19 @@ page?" hint when a write creates a page.
 
 Off by default; turn the line grammar on with
 `gbrain config set line_grammar.enabled true`. While it is off, these lines are
-ordinary list text and their links keep their inferred types. In the held-out
-junk audit, the grammar read 18 of 696,295 list lines in public notes and
-transcripts as grammar lines, and none of the 18 were real: all were fact
-lines, mostly unfilled template slots (`- [Time] - [Event]`) and a few
-dictionary usage labels. That failed the 0.95 precision bar. No relation line
-was minted, and no timecode, citation, task box, date or machine-written
-section was read.
+ordinary list text and their links keep their inferred types. It stays off
+because natural notes still produce false reads. In the first held-out junk
+audit, the grammar read 18 of 696,295 list lines in public notes and
+transcripts as grammar lines, and none of the 18 were real (mostly unfilled
+template slots and dictionary usage labels). The guards in
+[Lines the grammar does not read](#lines-the-grammar-does-not-read) remove
+those shapes, but the second held-out audit (decision `q2-parser-gaps-2026-10`,
+fresh natural pages) still minted 583 grammar lines, 459 of them wrong: an
+upper bound of 75.6 wrong reads per 100,000 list lines against a bar of 2. It
+also minted 17 of 52 decoy lines built to look like grammar lines. Typed lines
+written on purpose were read correctly, 511 of 511. Turn it on when you or
+your agent write typed lines on purpose; on a brain of imported notes and
+transcripts, expect some list lines to be read as grammar lines they are not.
 
 When it is on, a list item that names a relation type and exactly one link
 states that link's type:

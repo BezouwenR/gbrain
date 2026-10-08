@@ -101,7 +101,9 @@ export { parseInlineCitationTimelineEntries, type InlineCitationTimelineCandidat
 // 2026-10-05T03: typed relation lines (core/line-grammar.ts) state their link's type; a per-edge verb that
 // belongs to another link in the window no longer types this one; "joined [X] as <role>" reads as works_at.
 // Re-extract so existing pages pick these up.
-export const LINK_EXTRACTOR_VERSION_TS = '2026-10-05T03:00:00Z';
+// 2026-10-08: adviser wording and local negation (U1), board/observer/investor wording never types works_at (U3)
+// and advisory/board/investor roles are not employment starts (U4), each confirmed on held-out data (Q2).
+export const LINK_EXTRACTOR_VERSION_TS = '2026-10-08T20:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 

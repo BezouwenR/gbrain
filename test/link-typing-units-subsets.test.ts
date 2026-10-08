@@ -1,7 +1,8 @@
 /**
  * Every subset of the shipped typing units (U1, U3, U4: 2^3 = 8) passes the frozen examples
  * (test/helpers/typing-unit-examples.ts). With no unit, extraction types the world-v1 corpus byte-identically to master
- * (digest of master c5fb0201); with the shipped package it types it as the confirmed package afcec1ad did
+ * (digest of master b5f12b12); with the shipped package it types it as the confirmed package afcec1ad did, plus master's
+ * #6191 target-role rule (the only difference; docs/eval/decisions/q2-parser-gaps/dev-units.md, Landing merge)
  * (scripts/q2-typing-dev.ts world-v1). Those checks need a gbrain-evals checkout (GBRAIN_TEST_TYPING_EVALS_DIR, else
  * ../gbrain-evals) and are skipped without one.
  */
@@ -40,7 +41,7 @@ test.skipIf(!haveWorld)('no unit: world-v1 typing is byte-identical to master', 
   expect(r.sha256).toBe(master);
 }, 60_000);
 
-test.skipIf(!haveWorld)('shipped package: world-v1 typing is byte-identical to the confirmed package afcec1ad', async () => {
+test.skipIf(!haveWorld)('shipped package: world-v1 typing is the confirmed package afcec1ad plus master\'s target-role rule', async () => {
   const confirmed = readFileSync(join(import.meta.dir, 'fixtures/q2-typing-units/world-v1-confirmed-package.sha256'), 'utf8').trim();
   const r = await worldV1Edges(loadWorldV1(worldDir), extractPageLinks as never, deriveTemporalEvidence as never);
   expect(r.sha256).toBe(confirmed);
