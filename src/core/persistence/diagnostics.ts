@@ -7,7 +7,7 @@ import { writeHealth } from './health.ts';
 import { claimStall, claimStateOf, isOwnerThisProcess, sqlLabel, type ClaimRow, type ClaimState, type ClaimStall } from './claim-phase.ts';
 import { cliRenderContext, renderAction, type Action, type RenderedAction } from '../agent-output.ts';
 import { enginePoolStats, type DriverPoolStats } from '../postgres-engine/pool-stats.ts';
-import { consumerLive, listHostConsumers, type ConsumerRow } from './consumer-heartbeat.ts';
+import { listHostConsumers, type ListedConsumer } from './consumer-heartbeat.ts';
 import type { WriteRequestState } from './types.ts';
 import { preparationBudgetMs } from './preparation-budget.ts';
 import { readWriteSwitchSnapshot } from './switches.ts';
@@ -47,7 +47,7 @@ export function writerNextAction(reason: string | null | undefined): string {
  */
 export interface ClaimNextAction { code: 'claim_running' | 'claim_overdue' | 'claim_lapsed'; why: string; retry_after_ms: number | null; fix: RenderedAction }
 export function claimNextAction(claim: ClaimState, stall: ClaimStall | null, policy: { budgetMs: number | null; ceilingMs: number }, sourceId: string | null,
-  owner: { row: ConsumerRow | null; live: boolean | null }, now = Date.now()): ClaimNextAction {
+  owner: { row: ListedConsumer | null; live: boolean | null }, now = Date.now()): ClaimNextAction {
   const ctx = cliRenderContext();
   const status = ['gbrain', 'sources', 'writer', 'status', ...(sourceId ? ['--source', sourceId] : []), '--json'];
   const who = claim.owner ? `${claim.owner.kind} pid ${claim.owner.pid}` : 'the owner';
@@ -109,7 +109,7 @@ export async function readOwnerBackends(engine: BrainEngine, owners: Array<Pick<
   }
 }
 /** #6317 (C1): the pool numbers for a running claim: this process's driver when it owns the claim, else the owner's heartbeat row. */
-function claimPool(engine: BrainEngine, claim: ClaimState, row: ConsumerRow | null): { pool: DriverPoolStats | null; pool_source: 'driver' | 'heartbeat' | null } {
+function claimPool(engine: BrainEngine, claim: ClaimState, row: ListedConsumer | null): { pool: DriverPoolStats | null; pool_source: 'driver' | 'heartbeat' | null } {
   if (isOwnerThisProcess(claim.owner)) return { pool: enginePoolStats(engine), pool_source: enginePoolStats(engine) ? 'driver' : null };
   return { pool: row?.pool ?? null, pool_source: row?.pool ? 'heartbeat' : null };
 }
@@ -173,7 +173,7 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
   // #6317 (C1): the heartbeat rows of this host, read once, so each running claim can name its owner's liveness and pool.
   const { existingLocalHostId } = await import('./identity.ts');
   const hostId = existingLocalHostId();
-  const consumerRows = hostId ? await listHostConsumers(engine, hostId) : [];
+  const consumerRows = hostId ? await listHostConsumers(engine, hostId).catch(() => []) : [];
   const tracked = (engine as { getPoolDiagnostics?: () => { tracked?: unknown } | null }).getPoolDiagnostics?.()?.tracked ?? null;
   const claimStates = blockers.map(row => claimStateOf({ state: row.state, claim_phase: row.claim_phase, execution_token: row.execution_token, claim_lapsed: row.claim_lapsed, publication_started: row.publication_started }));
   const backends = await readOwnerBackends(engine, claimStates.flatMap(state => state?.owner ? [state.owner] : []));
@@ -200,8 +200,8 @@ export async function readWriterDiagnostics(engine: BrainEngine) {
       const ownerBackends = state?.owner ? backends.byOwner.get(`gbrain ${state.owner.kind}:${state.owner.pid}:${(state.owner.nonce ?? '').slice(0, 8)}`) ?? [] : [];
       const claim = state ? { ...state, ...(state.owner ? { owner: { ...state.owner, backend: ownerBackends, backend_visibility: backends.visibility } } : {}),
         ...(budget === null ? {} : { budget_ms: budget }), stall, ...claimPool(engine, state, ownerRow), pool_tracked_subset: tracked,
-        owner_live: ownerRow ? consumerLive(ownerRow) : null, owner_mode: ownerRow?.mode ?? null,
-        next: claimNextAction(state, stall, { budgetMs: budget, ceilingMs }, row.source_id, { row: ownerRow, live: ownerRow ? consumerLive(ownerRow) : null }) } : undefined;
+        owner_live: ownerRow ? ownerRow.liveness === 'live' : null, owner_mode: ownerRow?.mode ?? null,
+        next: claimNextAction(state, stall, { budgetMs: budget, ceilingMs }, row.source_id, { row: ownerRow, live: ownerRow ? ownerRow.liveness === 'live' : null }) } : undefined;
       return { ...row, preparation_attempts: row.preparation_attempts ?? 0, ...health, ...(claim ? { claim } : {}), next_action: health.diagnostic?.next_action === 'inspect_owner' && advice !== WRITER_INSPECTION_HINT
         ? `${WRITER_INSPECTION_HINT} ${advice}` : advice };
     }) };

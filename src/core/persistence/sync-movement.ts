@@ -35,7 +35,7 @@ import type { BrainEngine } from '../engine.ts';
 import { readManagedSyncBacklog, type ManagedSyncBacklog } from './sync-drain.ts';
 import { claimStateOf, type ClaimState } from './claim-phase.ts';
 import { readPreparationPolicy } from './switches.ts';
-import { consumerLive, listHostConsumers } from './consumer-heartbeat.ts';
+import { listHostConsumers } from './consumer-heartbeat.ts';
 
 export type MovementState = 'moving' | 'held' | 'parked' | 'not_moving' | 'nothing_pending';
 export interface MovementHead {
@@ -103,7 +103,7 @@ export async function readSourceMovement(engine: BrainEngine, opts: { sourceIds?
   const host = localHostId();
   const localConsumer = persistenceConsumerStatus(engine).state === 'open';
   let heartbeat: Promise<boolean> | undefined;
-  const liveHeartbeat = () => heartbeat ??= listHostConsumers(engine, host).then(rows => rows.some(row => (row.mode === 'full' || row.mode === 'promoted') && consumerLive(row, now)));
+  const liveHeartbeat = () => heartbeat ??= listHostConsumers(engine, host).then(rows => rows.some(row => (row.mode === 'full' || row.mode === 'promoted') && row.liveness === 'live'), () => false);
   const out: SourceMovement[] = [];
   for (const binding of bindings) {
     const [mark] = await engine.executeRaw<WatermarkRow>(`SELECT

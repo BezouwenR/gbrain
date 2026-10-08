@@ -518,7 +518,7 @@
         },
         {
           "category": "meta",
-          "message": "986 column(s) verified against live schema",
+          "message": "1001 column(s) verified against live schema",
           "name": "schema_columns",
           "status": "ok"
         },
@@ -1809,12 +1809,36 @@
         {
           "category": "ops",
           "details": {
-            "docs": "docs/guides/troubleshooting.md#persistence-pooler-transaction-mode"
+            "consumers": [],
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#two-consumers-on-host"
           },
-          "message": "PGLite has no pooler.",
-          "name": "persistence_pooler_transaction_mode",
-          "readiness_state": "not_applicable",
-          "severity": "info",
+          "message": "PGLite admits one process; no consumer heartbeat rows are kept.",
+          "name": "two_consumers_on_host",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#two-consumers-on-host",
+            "owners": []
+          },
+          "message": "PGLite admits one process; no consumer heartbeat rows are kept.",
+          "name": "consumers_without_heartbeat",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#host-identity-mismatch",
+            "host_id": "<uuid>",
+            "host_json_path": "<home>/.gbrain/persistence/host.json",
+            "mismatches": []
+          },
+          "message": "This process's host identity (<home>/.gbrain/persistence/host.json) owns every binding this filesystem holds.",
+          "name": "host_identity_mismatch",
           "status": "ok"
         },
         {

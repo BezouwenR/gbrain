@@ -1408,7 +1408,7 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 |---|---|---|---|---|---|---|
 | A facts or takes fence in the page cannot be imported without dropping or guessing rows, so the page (or the file) was not written. | Facts and takes fences are the page's structured rows. Importing a fence that does not parse, repeats a marker or reuses a row number would silently drop or renumber rows, so coordinated writers refuse it and managed sync holds the one file while the rest of the source syncs. | A refused write: fix the fence the message names (fence, section and rows; the reason says what is wrong) and send the page again with a new request_id, or write rows with remember / takes_add. A held file or stored page: the maintenance run repairs it; preview it now with gbrain repair fences --source <id> on the brain host. | agent | `repeat the read that failed` | 1 | no |
 
-Reasons: `header_unmapped`, `no_header`, `row_before_header`, `short_row`, `extra_cells`, `claim_split`, `holder_unresolved`, `missing_begin`, `split_rows`, `unclosed_trailing_content`, `marker_near_miss`, `repeated_marker`, `takes_in_facts`, `superseded_ambiguous`, `enum_unmapped`, `weight_missing`, `holder_missing`, `confidence_out_of_range`, `claim_value_invalid`, `takes_kind_unsupported`, `unparseable`, `row_collision`, `quoted_fence_rows`, `stored_row_collision`, `withdrawn_claim_in_malformed_fence`, `target_fence_malformed`, `prepare_time`, `normalizer_failed`, `llm_unavailable`, `llm_empty`, `llm_refused`, `llm_malformed`, `llm_truncated`, `llm_declined`, `llm_disabled`, `no_measured_model`, `budget_exhausted`, `no_pricing`, `ledger_unavailable`, `owner_unavailable`, `owner_cli_required`, `sync_in_progress`, `time_budget`, `changed_since_read`, `changed_since_preview`, `still_invalid`, `claim_changed`, `row_number_changed`, `visibility_loosened`, `row_count_changed`, `cell_changed`, `protection_loosened`.
+Reasons: `header_unmapped`, `no_header`, `row_before_header`, `short_row`, `extra_cells`, `claim_split`, `holder_unresolved`, `missing_begin`, `split_rows`, `unclosed_trailing_content`, `marker_near_miss`, `repeated_marker`, `takes_in_facts`, `superseded_ambiguous`, `enum_unmapped`, `weight_missing`, `holder_missing`, `confidence_out_of_range`, `claim_value_invalid`, `takes_kind_unsupported`, `unparseable`, `row_collision`, `quoted_fence_rows`, `stored_row_collision`, `withdrawn_claim_in_malformed_fence`, `target_fence_malformed`, `prepare_time`, `normalizer_failed`, `llm_unavailable`, `llm_empty`, `llm_refused`, `llm_malformed`, `llm_truncated`, `llm_declined`, `llm_disabled`, `no_measured_model`, `budget_exhausted`, `no_pricing`, `ledger_unavailable`, `owner_unavailable`, `owner_cli_required`, `host_mismatch`, `transfer_in_progress`, `clone_in_progress`, `incarnation_changed`, `local_path_missing`, `coordination_path_missing`, `sync_in_progress`, `time_budget`, `changed_since_read`, `changed_since_preview`, `still_invalid`, `claim_changed`, `row_number_changed`, `visibility_loosened`, `row_count_changed`, `cell_changed`, `protection_loosened`.
 
 More: [docs/guides/write-refusals.md#invalid_fence](../../docs/guides/write-refusals.md#invalid_fence)
 
@@ -1822,7 +1822,11 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| The brain's persistence owner is not reachable right now. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 1 | yes |
+| The source's canonical owner cannot run this write or maintenance step right now; `reason` says which condition. | A managed source publishes only through the host that owns its checkout. `host_mismatch`: another host id owns it (two GBRAIN_HOME identity files on one machine look the same; both ids are printed, and a retry on this host cannot help). `transfer_in_progress`: the worktree is draining for a writer transfer; `clone_in_progress`: a topology clone is recovering it; both clear by themselves. `binding_missing`, `incarnation_changed`, `local_path_missing` and `coordination_path_missing` name an incomplete or outdated registration. `not_sent` / `outcome_unknown`: the local owner's IPC lane did not take the write, or lost its acknowledgment. | Read gbrain sources writer status --source <id> --json on the brain host. A transfer or clone in progress: wait and retry. host_mismatch: run the step on the owner host, or give the worker and the shell one GBRAIN_HOME; never copy or regenerate host.json. Nothing claims or transfers ownership to run maintenance. | agent | `repeat the read that failed` | 1 | yes |
+
+Reasons: `host_mismatch`, `transfer_in_progress`, `clone_in_progress`, `binding_missing`, `incarnation_changed`, `coordination_path_missing`, `local_path_missing`, `not_sent`, `outcome_unknown`.
+
+More: [docs/guides/troubleshooting.md#owner-unavailable](../../docs/guides/troubleshooting.md#owner-unavailable)
 
 ### page_identity_changed
 
@@ -1907,16 +1911,6 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | This caller is not authorized for the operation. | Only the operator of the brain host can change what blocks this. | Only the brain host's operator can resolve this. Tell the user the message and run `gbrain doctor --json` on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
-
-### persistence_pooler_transaction_mode
-
-<a id="persistence_pooler_transaction_mode"></a>
-
-| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
-|---|---|---|---|---|---|---|
-| The resident write consumer's ordinary pool goes through a transaction-mode pooler (prepared statements off), where a consumer round-trip can be lost and one claim then holds its root for as long as the process lives. | A transaction-mode pooler (PgBouncer, Supavisor on port 6543) assigns a server connection per transaction and can leave a client waiting for a reply that never arrives (the backend reads `active` in `ClientRead`); the owner's phase deadline fires but the awaited promise never settles, so the claim renews forever with nothing in flight at the database. The same catch-up on the session-mode URL (port 5432) or the direct URL drains. Short-lived readers on the pooler are unaffected; the finding is about the processes that hold write claims. | Set DATABASE_URL for gbrain serve, gbrain sync and the jobs worker to the session-mode pooler URL or the direct database URL on their supervisor, restart them, then verify with gbrain sources writer movement. Run: gbrain sources writer status --json | host_admin | `gbrain doctor --only persistence_pooler_transaction_mode --json` | 1 | no |
-
-More: [docs/guides/troubleshooting.md#persistence-pooler-transaction-mode](../../docs/guides/troubleshooting.md#persistence-pooler-transaction-mode)
 
 ### persistence_write_stall
 
@@ -2508,7 +2502,9 @@ More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-c
 
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
-| A sync is running on this source. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 1 | yes |
+| A sync is running on this source, or a write in flight or the sync's frozen manifest still names the file a repair would write. | A repair that changed a file the running sync admits later would make that entry refuse on its raw hash, and a file a write in flight names would be written twice; so the one candidate waits while the rest of the source is repaired. `candidate_in_flight`: the file is named; `busy_set_unreadable`: the busy set could not be read, so every candidate waited. | Nothing to do for the repair: the next run reads the file again. To finish the sync now: gbrain sync --source <id> --no-pull. | agent | `repeat the read that failed` | 1 | yes |
+
+Reasons: `candidate_in_flight`, `busy_set_unreadable`.
 
 More: [docs/guides/write-refusals.md#sync_in_progress](../../docs/guides/write-refusals.md#sync_in_progress)
 

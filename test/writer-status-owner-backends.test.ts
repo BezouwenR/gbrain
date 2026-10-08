@@ -7,8 +7,6 @@
  * (`backend_visibility`: session, pooled, unavailable). The running claim also
  * ends with one `next` envelope, carries `last_sql` from the stamp and the
  * pool numbers from the vendored driver when this process owns the claim.
- * The doctor check `persistence_pooler_transaction_mode` fires from the
- * engine's own `prepare: false` mark (the port-6543 convention), never a probe.
  *
  * PGLite: the fields exist and read `unavailable`/empty. Postgres
  * (DATABASE_URL): this process's own connection appears under its name.
@@ -23,7 +21,6 @@ import { boundedReads } from '../src/core/persistence/bounded-reads.ts';
 import { consumerIdentity } from '../src/core/persistence/consumer-heartbeat.ts';
 import { gbrainApplicationName } from '../src/core/db.ts';
 import { driverPoolStats } from '../src/core/postgres-engine/pool-stats.ts';
-import { persistencePoolerEntry } from '../src/commands/doctor/checks/persistence-pooler.ts';
 import { isolatedPersistencePostgres } from './helpers/persistence-postgres.ts';
 import { testBackends } from './helpers/test-backends.ts';
 
@@ -134,7 +131,7 @@ describe('writer status running claims', () => {
     expect(overdue.why).toContain('past the 600s ceiling');
     const young = claimStateOf({ state: 'running', claim_phase: claimPhaseStamp({ ...startClaimPhase(Date.now() - 10_000), step: 'raw_hash', waitingOn: 'db' }, 't'), execution_token: 't' })!;
     const wedged = claimNextAction(young, null, { budgetMs: 120_000, ceilingMs: 600_000 }, 's',
-      { row: { host_id: 'h', pid: process.pid, nonce: 'n', pid_ns: null, kind: 'serve', mode: 'full', started_at: '', renewed_at: new Date().toISOString(), restart_required: true, root_barrier_age_ms: null, pool: null, host_json_path: null, persistence_home: null, minted_under: null, version: null }, live: true });
+      { row: { host_id: 'h', pid: process.pid, nonce: 'n', pid_ns: null, kind: 'serve', mode: 'full', started_at: '', renewed_at: new Date().toISOString(), restart_required: true, root_barrier_age_ms: null, pool: null, host_json_path: '/tmp/host.json', persistence_home: '/tmp', minted_under: null, version: 'test', renewed_age_ms: 0, age_ms: 0, liveness: 'live', self: false }, live: true });
     expect(wedged).toMatchObject({ code: 'claim_overdue', fix: { next: 'tell_user_to_run' } });
     expect(wedged.why).toContain('restart_required');
     const running = claimNextAction(young, null, { budgetMs: 120_000, ceilingMs: 600_000 }, 's', { row: null, live: null });
@@ -145,16 +142,3 @@ describe('writer status running claims', () => {
   });
 });
 
-describe('doctor persistence_pooler_transaction_mode', () => {
-  const ctxFor = (engine: unknown) => ({ engine } as unknown as Parameters<typeof persistencePoolerEntry.run>[0]);
-  test('fires from the engine\'s prepare:false mark with a host-admin fix; ok with prepared statements; not applicable on PGLite', async () => {
-    const pooled = { kind: 'postgres', getPoolDiagnostics: () => ({ prepare: false, poolMax: 10 }), connectionManager: { describeMode: () => ({ mode: 'split', direct_host: 'db.example:5432' }) } };
-    const [warn] = await persistencePoolerEntry.run(ctxFor(pooled)) as unknown as Array<Record<string, any>>;
-    expect(warn).toMatchObject({ name: 'persistence_pooler_transaction_mode', status: 'warn', readiness_state: 'degraded', details: { prepare: false, pool_mode: 'split' },
-      fix: { actor: 'host_admin', consent: [], argv: ['gbrain', 'sources', 'writer', 'status', '--json'], verify: { argv: ['gbrain', 'doctor', '--only', 'persistence_pooler_transaction_mode', '--json'] } } });
-    expect(warn!.message).toContain('ClientRead');
-    const session = { kind: 'postgres', getPoolDiagnostics: () => ({ prepare: true, poolMax: 10 }) };
-    expect((await persistencePoolerEntry.run(ctxFor(session)) as unknown as Array<Record<string, any>>)[0]).toMatchObject({ status: 'ok' });
-    expect((await persistencePoolerEntry.run(ctxFor({ kind: 'pglite' })) as unknown as Array<Record<string, any>>)[0]).toMatchObject({ status: 'ok', readiness_state: 'not_applicable' });
-  });
-});

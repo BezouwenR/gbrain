@@ -711,7 +711,15 @@
       },
       {
         "category": "ops",
-        "name": "persistence_pooler_transaction_mode"
+        "name": "two_consumers_on_host"
+      },
+      {
+        "category": "ops",
+        "name": "consumers_without_heartbeat"
+      },
+      {
+        "category": "ops",
+        "name": "host_identity_mismatch"
       },
       {
         "category": "ops",

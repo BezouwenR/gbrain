@@ -530,17 +530,17 @@ export function engineStallProbe(engine: BrainEngine, sourceId?: string): StallP
     async owner(claim) {
       if (claim.owner_pid === null) return null;
       const { localHostId } = await import('./identity.ts');
-      const { listHostConsumers, consumerLive } = await import('./consumer-heartbeat.ts');
-      const rows = await listHostConsumers(engine, localHostId());
+      const { listHostConsumers } = await import('./consumer-heartbeat.ts');
+      const rows = await listHostConsumers(engine, localHostId()).catch(() => []);
       const row = rows.find(r => r.pid === claim.owner_pid && (claim.owner_nonce === null || r.nonce === claim.owner_nonce));
-      return row ? { kind: row.kind, pid: row.pid, nonce: row.nonce, mode: row.mode, live: consumerLive(row), restart_required: row.restart_required, root_barrier_age_ms: row.root_barrier_age_ms } : null;
+      return row ? { kind: row.kind, pid: row.pid, nonce: row.nonce, mode: row.mode, live: row.liveness === 'live', restart_required: row.restart_required, root_barrier_age_ms: row.root_barrier_age_ms } : null;
     },
     async reclaimableHere() {
       const { persistenceConsumerStatus } = await import('./service.ts');
       if (persistenceConsumerStatus(engine).state === 'open') return true;
       const { localHostId } = await import('./identity.ts');
-      const { listHostConsumers, consumerLive } = await import('./consumer-heartbeat.ts');
-      return (await listHostConsumers(engine, localHostId())).some(row => (row.mode === 'full' || row.mode === 'promoted') && consumerLive(row));
+      const { listHostConsumers } = await import('./consumer-heartbeat.ts');
+      return (await listHostConsumers(engine, localHostId()).catch(() => [])).some(row => (row.mode === 'full' || row.mode === 'promoted') && row.liveness === 'live');
     },
     ...(sourceId ? { async head() {
       const [row] = await engine.executeRaw<{ head_state: string; head_claim_phase: unknown; head_token: string | null; head_lapsed: boolean | null; head_kind: string | null }>(
