@@ -128,7 +128,8 @@ for (const backend of testBackends()) {
       const attempt = (assignments: Array<{ id: number; row_num: number }>) => submitFactFenceAdoption(engine, authority, LEGACY_FILE_SLUG,
         { content, expectedRevision: snapshot.revision, assignments, file: true });
       await expect(attempt([{ id: seed.legacyFactIds[0], row_num: 1 }])).rejects.toMatchObject({ code: 'revision_conflict' });
-      await expect(attempt([{ id: seed.legacyFactIds[1], row_num: 1 }])).rejects.toMatchObject({ code: 'invalid_params' });
+      // #6278: a fence row that does not read back as its legacy fact is a planning defect (class server), not caller input.
+      await expect(attempt([{ id: seed.legacyFactIds[1], row_num: 1 }])).rejects.toMatchObject({ code: 'fence_unrenderable' });
       await expect(attempt([{ id: seed.legacyFactIds[0], row_num: 1 }, { id: seed.legacyFactIds[1], row_num: 1 }]))
         .rejects.toMatchObject({ code: 'invalid_params' });
       expect(await factRows(engine, [...seed.legacyFactIds, seed.extractorFactId])).toEqual(before);

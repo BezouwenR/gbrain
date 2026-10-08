@@ -7,7 +7,7 @@ import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
 import type { Action } from '../agent-output.ts';
 import { currentSubmissionAuthority } from '../minions/submission-authority.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
-import { parseFactsFence } from '../facts-fence.ts';
+import { normalizeClaimWhitespace, parseFactsFence } from '../facts-fence.ts';
 import { submissionAuthority, authorizeStoredRequest, authorizeWrite } from './authority.ts';
 import { currentVerifiedLocalWriter, localHostId, registerLocalWriter } from './identity.ts';
 import { getWorktreeBinding, managedPersistenceEnabled, type WorktreeBinding } from './ownership.ts';
@@ -288,10 +288,14 @@ async function prepareFactFenceAdoption(engine: BrainEngine, row: WriteRequest, 
           `A legacy fact on ${row.slug} in ${row.source_id} changed before fact-fence adoption request ${row.request_id} published; nothing was written. The next fact backfill run re-reads the facts and plans a fresh request.`,
           { fix: receiptFix(row) });
       }
+      // #6278: the fence codec trims and folds line endings, so the cell is
+      // compared with the legacy text modulo that whitespace; the cell's text
+      // is what the projection expects and is written back on apply.
       const cell = fence.get(assignment.row_num);
-      if (!cell?.active || cell.claim !== fact.value.fact || cell.visibility !== fact.value.visibility) {
-        throw opError('invalid_params', 'The adopted fence row does not render its legacy fact.',
-          `Fact-fence adoption request ${row.request_id} for ${row.slug} in ${row.source_id} was refused before publication; nothing changed. The rendered fence does not match the facts it adopts, so report the request ID to the user rather than running the same backfill again.`,
+      if (!cell?.active || cell.claim === '' || normalizeClaimWhitespace(cell.claim) !== normalizeClaimWhitespace(String(fact.value.fact))
+        || cell.visibility !== fact.value.visibility) {
+        throw opError('fence_unrenderable', 'The adopted fence row does not render its legacy fact.',
+          `Fact-fence adoption request ${row.request_id} for ${row.slug} in ${row.source_id} was refused before publication; nothing changed. Fence row ${assignment.row_num} does not read back as legacy fact ${assignment.id} (${!cell ? 'the row is missing from the rendered fence' : !cell.active ? 'it reads back struck' : cell.claim === '' ? 'it reads back empty' : cell.visibility !== fact.value.visibility ? 'its visibility differs' : 'its text differs by more than whitespace'}). This is a gbrain planning defect, not caller input: report the request ID with the gbrain version; the legacy fact stays active and searchable and nothing is lost.`,
           { fix: receiptFix(row) });
       }
     }
@@ -307,10 +311,13 @@ async function prepareFactFenceAdoption(engine: BrainEngine, row: WriteRequest, 
   return { ...prepared, validate: async tx => { await prepared.validate?.(tx); await check(tx, true); }, apply: async tx => {
     // Runs ahead of the page import and its canonical projection, so the
     // projection's expiry pass and insertFacts see the adopted positions.
-    const adopted = await tx.executeRaw(`UPDATE facts f SET row_num=a.row_num,source_markdown_slug=$2
-      FROM jsonb_to_recordset($3::text::jsonb) AS a(id integer,row_num integer)
+    // The fence cell's parsed text is written back with the row number: the
+    // projection expires any row whose (row_num, fact, visibility) differs from
+    // its fence row and inserts a new one, which would lose the legacy id.
+    const adopted = await tx.executeRaw(`UPDATE facts f SET row_num=a.row_num,source_markdown_slug=$2,fact=a.fact
+      FROM jsonb_to_recordset($3::text::jsonb) AS a(id integer,row_num integer,fact text)
       WHERE f.source_id=$1 AND f.id=a.id AND f.row_num IS NULL RETURNING f.id`,
-    [row.source_id, row.slug, JSON.stringify(facts.map(({ id, row_num }) => ({ id, row_num })))]);
+    [row.source_id, row.slug, JSON.stringify(facts.map(({ id, row_num }) => ({ id, row_num, fact: fence.get(row_num)!.claim })))]);
     if (adopted.length !== facts.length) throw opError('revision_conflict', 'A legacy fact was adopted by another run.',
       `Another run adopted a legacy fact on ${row.slug} in ${row.source_id} while request ${row.request_id} was publishing, so its transaction rolled back. Read the receipt with gbrain write-request -- ${row.request_id} for the final state before planning any new adoption.`,
       { fix: receiptFix(row) });
