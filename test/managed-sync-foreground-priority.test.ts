@@ -67,7 +67,7 @@ function writer(source: string, slugs: string[], intervalMs = 0, go?: string) {
   return async () => {
     const [stderr, code] = await Promise.all([new Response(child.stderr).text(), child.exited]);
     if (code !== 0) throw new Error(`writer exited ${code}: ${stderr.slice(-2000)}`);
-    return JSON.parse(readFileSync(out, 'utf8')) as Array<{ slug: string; state: string; error?: string; submitted: number; returned: number }>;
+    return JSON.parse(readFileSync(out, 'utf8')) as Array<{ slug: string; state: string; error?: string; submitted: number; returned: number; admitted?: number }>;
   };
 }
 
@@ -137,9 +137,11 @@ for (const lanes of [2, 1]) {
     // With lanes, groups admitted ahead were queued when the write arrived; it still went first.
     if (lanes > 1) expect(run.before.length).toBeGreaterThan(0);
     const put = run.final.find(row => row.slug === run.target)!;
-    // No sync group started (its head chosen) after the write was admitted and before it committed.
+    // No sync group started (its head chosen) after the write's admission committed and before the write committed.
+    // `created` is the admission transaction's start: a claim choosing its row before the commit cannot see the write.
+    expect(run.written.admitted).toBeGreaterThanOrEqual(put.created - 5);
     const heads = run.final.filter(row => row.kind?.startsWith('managed_sync_') && (row.grp ?? row.request_id) === row.request_id);
-    const early = heads.filter(row => { const claimed = run.claims.get(row.id) ?? Infinity; return claimed >= put.created && claimed < put.completed!; }).map(row => row.slug);
+    const early = heads.filter(row => { const claimed = run.claims.get(row.id) ?? Infinity; return claimed >= run.written.admitted! && claimed < put.completed!; }).map(row => row.slug);
     expect(early).toEqual([]);
     expect(run.final.filter(row => row.kind?.startsWith('managed_sync_import')).every(row => row.state === 'committed')).toBe(true);
   }), 300_000);

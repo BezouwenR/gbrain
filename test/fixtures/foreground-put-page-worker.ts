@@ -11,24 +11,30 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { submitPageMutation } from '../../src/core/persistence/page-mutations.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
+import { observeAdmissionTransactions } from '../../scripts/persistence/read-admission.ts';
 
-const engine = new PostgresEngine();
-await engine.connect({ database_url: process.env.WORKER_DATABASE_URL!, poolSize: 4 });
+// `admitted`: when the write's admission transaction committed (wall clock), so the test can tell a claim that
+// could already see the write from one that chose its row before the write was visible.
+let admittedAt: number | undefined;
+const postgres = new PostgresEngine();
+const engine = observeAdmissionTransactions(postgres, () => { admittedAt ??= Date.now(); });
+await postgres.connect({ database_url: process.env.WORKER_DATABASE_URL!, poolSize: 4 });
 const sourceId = process.env.WORKER_SOURCE!;
 const interval = Number(process.env.WORKER_INTERVAL_MS ?? '0');
-const results: Array<{ slug: string; state: string; error?: string; submitted: number; returned: number }> = [];
+const results: Array<{ slug: string; state: string; error?: string; submitted: number; returned: number; admitted?: number }> = [];
 const logger = { info() {}, warn() {}, error() {} };
 const go = process.env.WORKER_GO;
 if (go) while (!existsSync(go) || !readFileSync(go, 'utf8')) await Bun.sleep(5);
 const slugs = (go ? readFileSync(go, 'utf8') : process.env.WORKER_SLUGS!).split(',');
 for (const slug of slugs) {
   const submitted = Date.now();
+  admittedAt = undefined;
   try {
     const out = await submitPageMutation({ engine, config: { engine: 'postgres', database_url: process.env.WORKER_DATABASE_URL! }, remote: false, dryRun: false, sourceId, logger } as never,
       { operation: 'put_page', params: { slug, content: `---\ntitle: ${slug}\n---\nA foreground note written during the catch-up.\n` }, waitMs: 60_000 });
-    results.push({ slug, state: String((out as { state?: string }).state ?? ''), submitted, returned: Date.now() });
+    results.push({ slug, state: String((out as { state?: string }).state ?? ''), submitted, returned: Date.now(), admitted: admittedAt });
   } catch (error) {
-    results.push({ slug, state: 'error', error: (error as Error).message, submitted, returned: Date.now() });
+    results.push({ slug, state: 'error', error: (error as Error).message, submitted, returned: Date.now(), admitted: admittedAt });
   }
   if (interval) await Bun.sleep(interval);
 }

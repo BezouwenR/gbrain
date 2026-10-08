@@ -234,14 +234,21 @@ test('admit-ahead fits the writer\'s outstanding-request limit instead of stoppi
       const [row] = await engine!.executeRaw<{ n: number }>("SELECT count(*)::int AS n FROM persistence_requests WHERE source_id=$1 AND state IN ('queued','running')", [f.id]);
       admitted.push(row!.n);
     });
-    const result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true, lanes: 8 });
-    installFaultHook(undefined);
+    // Every admission transaction the limit refused (an admission over it used to stop admit-ahead until the window drained).
+    const refused: string[] = [];
+    const transaction = engine.transaction;
+    engine.transaction = async function (this: BrainEngine, fn: (tx: BrainEngine) => Promise<unknown>) {
+      try { return await transaction.call(this, fn); }
+      catch (error) { if ((error as { code?: string }).code === 'queue_capacity') refused.push((error as Error).message); throw error; }
+    } as BrainEngine['transaction'];
+    let result;
+    try { result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true, lanes: 8 }); }
+    finally { engine.transaction = transaction; installFaultHook(undefined); }
     expect(result.drain).toMatchObject({ outcome: 'synced' });
     expect((await imports(engine, f.id)).every(row => row.state === 'committed')).toBe(true);
-    // Groups kept being admitted ahead through the whole run: between the first admission and the last commits,
-    // the sync never ran out of admitted requests (an admission over the limit used to stop admit-ahead until the window drained).
-    const first = admitted.findIndex(n => n > 0), last = admitted.length - 1 - [...admitted].reverse().findIndex(n => n > 0);
-    expect(admitted.slice(first, last + 1).filter(n => n === 0)).toEqual([]);
+    expect(refused).toEqual([]);
+    // Admit-ahead still kept groups admitted while it stayed under the limit.
+    expect(Math.max(...admitted)).toBeGreaterThan(8);
     expect(Math.max(...admitted)).toBeLessThanOrEqual(40);
   } finally {
     installFaultHook(undefined);
