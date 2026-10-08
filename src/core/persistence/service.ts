@@ -321,7 +321,7 @@ export function writeResponse(row: WriteRequest, hints: { retryAfterMs?: number 
     error.why = `${error.why} This process runs no consumer of its own: the ${owner.kind} process (pid ${owner.pid}) on this host owns publication${claim?.claim?.stall?.step ? `, and its claim is stalled on step ${claim.claim.stall.step}` : ''}.`;
     error.fix = { argv: ['gbrain', 'sources', 'writer', 'status', '--source', row.source_id, '--json'], consent: [], actor: 'agent', requires_exclusive: false,
       why: 'Read-only: names the owner process, the running claim\'s step and every write waiting behind it.',
-      verify: { argv: ['gbrain', 'sources', 'writer', 'status', '--source', row.source_id, '--json'] } };
+      verify: { argv: ['gbrain', 'doctor', '--json'] } };
   }
   if (content) {
     if (content.code !== reason) error.canonical = content.code;

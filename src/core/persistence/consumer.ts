@@ -289,7 +289,9 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
    * alive. Idle probes therefore share one reserved connection; the rest of
    * the pool drains through idle_timeout. Pools too small to spare a long-hold
    * permit fall back to pooled probes. The lane always comes from the ordinary
-   * pool, never the direct/session route, whose clients are scarcer (#5233).
+   * pool (#5233); with a direct/session route configured the probe does not
+   * reserve a lane at all and runs on that route instead (#6317,
+   * consumer-lane.ts), so the whole ordinary pool drains.
    */
   private async acquireIdleLane(signal?: AbortSignal, forPublication = false): Promise<ReservedConnection | undefined> {
     if (this.idleLane) return this.idleLane.conn;
