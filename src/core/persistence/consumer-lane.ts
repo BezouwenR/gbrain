@@ -21,6 +21,12 @@
  * the consumer logs one loud line at start and `status()` reports
  * `connection.pooler_mode: 'transaction'`, so an operator sees the exposure in
  * `gbrain sources writer status --json` before the first stall.
+ *
+ * `GBRAIN_CONSUMER_DIRECT_LANE=0` keeps the tick statements on the ordinary
+ * pool even with a direct route (the claims, renewals and heartbeat still take
+ * it): the escape hatch when the direct pool is too small for the scans, and
+ * what the phase-liveness tests set to exercise the claim's BEGIN as the first
+ * direct statement.
  */
 import type { BrainEngine } from '../engine.ts';
 import { registerEngineView, viewedEngine } from './switches.ts';
@@ -43,7 +49,7 @@ export function consumerConnectionRoute(engine: BrainEngine): ConsumerConnection
   if (engine.kind !== 'postgres') return { lane: 'pool', pooler_mode: 'not_postgres' };
   const routed = engine as RoutedEngine;
   let direct = false, directHost: string | undefined, prepare: boolean | undefined;
-  try { direct = routed.connectionManager?.isDualPoolActive() === true; directHost = direct ? routed.connectionManager?.describeMode().direct_host : undefined; } catch { direct = false; }
+  try { direct = process.env.GBRAIN_CONSUMER_DIRECT_LANE !== '0' && routed.connectionManager?.isDualPoolActive() === true; directHost = direct ? routed.connectionManager?.describeMode().direct_host : undefined; } catch { direct = false; }
   try { prepare = routed.sql?.options?.prepare; } catch { prepare = undefined; }
   return { lane: direct ? 'direct' : 'pool', pooler_mode: prepare === false ? 'transaction' : prepare === undefined ? 'unknown' : 'session_or_direct', ...(directHost ? { direct_host: directHost } : {}) };
 }
