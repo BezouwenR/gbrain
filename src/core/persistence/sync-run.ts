@@ -39,10 +39,12 @@ import { cancelRows, cancelWindow } from './sync-window.ts';
 import { managedSyncResumeArgs } from '../sync-reconcile.ts';
 import { laneApplyMsPerMember, lanePolicy, openLanes } from './sync-lanes.ts';
 import { isContentRefusal } from '../import-screen.ts';
+import { isRetryableConnError, isStatementTimeoutError } from '../retry-matcher.ts';
 import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
 import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, preparationStalledHold, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
 import { fenceReceiptLocation } from '../fence-repair/refusal.ts';
 import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-write.ts';
+import { headCommittedBytes, pageChangeProof, pageChangedHold, pageMovedSinceAdmission, pinnedWorktreeConflict, worktreeDirtyHold } from './sync-page-fault.ts';
 import { faultPoint } from './fault-points.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { withCoordinatedWrite } from './context.ts';
@@ -371,27 +373,53 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
       content = (await readCommittedBlob(cursor.companyPlan.revision!, blob, cursor.companyPlan.limits)).toString('utf8');
       assertActive();
     } else content = entry.action === 'import' && !oversize ? readSyncContent(cursor, entry) : null;
+    // #6340: working-tree bytes that differ from the pinned blob but are committed at HEAD (a commit past the pin on a
+    // live checkout) are imported as HEAD has them; the pin..HEAD diff later re-imports the same bytes as a no-op.
+    // Uncommitted bytes keep the pinned content and reach the publication screen (idea from PR #6323).
+    if (entry.action === 'import' && !cursor.companyPlan && !entry.working && content !== null && rawHash !== null && rawHash !== sha256(content)) {
+      const head = headCommittedBytes(cursor, entry.path);
+      if (head && head.rawHash === rawHash) { content = head.content; blob = { oid: head.oid, size: bytes!.length }; }
+    }
     lineEndingOnly = bytes !== null && content !== null && bytes.equals(Buffer.from(bytes.toString('utf8'))) &&
       bytes.toString('utf8').replace(/\r\n/g, '\n') === content.replace(/\r\n/g, '\n');
     slug = entry.slug!; pageId = occupant?.page.id ?? entry.pageId ?? null; revision = occupant ? occupant.revision : entry.revision ?? null;
     frozenSnapshot = snapshot;
+    // #6340: a page that moved under the manifest holds the page, not the run (sync-page-fault.ts); `sync.holds=fail`
+    // and company-brain cursors keep the refusal. The hold's intent shape is what the entry would have imported.
+    const frozenIntent = { content, blobOid: blob?.oid, expected_revision: revision, rawHash };
+    const moved = entry.renameFrom;
+    const pageHold = async (why: string, observedPageId: number | null, observedRevision: string | null): Promise<Held> => {
+      const proof = await pageChangeProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pageId, expectedRevision: revision });
+      assertActive();
+      return { hold: pageChangedHold(entry, slug, observedPageId ?? pageId, frozenIntent, { proof, revision: observedRevision, why }) };
+    };
     if (occupant && (content === null || !await sameContentAtOrigin(engine, cursor, entry, key, snapshot, content, rawHash, lineEndingOnly, run.signal))) {
+      if (screening) return pageHold(`another run of this source imported page ${slug} from ${entry.path} with different content`, occupant.page.id, occupant.revision);
       throw syncRunRefusal('page_identity_changed', 'The imported origin no longer identifies exactly the accepted page.', retry,
         `Page ${slug} was imported from ${entry.path} by another run of source ${cursor.sourceId} with different content after this run enumerated it, so the run stopped before admitting it.`);
     }
     occupantRebound = occupant !== null;
-    const moved = entry.renameFrom;
     const recorded = moved?.slug === slug ? moved.sourcePath : entry.sourcePath;
     const foreignOrigin = snapshot?.page.source_path != null && !sameSyncOrigin(snapshot.page.source_path, recorded, originScope, snapshot.page.slug);
     if ((snapshot?.page.id ?? null) !== pageId || (snapshot?.revision ?? null) !== revision || (entry.unownedDeletion ? !foreignOrigin : foreignOrigin)) {
-      throw syncRunRefusal('revision_conflict', 'A page changed after this sync cursor was enumerated.', retry,
+      if (!screening) throw syncRunRefusal('revision_conflict', 'A page changed after this sync cursor was enumerated.', retry,
         `Page ${slug} in source ${cursor.sourceId} was edited, deleted or re-bound after this sync enumerated ${entry.path}, so the run stopped before admitting it.`);
+      // The page moved but still holds exactly what this import carries: re-bind the entry to it (the waiver screen passes it).
+      const rebind = entry.action === 'import' && !moved && !foreignOrigin && snapshot !== null && snapshot.page.deleted_at == null
+        && (snapshot.page.id === pageId || pageId === null) && content !== null
+        && await sameContentAtOrigin(engine, cursor, entry, key, snapshot, content, rawHash, lineEndingOnly, run.signal);
+      assertActive();
+      if (!rebind) return pageHold(`page ${slug} was ${snapshot === null || snapshot.page.deleted_at != null ? 'deleted' : foreignOrigin ? 're-bound to another file' : 'edited'} in the database`,
+        snapshot?.page.id ?? null, snapshot?.revision ?? null);
+      pageId = snapshot!.page.id; revision = snapshot!.revision;
     }
     if (moved && moved.slug !== slug) {
       const previous = await engine.readPageSnapshot(moved.slug, { sourceId: cursor.sourceId, includeDeleted: true });
       assertActive();
       if (previous?.page.id !== moved.pageId || previous.revision !== moved.revision || previous.page.deleted_at != null ||
           previous.page.source_path == null || !sameSyncOrigin(previous.page.source_path, moved.sourcePath, originScope, previous.page.slug)) {
+        if (screening) return { hold: pageChangedHold(entry, slug, pageId, frozenIntent, { proof: null, revision: previous?.revision ?? null,
+          why: `page ${moved.slug}, which ${entry.path} was renamed from, changed or was deleted in the database` }) };
         throw syncRunRefusal('revision_conflict', 'A renamed page changed after this sync cursor was enumerated.', retry,
           `Page ${moved.slug}, which ${entry.path} was renamed from, changed or was deleted after this sync enumerated it, so the run stopped before admitting the rename.`);
       }
@@ -591,6 +619,32 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
   }
   const fence = fenceReceiptLocation(failed);
   const compacted = !fence && failed.compacted === true && failed.error_message == null && ['invalid_params', 'take_row_collision'].includes(failed.error_code ?? '');
+  // #6340: a cursor an older run left blocked on a page that moved under it converts the same way the run now does.
+  if (!fence && !compacted && entry && entry.path === previous.intent.path && previous.intent.kind !== 'managed_sync_checkpoint' && !blocked.companyPlan) {
+    const proof = previous.intent.kind === 'managed_sync_import' ? await concurrentWriteProof(engine, { sourceId: blocked.sourceId, incarnation: blocked.incarnation, pending: previous, done: failed }) : null;
+    const moved = proof ? null : await pageMovedSinceAdmission(engine, blocked.sourceId, previous, failed);
+    const dirty = !proof && !moved && previous.intent.kind === 'managed_sync_import' && pinnedWorktreeConflict(failed);
+    assertActive();
+    if (proof || moved || dirty) {
+      // The file may have been committed meanwhile: a re-freeze then imports HEAD's bytes instead of holding the stale conflict.
+      if (dirty && headCommittedBytes(blocked, entry.path)?.rawHash !== undefined) {
+        const base: Cursor = { ...blocked }; delete base.pending;
+        const again = await freezeEntry(engine, base, key, assertActive, run);
+        const converted = [...(blocked.convertedFromFailed ?? []), previous.requestId];
+        if ('hold' in again) {
+          const held = await holdUnderGate(engine, { cursor: blocked, key, pending: previous, hold: again.hold, assertActive, observedAt: run.observedAt!, waitMs: 5000, failedId: failed.id });
+          return held === 'pending' ? blocked : held;
+        }
+        return saveCursor(engine, key, blocked, { ...blocked, convertedFromFailed: converted, pending: { ...again, converted: true } }, false, assertActive,
+          tx => recordSyncConversion(tx, blocked.sourceId, blocked.incarnation, { request_id: previous.requestId, path: previous.intent.path ?? null, slug: previous.slug, run_id: blocked.runId, outcome: 'refrozen' }));
+      }
+      const hold = proof ? concurrentWriteHold(entry, previous.slug, previous.pageId!, previous.intent, proof)
+        : moved ? pageChangedHold(entry, previous.slug, previous.pageId, previous.intent, { proof: null, revision: moved.revision, why: `page ${previous.slug} changed in the database` })
+          : worktreeDirtyHold(entry, previous.slug, previous.pageId, previous.intent);
+      const held = await holdUnderGate(engine, { cursor: blocked, key, pending: previous, hold, assertActive, observedAt: run.observedAt!, waitMs: 5000, failedId: failed.id });
+      return held === 'pending' ? blocked : held;
+    }
+  }
   if (!fence && !compacted && !isContentRefusal(failed.error_code, failed.error_message)) return blocked;
   const base: Cursor = { ...blocked }; delete base.pending;
   const again = await freezeEntry(engine, base, key, assertActive, run);
@@ -631,7 +685,8 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
   const entry = cursor.entries[cursor.index];
   if (!entry || entry.path !== pending.intent.path) return null;
   const stalled = preparationStalled(done);
-  if (!stalled && (pending.intent.kind !== 'managed_sync_import' || typeof pending.intent.content !== 'string')) return null;
+  const page = pending.intent.kind === 'managed_sync_import' && typeof pending.intent.content === 'string';
+  if (!stalled && !page && pending.intent.kind !== 'managed_sync_delete') return null;
   let base: Cursor | undefined;
   if (stalled) {
     // #6278 (1.5): the breaker counts the receipt first; at the trip the run stops and converts neither this receipt nor a later one.
@@ -640,13 +695,19 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
     if (breaker.tripped) return { tripped: await saveCursor(engine, key, cursor, { ...cursor, breaker }, false, assertActive) };
     base = { ...cursor, breaker }; delete base.pending; delete base.group; delete base.window;
   }
-  const fence = stalled ? null : fenceReceiptLocation(done);
+  const fence = stalled || !page ? null : fenceReceiptLocation(done);
   // #6194 (D4): a revision conflict proven to come from a concurrent database-only write is held the same way (sync-concurrent-write.ts).
-  const proof = stalled || fence ? null : await concurrentWriteProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pending, done });
-  if (!stalled && !fence && !proof) return null;
+  const proof = stalled || fence || !page ? null : await concurrentWriteProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pending, done });
+  // #6340: a revision conflict whose page really moved (no proof of who moved it) and a pinned-worktree conflict (uncommitted
+  // local bytes) hold the page too (sync-page-fault.ts); a run-level revision conflict (the page is where it was) still blocks.
+  const moved = stalled || fence || proof ? null : await pageMovedSinceAdmission(engine, cursor.sourceId, pending, done);
+  const dirty = !stalled && !fence && !proof && !moved && page && pinnedWorktreeConflict(done);
+  if (!stalled && !fence && !proof && !moved && !dirty) return null;
   const hold = stalled ? preparationStalledHold(entry, pending.slug, pending.pageId, done, pending.intent.content ?? null, pending.intent.blobOid, resumeArgsOf(cursor, run))
     : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content!, pending.intent.blobOid)
-      : concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof!);
+      : proof ? concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof)
+        : moved ? pageChangedHold(entry, pending.slug, pending.pageId, pending.intent, { proof: null, revision: moved.revision, why: `page ${pending.slug} changed in the database` })
+          : worktreeDirtyHold(entry, pending.slug, pending.pageId, pending.intent);
   return holdUnderGate(engine, { cursor, key, pending, hold, assertActive, observedAt: run.observedAt!, waitMs, failedId: done.id, base });
 }
 
@@ -1189,6 +1250,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         cursor = await saveCursor(engine, key, cursor, { ...retry, pending: await freezeEntry(engine, retry, key, assertActive, frozenRun) as Pending }, true, assertActive);
       }
     }
+    const startupConfig = await preparationConfigView(engine); // #5984 G3: one config read answers the startup's config reads
     if (cursor && opts.retryFailed && !opts.dryRun && !company && !cursor.done) {
       const unfinished = await engine.executeRaw(`SELECT id FROM persistence_requests WHERE source_id=$1
         AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1`, [cursor.sourceId]);
@@ -1198,11 +1260,19 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         const recorded = await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1 AND completed_keys->0->>'run_id'=$2", [key, cursor.runId]);
         assertActive();
         if ((failed && ['failed', 'conflict', 'cancelled'].includes(failed.state)) || (recorded.length && (failed?.state === 'committed' || !failed))) {
-          phase = 'discovery';
-          discoveryTarget = syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
-          const discovery = await discoverManagedSync(engine, opts, context);
+          // #6340: a pending request the run would now hold (a page that moved, a dirty file, a fence) converts in place with
+          // the frozen manifest instead of rediscovering it; only a failure no hold covers still rediscovers.
+          const screen = failed && cursor.pending ? await loadSyncScreenRun(startupConfig, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote) : null;
+          const converted = screen ? await convertBlockedCursor(engine, cursor, key, assertActive, { ...frozenRun, screen, observedAt: cursor.discoveredAt ?? runStartedAt }) : cursor;
           assertActive();
-          cursor = await replaceCursor(engine, key, header(cursor), { ...discovery, authority, processingOptions, syncOptions, runId: discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 } }, assertActive);
+          if (converted !== cursor) cursor = converted;
+          else {
+            phase = 'discovery';
+            discoveryTarget = syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
+            const discovery = await discoverManagedSync(engine, opts, context);
+            assertActive();
+            cursor = await replaceCursor(engine, key, header(cursor), { ...discovery, authority, processingOptions, syncOptions, runId: discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 } }, assertActive);
+          }
         }
       }
     }
@@ -1215,7 +1285,6 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
       return result(cursor, cursor.from === null ? 'first_sync' : 'synced');
     }
     if (cursor?.done) cursor = await retireCompletedCursor(engine, key, cursor, assertActive);
-    const startupConfig = await preparationConfigView(engine); // #5984 G3: one config read answers the startup's config reads
     if (!cursor) {
       assertActive();
       phase = 'discovery';
@@ -1403,8 +1472,10 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     if (!opts.dryRun) {
       const code = error instanceof OperationError ? error.code : 'storage_error';
       // A refresh fence, or an admission refused while other requests hold the writer's outstanding cap (#6278: the drain
-      // waits for them), is transient admission back-pressure, not a sync failure to record.
-      if (!['permission_denied', 'worktree_refreshing', 'refresh_recovery_required'].includes(code) && !isWriteCapacityWait(error)) {
+      // waits for them), is transient admission back-pressure, not a sync failure to record. #6340: neither is a lost
+      // database connection or a statement timeout: the cursor and its frozen manifest stay, and the next pass resumes them.
+      if (!['permission_denied', 'worktree_refreshing', 'refresh_recovery_required'].includes(code) && !isWriteCapacityWait(error)
+        && !isRetryableConnError(error) && !isStatementTimeoutError(error)) {
         const [stored] = cursor ? [] : await engine.executeRaw<{ completed_keys: [CursorHeader] }>('SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2', [OP, key]);
         const failedCursor = cursor ?? stored?.completed_keys?.[0];
         const { failure } = await recordManagedSyncFailure(engine, { source_id: context.sourceId, source_incarnation: context.incarnation, path: cursor?.entries[cursor.index]?.path ?? failedCursor?.pending?.intent.path ?? `<${phase}>`, code,
