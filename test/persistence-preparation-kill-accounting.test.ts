@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { admitWrite, claimNextWrite, getWriteRequestById } from '../src/core/persistence/journal.ts';
+import type { WriteRequest } from '../src/core/persistence/model.ts';
 import { releaseAbandonedClaims } from '../src/core/persistence/effect-journal.ts';
 import { claimPhaseStamp, startClaimPhase } from '../src/core/persistence/claim-phase.ts';
 import { admission, fixtures, initializeFixtures, selectFixtureHost, type HarnessConfig } from '../scripts/persistence/harness.ts';
@@ -38,7 +39,7 @@ test('the PGLite reclaim charges a preparing claim of the reclaimed token only, 
   const sources = await fixtures(engine, config);
   // Three roots, one claimed request each: claimed (stamped preparing at claim), publishing, and an earlier claim's stamp.
   const rows = await Promise.all(sources.map((source, i) => admitWrite(engine, admission(config, source, `kill/${i}`, `body ${i}`))));
-  const claimed = [];
+  const claimed: WriteRequest[] = [];
   for (let i = 0; i < 3; i++) claimed.push((await claimNextWrite(engine, config.hostId, 30_000, claimed.map(row => row.worktree_id!)))!);
   expect(claimed.map(row => row.slug).sort()).toEqual(rows.map(row => row.slug).sort());
   const byIndex = (i: number) => claimed.find(row => row.slug === `kill/${i}`)!;
@@ -50,7 +51,7 @@ test('the PGLite reclaim charges a preparing claim of the reclaimed token only, 
   expect(await releaseAbandonedClaims(engine, future, false)).toBe(3);
   for (let i = 0; i < 3; i++) expect(await getWriteRequestById(engine, byIndex(i).id)).toMatchObject({ state: 'queued', preparation_attempts: 0 });
   // Claim again (fresh stamps), restore the two control stamps, then reclaim with the switch on.
-  const again = [];
+  const again: WriteRequest[] = [];
   for (let i = 0; i < 3; i++) again.push((await claimNextWrite(engine, config.hostId, 30_000, again.map(row => row.worktree_id!)))!);
   const second = (i: number) => again.find(row => row.slug === `kill/${i}`)!;
   await engine.executeRaw('UPDATE persistence_requests SET claim_phase=$2::text::jsonb WHERE id=$1::uuid', [second(1).id, claimPhaseStamp(publishing, second(1).execution_token)]);

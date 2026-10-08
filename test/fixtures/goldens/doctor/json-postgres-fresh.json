@@ -820,6 +820,12 @@
             "count": 0,
             "docs": "docs/guides/troubleshooting.md#persistence-write-stall",
             "max_claim_ms": "<volatile>",
+            "preparation_policy": {
+              "maintenance_preparation_ms": "<volatile>",
+              "max_preparation_attempts": 2,
+              "preparation_ceiling_ms": "<volatile>",
+              "sync_preparation_ms": "<volatile>"
+            },
             "stalls": []
           },
           "message": "No write request has held its claim longer than persistence.max_claim_ms (600000 ms).",

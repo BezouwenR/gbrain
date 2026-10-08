@@ -2,7 +2,9 @@ import type { BrainEngine } from '../../../core/engine.ts';
 import type { Check } from '../../doctor.ts';
 import { readRequestIndexStates, REQUEST_INDEXES_REPAIR_COMMAND } from '../../../core/persistence/checkpoint-validation.ts';
 import { oneYearCapacity, readJournalLimits, journalLimitKey } from '../../../core/persistence/limits.ts';
-import { claimStateOf, MAX_CLAIM_CONFIG_KEY, readMaxClaimMs } from '../../../core/persistence/claim-phase.ts';
+import { claimStall, claimStateOf, MAX_CLAIM_CONFIG_KEY, readMaxClaimMs } from '../../../core/persistence/claim-phase.ts';
+import { preparationBudgetMs } from '../../../core/persistence/preparation-budget.ts';
+import { readPreparationPolicy } from '../../../core/persistence/switches.ts';
 import { agentFix, checkError } from '../check-fix.ts';
 
 const WINDOW_DAYS = 7;
@@ -106,14 +108,18 @@ export async function requestGrowthCheck(engine: BrainEngine): Promise<Check> {
  * its root waits behind it. Names the stuck phase (claim-phase.ts), the root,
  * the claim's age, how many writes wait behind it and whether the same request
  * resumes on its own, with the read-only writer status as the next step.
+ * #6278: each stall also carries the claim's step, what it waits on, the owner
+ * process and, for a preparation past its budget, `claim.stall`
+ * (`preparation_overdue`); the budgets in effect are in the details.
  */
 export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
   const docs = 'docs/guides/troubleshooting.md#persistence-write-stall';
   try {
     const maxClaimMs = await readMaxClaimMs(engine);
-    const rows = await engine.executeRaw<{ request_id: string; source_id: string; worktree_id: string | null; operation: string; state: string; claim_phase: unknown;
+    const policy = await readPreparationPolicy(engine);
+    const rows = await engine.executeRaw<{ request_id: string; source_id: string; worktree_id: string | null; operation: string; intent_kind: string | null; state: string; claim_phase: unknown;
       execution_token: string | null; claim_lapsed: boolean | null; publication_started: boolean; request_age_ms: string; waiting: number }>(
-      `SELECT r.request_id::text,r.source_id,r.worktree_id::text,r.operation,r.state,r.claim_phase,r.execution_token::text,r.claim_expires_at<now() AS claim_lapsed,
+      `SELECT r.request_id::text,r.source_id,r.worktree_id::text,r.operation,r.intent->>'kind' AS intent_kind,r.state,r.claim_phase,r.execution_token::text,r.claim_expires_at<now() AS claim_lapsed,
         r.publication_started,(EXTRACT(EPOCH FROM (now()-r.created_at))*1000)::bigint::text AS request_age_ms,
         (SELECT count(*)::int FROM persistence_requests q WHERE q.worktree_id=r.worktree_id AND q.state='queued' AND q.sequence>r.sequence) AS waiting
       FROM persistence_requests r WHERE r.state='running' ORDER BY r.sequence LIMIT 100`);
@@ -124,10 +130,13 @@ export async function writeStallCheck(engine: BrainEngine): Promise<Check> {
       // An owner that predates phase recording never stamps its claims; the request's own age bounds the claim's.
       const held = claim.claim_age_ms ?? (row.claim_phase == null ? Math.max(0, Number(row.request_age_ms)) : null);
       if (held === null || !(held >= maxClaimMs)) return [];
-      return [{ request_id: row.request_id, source_id: row.source_id, root: row.worktree_id, operation: row.operation, phase: claim.phase,
-        claim_age_ms: held, phase_age_ms: claim.phase_age_ms, waiting_behind: row.waiting, resumes_on_its_own: claim.resumes_on_its_own, why: claim.why }];
+      const budget = preparationBudgetMs({ operation: row.operation, intent: row.intent_kind ? { kind: row.intent_kind } : null }, policy, 30_000);
+      return [{ request_id: row.request_id, source_id: row.source_id, root: row.worktree_id, operation: row.operation, intent_kind: row.intent_kind, phase: claim.phase,
+        claim_age_ms: held, phase_age_ms: claim.phase_age_ms, step: claim.step, step_age_ms: claim.step_age_ms, waiting_on: claim.waiting_on, owner: claim.owner,
+        budget_ms: budget, stall: claimStall(claim, budget), waiting_behind: row.waiting, resumes_on_its_own: claim.resumes_on_its_own, why: claim.why }];
     });
-    const details = { max_claim_ms: maxClaimMs, config_key: MAX_CLAIM_CONFIG_KEY, count: stalls.length, stalls, docs };
+    const details = { max_claim_ms: maxClaimMs, config_key: MAX_CLAIM_CONFIG_KEY, count: stalls.length, stalls, docs,
+      preparation_policy: { sync_preparation_ms: policy.syncMs, maintenance_preparation_ms: policy.maintenanceMs, preparation_ceiling_ms: policy.ceilingMs, max_preparation_attempts: policy.maxAttempts } };
     if (!stalls.length) return { name: 'persistence_write_stall', status: 'ok', details,
       message: `No write request has held its claim longer than ${MAX_CLAIM_CONFIG_KEY} (${maxClaimMs} ms).` };
     const first = stalls[0]!;
