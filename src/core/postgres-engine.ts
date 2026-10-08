@@ -13,8 +13,10 @@ import type { PageReadScope } from './types.ts';
 import type { PageReadPolicy } from './types.ts';
 import { readRelationalFanout, readChainHop, readAliases, readBacklinkCounts, readAdjacencyBoosts, readContentFlags, readExtractionStates, readEffectiveDates, readSalienceScores } from './search/read-enrichment.ts';
 import postgres from '#postgres'
+import { reservedTransactions, type ReservedTransactions } from './postgres-engine/reserved-transactions.ts';
 import { traceSqlOptions } from './sql-trace.ts';
 import { hasPostgresCancellationCapability, postgresCancellationUnavailable, reserveWithCancellation } from './postgres-engine/cancellation.ts';
+import { runBoundedStatement } from './postgres-engine/bounded-statement.ts';
 export { hasPostgresCancellationCapability } from './postgres-engine/cancellation.ts';
 import type {
   BrainEngine,
@@ -43,6 +45,7 @@ import {
 } from './retry.ts';
 import { isConnectionEndedError } from './retry-matcher.ts';
 import { CheckoutGauge, PoisonedDiscardCounter, type PoolGaugeSnapshot } from './pool-gauge.ts';
+import { driverPoolStats, type DriverPoolStats } from './postgres-engine/pool-stats.ts';
 import {
   valueHash,
   normalizeDimension,
@@ -132,6 +135,17 @@ import { searchKeywordCJK as searchKeywordCJKImpl } from './engine-sql/cjk-searc
 import * as titlesImpl from './engine-sql/titles.ts';
 import type { CjkKeywordCtx } from './search/cjk-keyword-sql.ts';
 import { postgresExecutor, type RunUnsafeOpts } from './engine-sql/dialect-postgres.ts';
+
+/**
+ * #6278: how long a cancelled statement may stay unsettled after its cancel request before the reserved
+ * connection is discarded to settle it client-side. A transaction-mode pooler (Supavisor :6543) may not
+ * forward the cancel, leaving the backend in ClientRead where no server timeout applies.
+ */
+export const DEFAULT_CANCEL_SETTLE_MS = 2_000;
+export function cancelSettleMs(): number {
+  const raw = Number(process.env.GBRAIN_CANCEL_SETTLE_MS);
+  return Number.isFinite(raw) && raw >= 100 ? raw : DEFAULT_CANCEL_SETTLE_MS;
+}
 import type { SqlExecutor } from './engine-sql/executor.ts';
 import { scopedRead, unscopedExecutor } from './engine-sql/brands.ts';
 
@@ -374,10 +388,9 @@ export class PostgresEngine implements BrainEngine {
         // GBRAIN_PG_NOTICES=1.
         onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
         onpoisoned: (status: string) => this.onPoisoned('read', status),
+        shared_types: db.resolveSharedTypes(),
       };
-      if (Object.keys(timeouts).length > 0) {
-        opts.connection = timeouts;
-      }
+      opts.connection = { ...timeouts, application_name: db.gbrainApplicationName() };
       if (typeof prepare === 'boolean') {
         opts.prepare = prepare;
       }
@@ -558,6 +571,7 @@ export class PostgresEngine implements BrainEngine {
         if (verify.healed.length > 0) {
           process.stderr.write(`  Schema verify: self-healed ${verify.healed.length} missing column(s)\n`);
         }
+        if (applied > 0 || verify.healed.length > 0) db.clearSharedTypes(this.sql, pool);
 
         // v0.30.1 (Fix 5): sweep zombie HNSW indexes (indisvalid=false) from
         // crashed CREATE INDEX CONCURRENTLY calls. Best-effort; errors logged
@@ -674,7 +688,7 @@ export class PostgresEngine implements BrainEngine {
           return rows as unknown as R[];
         },
       };
-      return await fn(conn);
+      return await fn(Object.assign(conn, { transaction: <R>(run: (engine: BrainEngine) => Promise<R>) => this.transactionOn(reservedTransactions(reserved), run) } satisfies ReservedTransactions));
     } finally {
       // Counter/gauge decrements run regardless of release() throwing
       // (double-release or socket error must not permanently leak a permit
@@ -698,13 +712,15 @@ export class PostgresEngine implements BrainEngine {
   /** #5801: observe connection acquisition (see CheckoutGauge.onCheckout). Duck-typed like getPoolDiagnostics. */
   onCheckout(listener: () => void): () => void { return this.checkoutGauge.onCheckout(listener); }
 
-  getPoolDiagnostics(): { tracked: PoolGaugeSnapshot; poolMax: number | null; poisonedDiscards: number } | null {
+  getPoolDiagnostics(): { tracked: PoolGaugeSnapshot; poolMax: number | null; poisonedDiscards: number; pool: DriverPoolStats | null; prepare: boolean | null } | null {
     try {
       const max = (this.sql as unknown as { options?: { max?: number } }).options?.max;
       return {
         tracked: this.checkoutGauge.snapshot(),
         poolMax: typeof max === 'number' ? max : null,
         poisonedDiscards: this.poisonedDiscards?.count ?? 0,
+        pool: driverPoolStats(this.sql),
+        prepare: (this.sql as unknown as { options?: { prepare?: boolean } }).options?.prepare ?? null,
       };
     } catch {
       return null;
@@ -717,8 +733,10 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async readPageSnapshot(slug: string, opts?: PageSnapshotOptions): Promise<PageSnapshot | null> {
+    // #6276: the remote alias-resolving read's visibility subplans cross the JIT thresholds on larger brains; run it with JIT off.
     return this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, tx =>
-      readCanonicalPageSnapshot(async (query, params) => Array.from(await tx.unsafe(query, params as never, { prepare: true })) as never, slug, opts));
+      readCanonicalPageSnapshot(async (query, params) => Array.from(await tx.unsafe(query, params as never, { prepare: true })) as never, slug, opts),
+    opts?.resolveAlias && opts.excludePrivate ? { alwaysTransaction: true, jitOff: true } : undefined);
   }
 
   async lockPageKeys(keys: readonly PageKey[]): Promise<void> {
@@ -742,14 +760,15 @@ export class PostgresEngine implements BrainEngine {
 
   async putPage(slug: string, page: PageInput, opts?: PageWriteOptions): Promise<Page> {
     slug = validateSlug(slug);
-    return this.transaction(async tx => {
+    const write = async (tx: BrainEngine) => {
       const sourceId = opts?.sourceId ?? 'default';
       await tx.lockPageKeys([{ sourceId, slug }]);
       if (opts?.expectedRevision !== undefined || opts?.force !== undefined) {
         assertPageRevision(await tx.readPageSnapshot(slug, { sourceId, includeDeleted: true }), opts);
       }
       return pagesImpl.putPage((tx as PostgresEngine).engineSql, slug, page, opts);
-    });
+    };
+    return opts?.inline && this._pageTransaction ? write(this) : this.transaction(write);
   }
 
   async deletePage(slug: string, opts?: { sourceId?: string }): Promise<void> {
@@ -1455,13 +1474,13 @@ export class PostgresEngine implements BrainEngine {
   // Chunks SQL lives once in ./engine-sql/chunks.ts (refactor wave 1, W1-extended).
   // The engine keeps the retry + transaction wrapper, the RLS scope
   // transaction and the source-scope / active-column resolution.
-  async upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number } & BatchOpts): Promise<void> {
+  async upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; pageId?: number } & BatchOpts): Promise<void> {
     if (this._chunkWritesInTransaction) return this._upsertChunksOnce(slug, chunks, opts);
     return this.batchRetry(opts?.auditSite ?? 'upsertChunks', opts?.signal,
       () => this.transaction(tx => (tx as PostgresEngine)._upsertChunksOnce(slug, chunks, opts)), chunks.length);
   }
 
-  private async _upsertChunksOnce(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number }): Promise<void> {
+  private async _upsertChunksOnce(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; pageId?: number }): Promise<void> {
     return chunksImpl.upsertChunksOnce(this.engineSql, {
       lockPageKeys: (keys) => this.lockPageKeys(keys),
       readPageSnapshot: (pageSlug, snapshotOpts) => this.readPageSnapshot(pageSlug, snapshotOpts),
@@ -2492,7 +2511,8 @@ export class PostgresEngine implements BrainEngine {
     return readAliases(this.executeRaw.bind(this), aliasNorms, opts);
   }
 
-  async setPageAliases(slug: string, sourceId: string, aliasNorms: string[]): Promise<void> {
+  async setPageAliases(slug: string, sourceId: string, aliasNorms: string[], opts?: { inline?: boolean }): Promise<void> {
+    if (opts?.inline && this._pageTransaction) return pagesImpl.setPageAliases(this.engineSql, this, slug, sourceId, aliasNorms);
     return this.transaction(tx => pagesImpl.setPageAliases((tx as PostgresEngine).engineSql, tx, slug, sourceId, aliasNorms));
   }
 
@@ -2708,7 +2728,8 @@ export class PostgresEngine implements BrainEngine {
       let reserved: postgres.ReservedSql | undefined;
       let pending: ReturnType<typeof conn.unsafe> | undefined;
       let cancellation: Promise<void> | undefined;
-      let retired = false;
+      let retired = false, settled = false, discarded = false;
+      let settleTimer: ReturnType<typeof setTimeout> | undefined;
       let owner: postgres.TransactionSql | postgres.ReservedSql = conn as unknown as postgres.TransactionSql;
       signal?.addEventListener('abort', onAbort, { once: true });
       try {
@@ -2723,16 +2744,26 @@ export class PostgresEngine implements BrainEngine {
         // describe round trip plus an execute round trip.
         const driverOpts = { cancelFence: !!signal, prepare: opts?.prepare ?? true, ...(opts?.simple === undefined ? {} : { simple: opts.simple }) };
         pending = conn.unsafe(sql, params as Parameters<typeof conn.unsafe>[1], driverOpts);
-        return await pending as unknown as T[];
+        try { return await pending as unknown as T[]; } finally { settled = true; }
       } finally {
         signal?.removeEventListener('abort', onAbort);
+        clearTimeout(settleTimer);
         try {
           if (cancellation) await cancellation;
-          if (retired) owner.discard();
+          if (retired && !discarded) owner.discard();
         } finally { reserved?.release(); }
       }
       function onAbort() {
         if (!pending || cancellation) return;
+        // #6278: a transaction-mode pooler may swallow the cancel request and leave the backend in ClientRead,
+        // so the statement never settles on its own. Past the settle window the reserved connection is
+        // discarded, which rejects the statement client-side (CONNECTION_DESTROYED) and frees the awaiting caller.
+        pending.then(() => { settled = true; }, () => { settled = true; });
+        settleTimer = setTimeout(() => {
+          if (settled) return;
+          retired = true; discarded = true;
+          owner.discard();
+        }, cancelSettleMs());
         try { cancellation = pending.cancel().catch(() => { retired = true; }); }
         catch { retired = true; }
       }
@@ -2742,13 +2773,17 @@ export class PostgresEngine implements BrainEngine {
   async executeRaw<T = Record<string, unknown>>(
     sql: string,
     params?: unknown[],
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<T[]> {
     // try/finally (not .finally on the promise): runUnsafe throws
     // SYNCHRONOUSLY on a pre-aborted signal, which would skip a chained
     // .finally and leak the counter.
     this.checkoutGauge.acquire('raw');
     try {
+      // #6278: a transaction-local statement_timeout, which holds through a transaction-mode pooler (postgres-engine/bounded-statement.ts).
+      if (opts?.timeoutMs !== undefined && !this._pageTransaction) {
+        return await runBoundedStatement<T>(this.sql, sql, params, { ...opts, timeoutMs: opts.timeoutMs }, () => this.checkoutGauge.checkedOut());
+      }
       return await this.runUnsafe<T>(this.sql, sql, params, opts);
     } finally {
       this.checkoutGauge.release('raw');

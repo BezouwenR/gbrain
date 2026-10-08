@@ -313,6 +313,10 @@ CREATE TABLE IF NOT EXISTS content_chunks (
   model                 TEXT    NOT NULL DEFAULT 'text-embedding-3-large',
   token_count           INTEGER,
   embedded_at           TIMESTAMPTZ,
+  -- v221: embedding_pending_since (when the stored vector last became missing;
+  -- doctor's embeddings check ages the backlog from it, never from created_at)
+  -- is added by migration v221 on every install, after the migration-added
+  -- content_chunks columns, so fresh and upgraded brains share their ordinals.
   -- #4246 (v133): md5(chunk_text) at embed time. NULL = no embedding or
   -- pre-v133 row (grandfathered by invalidateContentDriftEmbeddings).
   embedded_text_hash    TEXT,
@@ -2036,6 +2040,24 @@ CREATE TABLE IF NOT EXISTS persistence_effects (
     execution_token uuid,
     updated_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE(request_id,kind)
+  );
+CREATE TABLE IF NOT EXISTS persistence_consumers (
+    host_id uuid NOT NULL,
+    pid integer NOT NULL,
+    nonce text NOT NULL,
+    pid_ns text,
+    kind text NOT NULL,
+    mode text NOT NULL CHECK (mode IN ('probing','full','waiter_only','promoted')),
+    started_at timestamptz NOT NULL DEFAULT now(),
+    renewed_at timestamptz NOT NULL DEFAULT now(),
+    restart_required boolean NOT NULL DEFAULT false,
+    root_barrier_age_ms integer,
+    pool jsonb,
+    host_json_path text NOT NULL,
+    persistence_home text NOT NULL,
+    minted_under jsonb,
+    version text NOT NULL,
+    PRIMARY KEY(host_id,pid,nonce)
   );
 
 CREATE OR REPLACE FUNCTION gbrain_require_managed_writer() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, public AS $fn$
