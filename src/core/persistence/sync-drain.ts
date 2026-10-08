@@ -395,7 +395,8 @@ export async function drainManagedSync(engine: BrainEngine, opts: SyncOpts, anno
   const { performManagedSync } = await import('./sync-run.ts');
   const { resolveBulkSettings } = await import('./sync-group.ts');
   const drainStartedAt = opts.drainStartedAt ?? Date.now();
-  const bulk = await resolveBulkSettings(engine, opts.noBulk, opts.lanes);
+  const { preparationConfigView } = await import('./config-snapshot.ts');
+  const bulk = await resolveBulkSettings(await preparationConfigView(engine), opts.noBulk, opts.lanes);
   // #5984 lanes: one lane run per drain; its groups carry the id and this process claims them out of FIFO order.
   const laneRun = bulk.enabled && (bulk.lanes ?? 1) > 1 ? randomUUID() : undefined;
   const { closeLaneRun } = await import('./sync-lanes.ts');

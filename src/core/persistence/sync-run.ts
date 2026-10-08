@@ -9,6 +9,7 @@ import { currentSourceFilesystemSignal } from '../minions/source-filesystem.ts';
 import { throwIfAborted } from '../abort-check.ts';
 import { digest, sha256 } from './digest.ts';
 import { getWriteRequest, admitWriteInTransaction, foregroundPriority, intentDigest, receiptFor } from './journal.ts';
+import { preparationConfigView } from './config-snapshot.ts';
 import { retryWriteAdmission } from './admission-retry.ts';
 import { assertPersistenceAccepting, awaitWrite, foregroundWriteCompletions, startPersistenceConsumer, type WriteWait } from './service.ts';
 import { assertSyncEntryOrigin, discoverManagedSync, resolveManagedSyncContext, readSyncContent, readSyncFile, syncGit, type SyncDiscovery } from './sync-discovery.ts';
@@ -731,8 +732,10 @@ type FreezeAt = (base: Cursor) => (index: number) => Promise<Pending | null>;
 
 /** The most consecutive no-op entries one waiver transaction passes. */
 const WAIVER_RUN_MAX = 64;
+/** How many entries after a waived head are frozen and screened at once. */
+const WAIVER_SCREEN_WIDTH = 8;
 /**
- * #5984 Phase 3: when the frozen head would be waived, freezes and screens the entries after it four at a time
+ * #5984 Phase 3: when the frozen head would be waived, freezes and screens the entries after it eight at a time
  * (stopping at the first that would not be waived, is held, is overtaken, refuses to freeze, or at the checkpoint)
  * and waives the run in one transaction, without a `pending` cursor save per entry. Returns null to take the
  * per-entry path for the head (its screen admits it, or the run's transaction validated nothing or timed out);
@@ -746,14 +749,19 @@ async function waiveRun(engine: BrainEngine, cursor: Cursor, head: Pending, key:
   assertActive();
   const run: WaiverRunEntry[] = [{ pending: head, waived: first }];
   const max = Math.max(1, Math.min(WAIVER_RUN_MAX, limit));
+  // Each entry is frozen and screened in its own chain, WAIVER_SCREEN_WIDTH at a time (reads only, so the entries
+  // past the first that is not waived are discarded unused).
   extend: for (let next = cursor.index + 1; run.length < max && next < cursor.entries.length;) {
-    const batch = Array.from({ length: Math.min(4, max - run.length, cursor.entries.length - next) }, (_, i) => next + i);
-    const frozen = await Promise.all(batch.map(index => freezeEntry(engine, { ...cursor, index }, key, assertActive, frozenRun).catch(() => null)));
-    const screened = await Promise.all(frozen.map((entry, i) => entry && !('hold' in entry) && !entry.rebound
-      ? screenWaiver(engine, { ...cursor, index: batch[i]! }, entry, config, frozenRun.signal).catch(() => null) : null));
-    for (const [i, waived] of screened.entries()) {
-      if (!waived) break extend;
-      run.push({ pending: frozen[i] as Pending, waived });
+    const batch = Array.from({ length: Math.min(WAIVER_SCREEN_WIDTH, max - run.length, cursor.entries.length - next) }, (_, i) => next + i);
+    const screened = await Promise.all(batch.map(async index => {
+      const entry = await freezeEntry(engine, { ...cursor, index }, key, assertActive, frozenRun).catch(() => null);
+      if (!entry || 'hold' in entry || entry.rebound) return null;
+      const waived = await screenWaiver(engine, { ...cursor, index }, entry, config, frozenRun.signal).catch(() => null);
+      return waived ? { pending: entry as Pending, waived } : null;
+    }));
+    for (const member of screened) {
+      if (!member) break extend;
+      run.push(member);
     }
     next += batch.length;
   }
@@ -801,7 +809,9 @@ function groupSize(cursor: Cursor, bulk: BulkPass): number {
   const first = !bulk.formed && !(cursor.counts.added + cursor.counts.modified + cursor.counts.deleted);
   bulk.formed = (bulk.formed ?? 0) + 1;
   return nextGroupSize(bulk.settings, lanes ? laneApplyMsPerMember(cursor.binding.worktree_id) : bulk.perMemberMs,
-    { first, foreground: bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_BUDGET_RECENT_MS });
+    // With foreground priority a foreground write publishes beside lane groups instead of waiting for them, so
+    // groups keep their full budget; without it they shrink while foreground writes are recent.
+    { first, foreground: !bulk.foregroundFirst && bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_BUDGET_RECENT_MS });
 }
 /**
  * #5984 Phase 1: admits a group's requests and saves the cursor that records them in one transaction: the
@@ -819,7 +829,8 @@ async function admitAndSave(engine: BrainEngine, key: string, before: Cursor, ne
     return saved.length > 0;
   });
   if (!rows) return null;
-  startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake();
+  // The sync loop's own admission: the consumer's next tick claims it directly, leaving its scans to their cadence.
+  startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake(true);
   await faultPoint('sync:mid_checkpoint', { sourceId: next.sourceId });
   return next;
 }
@@ -862,6 +873,9 @@ async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk
   if (!bulk.settings.enabled || !cursor.group?.length) return cursor;
   const lane = laneRunOf(cursor, bulk);
   // With lanes, twice the lane count stays admitted, so lanes never wait for the sync side to freeze the next group.
+  // Nothing is frozen ahead until the run's first page commits, so the first group publishes without competing for
+  // connections and the event loop (#5984 G3).
+  if (cursor.counts.added + cursor.counts.modified + cursor.counts.deleted === 0) return cursor;
   const depth = lane ? 2 * Math.max(1, lanePolicy(cursor.binding.worktree_id)?.effective ?? 1) : 1;
   let current = cursor, foregroundChecked = false;
   for (let slot = 0; ; slot++) {
@@ -923,7 +937,7 @@ async function admitWindowGroup(engine: BrainEngine, cursor: Cursor, key: string
     const [held] = await tx.executeRaw<{ request_id: string | null }>(`SELECT completed_keys->0->'window'->($3::int)->0->>'requestId' AS request_id FROM op_checkpoints WHERE op=$1 AND fingerprint=$2 FOR SHARE`, [OP, key, slot]);
     return held?.request_id === members[0]!.requestId;
   }).catch(() => null);
-  if (rows) startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake();
+  if (rows) startPersistenceConsumer(engine, loadConfig() ?? { engine: engine.kind }).wake(true);
   return rows !== null;
 }
 /**
@@ -1178,11 +1192,12 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
       return result(cursor, cursor.from === null ? 'first_sync' : 'synced');
     }
     if (cursor?.done) cursor = await retireCompletedCursor(engine, key, cursor, assertActive);
+    const startupConfig = await preparationConfigView(engine); // #5984 G3: one config read answers the startup's config reads
     if (!cursor) {
       assertActive();
       phase = 'discovery';
       discoveryTarget = company?.plan.revision?.commit ?? syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
-      const discovery = await discoverManagedSync(engine, opts, context);
+      const discovery = await discoverManagedSync(startupConfig, opts, context);
       assertActive();
       const fresh: Cursor = { ...discovery, authority, processingOptions, syncOptions, runId: discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 }, ...(company ? { companyReceiptId: company.receiptId } : {}) };
       if (opts.dryRun) return dryRun(fresh);
@@ -1211,19 +1226,18 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     }
     assertCursorProcessingOptions(cursor, processingOptions, opts.explicitProcessing);
     if (opts.dryRun) return dryRun(cursor);
-    frozenRun.screen = company ? null : await loadSyncScreenRun(engine, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote);
+    frozenRun.screen = company ? null : await loadSyncScreenRun(startupConfig, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote);
     const observedAt = frozenRun.observedAt = cursor.discoveredAt ?? runStartedAt;
     if (frozenRun.screen && !opts.retryFailed && cursor.pending && !cursor.done) {
       phase = 'freeze';
       cursor = await convertBlockedCursor(engine, cursor, key, assertActive, frozenRun);
     }
-    const config = loadConfig() ?? { engine: engine.kind };
-    const analyzeEvery = await importAnalyzeEveryPages(engine);
+    const config = loadConfig() ?? { engine: engine.kind }, analyzeEvery = await importAnalyzeEveryPages(engine);
     let batchStart = performance.now(), batchPages = 0, foregroundWaitStart = 0, foregroundBaseline = 0;
     let creditedPages = 0, creditStarted = 0, foregroundQueued = false;
     const sliceStarted = performance.now(), sliceFirstIndex = cursor.index, drainStartedAt = opts.drainStartedAt ?? Date.now();
     const bulk: BulkPass = { settings: opts.bulk && !company ? opts.bulk : { enabled: false, reason: null, size: 1, maxTxnMs: 0 }, perMemberMs: null, foregroundFirst: await foregroundPriority(engine) };
-    const waiveBatch = noopWaiversEnabled() && await waiverBatchEnabled(engine);
+    const waiveBatch = noopWaiversEnabled() && await waiverBatchEnabled(startupConfig);
     opts.onProgress?.({ phase: 'managed_sync.start', bankedFiles: cursor.index, total: cursor.entries.length });
     while (!cursor.done) {
       assertActive();

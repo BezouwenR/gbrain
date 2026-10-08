@@ -182,6 +182,38 @@ test('#5984 4.5: health never reports an overtaking claimed write as waiting, no
   }
 });
 
+test('#5984 4.5: a foreground write publishing beside running lane groups is not reported waiting on them', async () => {
+  for (const engine of engines) {
+    await disposePersistenceConsumer(engine);
+    const ctx: OperationContext = { engine, config: { engine: engine.kind }, sourceId: 'default',
+      remote: false, dryRun: false, logger: { info() {}, warn() {}, error() {} } };
+    await initializeLocalPersistence(ctx);
+    await engine.executeRaw("DELETE FROM config WHERE key LIKE 'persistence.limits.%'");
+    const [source] = await engine.executeRaw<{ incarnation: string }>("SELECT incarnation FROM sources WHERE id='default'");
+    const admit = async (slug: string, intent: Record<string, unknown>) => {
+      const authority = await submissionAuthority(ctx, 'put_page', 'default', source.incarnation, slug);
+      return admitWrite(engine, { principal: authority.principal, authority, operation: 'put_page', sourceId: 'default',
+        sourceIncarnation: source.incarnation, slug, requestId: randomUUID(), callerIntent: {}, intent });
+    };
+    const lane = await admit('inbox/lane-group', { kind: 'managed_sync_import', content: 'a', lane: randomUUID() });
+    const foreground = await admit('inbox/beside-foreground', { content: 'b' });
+    const worktree = randomUUID();
+    await engine.executeRaw("INSERT INTO persistence_worktrees(id,owner_host_id,state) VALUES($1,$2,'active')", [worktree, randomUUID()]);
+    await engine.executeRaw('UPDATE persistence_requests SET worktree_id=$2 WHERE id=ANY($1::uuid[])', [[lane.id, foreground.id], worktree]);
+    await engine.executeRaw("UPDATE persistence_requests SET operation='submit_job' WHERE id=$1::uuid", [lane.id]);
+    await engine.executeRaw("UPDATE persistence_requests SET state='running',execution_token=gen_random_uuid() WHERE id=ANY($1::uuid[])", [[lane.id, foreground.id]]);
+    const earlier = async () => {
+      const rows = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid', [foreground.id]);
+      return (await writeHealthFacts(engine, rows)).get(foreground.id)?.earlier_write;
+    };
+    expect(await earlier()).toBe(false);
+    // A recovering sync row still comes first.
+    await engine.executeRaw("UPDATE persistence_requests SET state='recovering' WHERE id=$1::uuid", [lane.id]);
+    expect(await earlier()).toBe(true);
+    await engine.executeRaw("UPDATE persistence_requests SET state='cancelled',execution_token=NULL,completed_at=now() WHERE id=ANY($1::uuid[])", [[lane.id, foreground.id]]);
+  }
+});
+
 test('#6275: a publication in progress with its before-image record is not recovery; a recovering head or a lost claim is', async () => {
   for (const engine of engines) {
     await disposePersistenceConsumer(engine);
