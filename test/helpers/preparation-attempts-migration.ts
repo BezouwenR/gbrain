@@ -7,6 +7,7 @@ import { expect } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { LATEST_VERSION, runMigrations } from '../../src/core/migrate.ts';
+import { MIGRATIONS } from '../../src/core/schema-migrations/registry.generated.ts';
 import { declarePersistenceProtocol } from '../../src/core/persistence/protocol.ts';
 
 const COLUMN_SQL = `SELECT column_name,data_type,is_nullable,column_default FROM information_schema.columns
@@ -49,16 +50,17 @@ export async function assertFreshPreparationAttemptsColumn(engine: BrainEngine):
 }
 
 /**
- * An upgraded brain: the column is dropped as a pre-v221 brain lacks it, rows in
- * every state exist, the version is set back to 220, and the migration runner
+ * An upgraded brain: the column is dropped as a brain from before the migration lacks it, rows in
+ * every state exist, the version is set back one, and the migration runner
  * adds the column with 0 on every existing row without touching the rows.
  */
 export async function assertUpgradedPreparationAttemptsColumn(engine: BrainEngine): Promise<void> {
+  const migration = MIGRATIONS.find(m => m.name === 'persistence_request_preparation_attempts')!;
   const ids = await insertRequests(engine, [{ state: 'queued' }, { state: 'running' }, { state: 'failed' }, { state: 'committed', compacted: true }]);
   const before = await engine.executeRaw<Record<string, unknown>>('SELECT id,state,execution_token,compacted,error_code FROM persistence_requests WHERE id=ANY($1::uuid[]) ORDER BY sequence', [ids]);
   await engine.executeRaw('ALTER TABLE persistence_requests DROP COLUMN preparation_attempts');
   expect(await engine.executeRaw(COLUMN_SQL)).toEqual([]);
-  await engine.setConfig('version', '220');
+  await engine.setConfig('version', String(migration.version - 1));
   const first = await runMigrations(engine);
   expect(first.current).toBe(LATEST_VERSION);
   expect(first.applied).toBeGreaterThanOrEqual(1);
@@ -68,7 +70,7 @@ export async function assertUpgradedPreparationAttemptsColumn(engine: BrainEngin
   expect(after.map(({ preparation_attempts: _attempts, ...row }) => row)).toEqual(before);
   expect(after.map(row => row.preparation_attempts)).toEqual([0, 0, 0, 0]);
   // Re-running the idempotent migration is a no-op.
-  await engine.setConfig('version', '220');
+  await engine.setConfig('version', String(migration.version - 1));
   const second = await runMigrations(engine);
   expect(second.current).toBe(LATEST_VERSION);
   expect(await engine.executeRaw(COLUMN_SQL)).toHaveLength(1);
