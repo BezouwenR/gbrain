@@ -93,6 +93,8 @@ export class PersistenceConsumer {
   /** #5373: preparations and renewals that outlived their claim; stop() drains them before the engine closes. */
   private outlived = new Set<Promise<void>>();
   private activeRoots = new Set<string>();
+  /** #5984 Phase 4.5: active roots whose only task is a foreground write publishing beside this process's lane groups. */
+  private besideLanes = new Set<string>();
   /** #5984 lanes: running lane tasks per worktree. */
   private laneTasks = new Map<string, number>();
   private foregroundCounts = new Map<string, number>();
@@ -196,7 +198,7 @@ export class PersistenceConsumer {
     const retryingTopologies = [...this.topologyRetryAfter.keys()];
     const [row] = await this.phase('idle_probe', async signal => this.probeQuery<{ work: boolean }>(this.laneInUse ? undefined : await this.acquireIdleLane(signal), `SELECT (
       EXISTS (SELECT 1 FROM persistence_requests r LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
-        WHERE ${claimableWriteSql(foregroundPrioritySql())}
+        WHERE ${claimableWriteSql(foregroundPrioritySql(), '$5::text[]')}
         AND ($3::boolean OR r.blocked_reason IS DISTINCT FROM 'writer_pool_capacity'))
       OR EXISTS (SELECT 1 FROM persistence_requests r JOIN persistence_worktrees w ON w.id=r.worktree_id
         WHERE w.owner_host_id=$1::uuid AND r.recovery IS NOT NULL AND NOT (r.worktree_id::text=ANY($2::text[])))
@@ -219,7 +221,7 @@ export class PersistenceConsumer {
       OR EXISTS (SELECT 1 FROM persistence_topology_changes c
         JOIN persistence_worktrees w ON w.id=(c.recovery->>'worktreeId')::uuid
         WHERE c.recovery IS NOT NULL AND w.owner_host_id=$1::uuid AND NOT (c.id::text=ANY($4::text[])))
-    ) AS work`, [this.hostId, excluded, publicationConcurrency(this.engine) > 0, retryingTopologies], signal));
+    ) AS work`, [this.hostId, excluded, publicationConcurrency(this.engine) > 0, retryingTopologies, [...this.laneTasks.keys()]], signal));
     return row?.work === true;
   }
   /**
@@ -447,11 +449,15 @@ export class PersistenceConsumer {
       return;
     }
     const concurrency = this.opts.concurrency ?? 2;
-    const attemptedRoots = new Set([...this.activeRoots, ...this.laneTasks.keys(), ...this.rootRetryAfter.keys()]);
+    // #5984: on a root whose lane groups run here, only a foreground write is claimed, to publish beside them.
+    const laneRootKeys = [...this.laneTasks.keys()];
+    const attemptedRoots = new Set([...this.activeRoots, ...this.rootRetryAfter.keys()]);
     while (!this.stopping && this.active.size - this.laneTaskCount() < concurrency) {
       const claimed = laneClaim();
       try {
-        const row = await this.phase('claim', () => claimNextWrite(this.engine, this.hostId, this.opts.claimLeaseMs ?? 30_000, [...attemptedRoots], [...this.owesSyncTurn]));
+        // A root where lanes run here owes the sync side no FIFO turn: the write publishes beside its groups.
+        const row = await this.phase('claim', () => claimNextWrite(this.engine, this.hostId, this.opts.claimLeaseMs ?? 30_000, [...attemptedRoots],
+          [...this.owesSyncTurn].filter(key => !laneRootKeys.includes(key)), laneRootKeys.filter(key => !attemptedRoots.has(key))));
         if (!row) break;
         if (String(row.intent?.kind ?? '').startsWith('managed_sync_')) this.owesSyncTurn.delete(row.worktree_id ?? `db:${row.source_incarnation}`);
         else if (row.passed_sync) this.passedSync.add(row.id);
@@ -462,7 +468,9 @@ export class PersistenceConsumer {
         if (laneOf(row)) { this.startLaneTask(row, key); continue; }
         if (this.activeRoots.has(key)) { await releaseUnpublishedClaim(this.engine, row, 'writer_busy'); break; }
         this.activeRoots.add(key);
-        this.track(row, () => this.activeRoots.delete(key), key);
+        // Lane heads keep being claimed beside a foreground write on a lane root (it joins their lease).
+        if (laneRootKeys.includes(key)) this.besideLanes.add(key);
+        this.track(row, () => { this.activeRoots.delete(key); this.besideLanes.delete(key); }, key);
       } finally { claimed(); }
     }
     await this.claimLanes();
@@ -470,7 +478,7 @@ export class PersistenceConsumer {
   /** #5984 lanes: claims the next group heads of every open lane run in this process, up to its effective lane count. */
   private async claimLanes(): Promise<void> {
     for (const { worktreeId, run, capacity } of laneRoots()) {
-      if (this.rootRetryAfter.has(worktreeId) || this.activeRoots.has(worktreeId)) continue;
+      if (this.rootRetryAfter.has(worktreeId) || this.activeRoots.has(worktreeId) && !this.besideLanes.has(worktreeId)) continue;
       while (!this.stopping && (this.laneTasks.get(worktreeId) ?? 0) < capacity) {
         const claimed = laneClaim();
         try {

@@ -35,11 +35,11 @@ import type { BrainEngine } from '../engine.ts';
 import { OperationError } from '../ops/contract.ts';
 import { authorizeStoredRequest, storedAuthorizationReads } from './authority.ts';
 import { localHostId } from './identity.ts';
-import { acquireWorktree, acquireWorktreeShared, getWorktreeBinding, guardOwnership } from './ownership.ts';
-import { awaitLaneBegin, awaitLaneTurn, LaneAbort, laneApplyBegin, laneClaimed, laneFinished, stepDownLanes, type LaneState } from './sync-lanes.ts';
+import { acquireWorktree, acquireWorktreeShared, getWorktreeBinding, guardOwnership, joinWorktreeLease } from './ownership.ts';
+import { awaitLaneBegin, awaitLaneTurn, LaneAbort, laneApplyBegin, laneClaimed, laneFinished, lanePolicy, stepDownLanes, type LaneState } from './sync-lanes.ts';
 import { cancelRows, windowPredecessor } from './sync-window.ts';
 import { clearResolvedRecoveries, completeWrite, ENSURE_COUNTERS_SQL, getWriteRequestById, LOCK_COUNTERS_SQL, markRecovering, prepareRecoveries,
-  publicationGroupKey, reclaimReleasedWrite, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
+  foregroundPriority, publicationGroupKey, reclaimReleasedWrite, releaseUnpublishedClaim, renewGroupClaims } from './journal.ts';
 import { principalKey, requestPrincipal, type FileRecoveryRecord, type WriteRequest } from './model.ts';
 import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
 import { claimPhaseStamp, enterClaimPhase, startClaimPhase } from './claim-phase.ts';
@@ -178,6 +178,9 @@ export interface GroupHooks {
 /** Runs one transaction: `engine.transaction`, or a reserved connection's (Phase 4.4). */
 export type TransactionRunner = <T>(fn: (tx: BrainEngine) => Promise<T>) => Promise<T>;
 
+/** #5984 Phase 4.5: foreground writes publishing beside this process's lane groups, until their recovery record is cleared. */
+const publishingBeside = new Set<string>();
+
 export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], prepared: PreparedMutation[], hostId = localHostId(),
   hooks: GroupHooks = {}, lane: LaneState | null = null, transaction: TransactionRunner = fn => engine.transaction(fn)): Promise<{ done: WriteRequest[] | null; requeued: string[]; reason?: GroupFailure }> {
   const head = rows[0];
@@ -186,9 +189,14 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
     || rows.length > 1 && singleWrite(row))) return none;
   const binding = await getWorktreeBinding(engine, head.source_id, hostId);
   if (!binding || binding.owner_host_id !== hostId || !binding.local_path) return none;
-  // #5984 lanes: lane groups share this process's native lock; everything else takes it exclusively.
-  const lock = lane ? await acquireWorktreeShared(binding, engine) : await acquireWorktree(binding, 0, undefined, engine);
+  // #5984 lanes: lane groups share this process's native lock; a foreground page write (Phase 4.5) joins their
+  // lease and publishes beside them; everything else takes it exclusively.
+  // With this process's lanes open on the worktree but none publishing, it opens the lease for them to join.
+  const beside = !lane && rows.length === 1 && singleWrite(head) && await foregroundPriority(engine);
+  const joined = beside ? joinWorktreeLease(binding) ?? ((lanePolicy(head.worktree_id)?.effective ?? 1) > 1 ? await acquireWorktreeShared(binding, engine) : null) : null;
+  const lock = lane ? await acquireWorktreeShared(binding, engine) : joined ?? await acquireWorktree(binding, 0, undefined, engine, { yieldLanes: true });
   if (!lock) return { ...none, reason: 'busy' };
+  if (joined) publishingBeside.add(head.id);
   if (lane) lane.coordinationPath ??= binding.coordination_path;
   let releaseCapacity: (() => void) | null = null;
   const recorded = new Map<number, { row: WriteRequest; record: FileRecoveryRecord; bytes: number }>();
@@ -196,13 +204,16 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
   const timed: { apply: ReturnType<typeof laneApplyBegin> | null } = { apply: null };
   try {
     // The recovery check and the journal limits the recovery record is sized against go out together.
+    // A lane group passes the recovery record of a foreground write this process publishes beside it (Phase 4.5,
+    // another page); any other record still blocks it, and the group releases its claims to retry.
     const [blocked, limits] = await pipelined(engine, [
       () => engine.executeRaw(`SELECT 1 FROM persistence_requests WHERE worktree_id=$1::uuid AND NOT (id=ANY($2::uuid[])) AND recovery IS NOT NULL
-      UNION ALL SELECT 1 FROM persistence_effects WHERE worktree_id=$1::uuid AND recovery IS NOT NULL LIMIT 1`, [head.worktree_id, rows.map(row => row.id)]),
+      UNION ALL SELECT 1 FROM persistence_effects WHERE worktree_id=$1::uuid AND recovery IS NOT NULL LIMIT 1`,
+      [head.worktree_id, [...rows.map(row => row.id), ...(lane ? publishingBeside : [])]]),
       () => prepared.some(member => member.file && !member.noop) ? readJournalLimits(engine) : Promise.resolve(undefined),
     ]) as [unknown[], JournalLimits | undefined];
-    if (blocked.length) return none;
-    releaseCapacity = tryAcquirePublicationCapacity(engine, lane ? lane.effective + 1 : undefined);
+    if (blocked.length) return lane ? { ...none, reason: 'busy' } : none;
+    releaseCapacity = tryAcquirePublicationCapacity(engine, lane ? lane.effective + 1 : joined ? Number.POSITIVE_INFINITY : undefined);
     if (!releaseCapacity) return { ...none, reason: 'busy' };
     const files = new Map<number, { row: WriteRequest; record: FileRecoveryRecord; bytes: number }>();
     for (let i = 0; i < rows.length; i++) {
@@ -308,7 +319,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
         await effects?.();
       }, requestAttribution(head));
       // #5984 lanes: applied concurrently, committed in manifest order.
-      if (lane) { timed.apply?.turn(); await awaitLaneTurn(tx, lane, rows); timed.apply?.turned(); }
+      if (lane) { timed.apply?.turn(); await faultPoint('lane:applied', { requestId: head.request_id, sourceId: head.source_id, operation: head.operation }); await awaitLaneTurn(tx, lane, rows); timed.apply?.turned(); }
       const done = await completeGroup(tx, rows, outcomes);
       // Every member is complete in this transaction: the batch's last page re-arms the batch's mention links once.
       const last = rows[rows.length - 1]!;
@@ -346,6 +357,7 @@ export async function publishGroup(engine: BrainEngine, rows: WriteRequest[], pr
   } finally {
     timed.apply?.end(rows.length);
     releaseCapacity?.();
+    publishingBeside.delete(head.id);
     await lock.release();
   }
 }
@@ -401,7 +413,9 @@ async function laneFallback(engine: BrainEngine, rows: WriteRequest[], reason: G
   const after = windowPredecessor(rows[0]!);
   const prior = after ? await engine.executeRaw<{ state: string }>('SELECT state FROM persistence_requests WHERE principal_kind=$1 AND principal_id=$2 AND request_id=$3::uuid',
     [rows[0]!.principal_kind, rows[0]!.principal_id, after]).then(found => found[0]?.state ?? null) : 'committed';
-  if (prior === 'committed') return null;
+  // A group that found the worktree busy (another holder or no publication capacity) releases its claims and is
+  // claimed again as a lane head; publishing its members one at a time would hold the lanes back.
+  if (prior === 'committed' && reason !== 'busy') return null;
   if (prior !== null && ['failed', 'conflict', 'cancelled'].includes(prior)) {
     for (const done of await cancelRows(engine, rows)) run.settled(done);
     return true;

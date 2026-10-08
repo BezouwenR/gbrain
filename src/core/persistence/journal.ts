@@ -414,15 +414,19 @@ const NAMES_PAGE = (sync: string, write: string) => `(${sync}.source_id=${write}
  * sync row that has not started and does not name its page. Running and recovering rows, recovery records and
  * a sync row naming the page still come first; a passed sync row waits until the foreground request finishes.
  */
-const PASSES_QUEUED_SYNC = (earlier: string, r: string, priority: string) => `((${priority}) AND NOT ${SYNC_KIND(r)}
-  AND ${earlier}.state='queued' AND ${earlier}.recovery IS NULL AND ${SYNC_KIND(earlier)} AND NOT ${NAMES_PAGE(earlier, r)})`;
+const PASSES_QUEUED_SYNC = (earlier: string, r: string, priority: string, laneRoots: string) => `((${priority}) AND NOT ${SYNC_KIND(r)}
+  AND (${earlier}.state='queued' OR (${earlier}.state='running' AND ${earlier}.intent ? 'lane'
+    AND ${earlier}.worktree_id::text=ANY(${laneRoots})))
+  AND ${earlier}.recovery IS NULL AND ${SYNC_KIND(earlier)} AND NOT ${NAMES_PAGE(earlier, r)})`;
 /**
  * The rows `claimNextWrite` may claim, over `persistence_requests r LEFT JOIN
  * persistence_worktrees w`, with $1 = host id and $2 = excluded root keys and
  * `priority` the SQL condition of the `foreground_priority` switch. An
- * unresolved head blocks its entire root.
+ * unresolved head blocks its entire root. `laneRoots` (an SQL text[]) names the worktrees whose lane groups
+ * run in the claiming process: there a foreground write also passes running lane groups that do not name its
+ * page and publishes beside them on the process's shared worktree lock (group-publish.ts).
  */
-export const claimableWriteSql = (priority: string) => `r.state='queued' AND (r.worktree_id IS NULL OR (w.owner_host_id=$1::uuid AND w.state='active'))
+export const claimableWriteSql = (priority: string, laneRoots = "'{}'::text[]") => `r.state='queued' AND (r.worktree_id IS NULL OR (w.owner_host_id=$1::uuid AND w.state='active'))
       AND (r.worktree_id IS NULL OR ${refreshFenceClear('r')})
       AND NOT (COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)=ANY($2::text[]))
       AND NOT EXISTS (SELECT 1 FROM persistence_effects blocked WHERE blocked.worktree_id=r.worktree_id AND blocked.recovery IS NOT NULL)
@@ -434,7 +438,7 @@ export const claimableWriteSql = (priority: string) => `r.state='queued' AND (r.
         WHERE COALESCE(earlier.worktree_id::text,'db:'||earlier.source_incarnation::text)
               =COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)
         AND earlier.sequence<r.sequence AND earlier.state IN ('queued','running','recovering')
-        AND NOT ${PASSES_QUEUED_SYNC('earlier', 'r', priority)})
+        AND NOT ${PASSES_QUEUED_SYNC('earlier', 'r', priority, laneRoots)})
       AND NOT ((${priority}) AND ${SYNC_KIND('r')} AND EXISTS (SELECT 1 FROM persistence_requests ahead
         WHERE ahead.worktree_id=r.worktree_id AND ahead.sequence>r.sequence AND ahead.state IN ('running','recovering') AND NOT ${SYNC_KIND('ahead')}))`;
 /** With the switch on, a claimable foreground request is claimed before the sync rows it passes. */
@@ -466,7 +470,8 @@ export async function hasClaimableWrite(engine: SqlEngine, hostId: string, exclu
  * `fifoRoots` (#5984 Phase 4.5) are roots where this consumer owes the sync side a turn: a foreground write it
  * claimed ahead of a queued sync row (`passed_sync`) committed since it last claimed a sync row, so there the claim is plain FIFO.
  */
-export async function claimNextWrite(engine: BrainEngine, hostId: string, leaseMs = 30_000, excludeRoots: string[] = [], fifoRoots: string[] = []): Promise<(WriteRequest & { passed_sync?: boolean }) | null> {
+export async function claimNextWrite(engine: BrainEngine, hostId: string, leaseMs = 30_000, excludeRoots: string[] = [], fifoRoots: string[] = [],
+  laneRoots: string[] = []): Promise<(WriteRequest & { passed_sync?: boolean }) | null> {
   const first = `(${foregroundPrioritySql()}) AND NOT (COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)=ANY($3::text[]))`;
   return engine.transactionDirect(async tx => {
     // The protocol declaration and the FIFO head read are sent together.
@@ -474,8 +479,10 @@ export async function claimNextWrite(engine: BrainEngine, hostId: string, leaseM
       () => declarePersistenceProtocol(tx),
       () => tx.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
       LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
-      WHERE ${claimableWriteSql(`(${first})`)}
-      ORDER BY ${CLAIM_ORDER(`(${first})`)} LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, excludeRoots, fifoRoots]),
+      WHERE ${claimableWriteSql(`(${first})`, '$4::text[]')}
+        -- On a root whose lane groups run in this process only a foreground write is claimed (beside them).
+        AND NOT (r.worktree_id::text=ANY($4::text[]) AND (${SYNC_KIND('r')} OR NOT (${first})))
+      ORDER BY ${CLAIM_ORDER(`(${first})`)} LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, excludeRoots, fifoRoots, laneRoots]),
     ]) as [unknown, WriteRequest[]];
     if (!row) return null;
     // `passed_sync`: the claimed row went ahead of a queued sync row of its root.
@@ -516,9 +523,10 @@ export async function claimNextLaneHead(engine: BrainEngine, hostId: string, wor
         AND NOT EXISTS (SELECT 1 FROM persistence_requests blocked WHERE blocked.worktree_id=r.worktree_id AND blocked.recovery IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM persistence_requests earlier WHERE earlier.worktree_id=r.worktree_id AND earlier.sequence<r.sequence
           AND (earlier.state IN ('queued','recovering') OR (earlier.state='running' AND COALESCE(earlier.intent->>'lane','')<>$3)))
-        -- #5984 Phase 4.5: no new lane head while a foreground write that may go first is unfinished, except one head
-        -- after each foreground commit since this run's last head claim, so a stream of writes cannot starve the drain.
-        AND NOT ((${foregroundPrioritySql()}) AND EXISTS (SELECT 1 FROM persistence_requests f WHERE f.worktree_id=r.worktree_id AND f.state IN ('queued','running','recovering')
+        -- #5984 Phase 4.5: no new lane head while a foreground write that may go first waits to be claimed (a claimed
+        -- one publishes beside the lanes), except one head after each foreground commit since this run's last head
+        -- claim, so a stream of writes cannot starve the drain.
+        AND NOT ((${foregroundPrioritySql()}) AND EXISTS (SELECT 1 FROM persistence_requests f WHERE f.worktree_id=r.worktree_id AND f.state IN ('queued','recovering')
             AND f.recovery IS NULL AND NOT ${SYNC_KIND('f')}
             AND NOT EXISTS (SELECT 1 FROM persistence_requests named WHERE named.worktree_id=f.worktree_id AND named.sequence<f.sequence
               AND named.state IN ('queued','running','recovering') AND ${SYNC_KIND('named')} AND ${NAMES_PAGE('named', 'f')}))
@@ -797,9 +805,9 @@ export async function writeHealthFacts(engine: BrainEngine, rows: WriteRequest[]
   const roots = [...new Set(pending.map(row => row.worktree_id ?? `db:${row.source_incarnation}`))];
   const abort = new AbortController();
   const observed_at = new Date().toISOString();
-  const query = engine.executeRaw<{ root: string; sequence: string | null; started_sequence: string | null; recovery_required: boolean; owner_unavailable: boolean; inspect_owner: boolean }>(`
+  const query = engine.executeRaw<{ root: string; sequence: string | null; started_sequence: string | null; started_unlaned: string | null; recovery_required: boolean; owner_unavailable: boolean; inspect_owner: boolean }>(`
     WITH roots AS (SELECT unnest($1::text[]) AS root)
-    SELECT roots.root,head.sequence::text,head.started_sequence::text,COALESCE(head.inspect_owner,false) AS inspect_owner,
+    SELECT roots.root,head.sequence::text,head.started_sequence::text,head.started_unlaned::text,COALESCE(head.inspect_owner,false) AS inspect_owner,
       COALESCE(head.recovering,false) OR EXISTS (SELECT 1 FROM persistence_effects e
         WHERE e.worktree_id=w.id AND e.recovery IS NOT NULL) AS recovery_required,
       w.id IS NOT NULL AND (w.state<>'active' OR w.owner_host_id IS NULL) AS owner_unavailable
@@ -807,13 +815,16 @@ export async function writeHealthFacts(engine: BrainEngine, rows: WriteRequest[]
     LEFT JOIN LATERAL (
       (SELECT r.sequence,(SELECT s.sequence FROM persistence_requests s WHERE s.worktree_id=w.id
           AND (s.state IN ('running','recovering') OR s.recovery IS NOT NULL) ORDER BY s.sequence LIMIT 1) AS started_sequence,
+        (SELECT s.sequence FROM persistence_requests s WHERE s.worktree_id=w.id
+          AND (s.state IN ('running','recovering') OR s.recovery IS NOT NULL)
+          AND NOT (s.state='running' AND s.recovery IS NULL AND s.intent ? 'lane') ORDER BY s.sequence LIMIT 1) AS started_unlaned,
         ${STUCK_RECOVERY('r')} AS recovering,
         r.blocked_reason IN ('unexpected_file_bytes','unexpected_staging_bytes') AS inspect_owner FROM persistence_requests r
         WHERE r.worktree_id=w.id AND (r.state IN ('queued','running','recovering') OR r.recovery IS NOT NULL)
         ORDER BY r.sequence LIMIT 1)
       UNION ALL
       (SELECT r.sequence,(SELECT s.sequence FROM persistence_requests s WHERE s.worktree_id IS NULL AND s.source_incarnation=r.source_incarnation
-          AND s.state IN ('running','recovering') ORDER BY s.sequence LIMIT 1) AS started_sequence,
+          AND s.state IN ('running','recovering') ORDER BY s.sequence LIMIT 1) AS started_sequence,NULL::bigint AS started_unlaned,
         ${STUCK_RECOVERY('r')} AS recovering,
         r.blocked_reason IN ('unexpected_file_bytes','unexpected_staging_bytes') AS inspect_owner FROM persistence_requests r
         WHERE r.worktree_id IS NULL AND r.source_incarnation=CASE WHEN roots.root LIKE 'db:%' THEN substring(roots.root FROM 4)::uuid END
@@ -830,7 +841,8 @@ export async function writeHealthFacts(engine: BrainEngine, rows: WriteRequest[]
   for (const row of pending) {
     const fact = byRoot.get(row.worktree_id ?? `db:${row.source_incarnation}`);
     if (!fact) continue;
-    const head = row.state === 'queued' ? fact.sequence : fact.started_sequence;
+    // #5984 Phase 4.5: a foreground write publishing beside running lane groups is not waiting on them.
+    const head = row.state === 'queued' ? fact.sequence : row.worktree_id && !String(row.intent?.kind ?? '').startsWith('managed_sync_') ? fact.started_unlaned : fact.started_sequence;
     result.set(row.id, { observed_at, recovery_required: fact.recovery_required,
       owner_unavailable: fact.owner_unavailable,
       inspect_owner: fact.inspect_owner,

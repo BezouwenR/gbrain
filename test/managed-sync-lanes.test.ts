@@ -15,7 +15,7 @@ import { performSync } from '../src/commands/sync/perform.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { resolveBulkSettings } from '../src/core/persistence/sync-group.ts';
 import { WINDOW_CANCEL_MESSAGE } from '../src/core/persistence/sync-window.ts';
-import { acquireShared, leaseDraining, leaseWounded, yieldLease } from '../src/core/persistence/worktree-lease.ts';
+import { acquireShared, DEFER_WAIT_MS, deferToLease, exclusiveAcquired, joinLease, leaseDraining, leaseWounded, yieldLease } from '../src/core/persistence/worktree-lease.ts';
 import type { NativeLockHandle } from '../src/core/persistence/native-lock.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { installFaultHook } from '../src/core/persistence/fault-points.ts';
@@ -116,6 +116,42 @@ test('a lease is shared by lanes; an exclusive writer drains and wounds it and g
   await b.release(); expect(released).toBe(1);
   expect(await waiting).toBe(true);
   expect(leaseDraining(path)).toBe(false);
+});
+
+test('a background writer never wounds the lanes: the lease drains for it after the defer wait, and no new lease starts until it has the lock', async () => {
+  const native = (): Promise<NativeLockHandle> => { let done = false; return Promise.resolve({ get released() { return done; }, async release() { done = true; } }); };
+  const path = join(home, 'lease-defer');
+  const start = Date.now();
+  try {
+    const lane = (await acquireShared(path, native))!;
+    expect(deferToLease(path)).toBe(false);
+    expect(leaseWounded(path) || leaseDraining(path)).toBe(false);
+    setSystemTime(new Date(start + DEFER_WAIT_MS));
+    expect(leaseDraining(path)).toBe(true);
+    expect(leaseWounded(path)).toBe(false);
+    await lane.release();
+    // Between leases the waiting writer goes first: lanes do not open a new lease until it took the lock.
+    expect(leaseDraining(path)).toBe(true);
+    expect(deferToLease(path)).toBe(true);
+    exclusiveAcquired(path);
+    expect(leaseDraining(path)).toBe(false);
+  } finally { setSystemTime(); }
+});
+
+test('a foreground write joins a live lane lease and keeps it open until it leaves; it never takes a wounded or absent one', async () => {
+  let released = 0;
+  const native = (): Promise<NativeLockHandle> => { let done = false; return Promise.resolve({ get released() { return done; }, async release() { done = true; released++; } }); };
+  const path = join(home, 'lease-join');
+  expect(joinLease(path)).toBeNull();
+  const lane = (await acquireShared(path, native))!;
+  const write = joinLease(path)!;
+  expect(write).not.toBeNull();
+  await lane.release(); expect(released).toBe(0);
+  await write.release(); expect(released).toBe(1);
+  const again = (await acquireShared(path, native))!;
+  expect(await yieldLease(path, 0)).toBe(false);
+  expect(joinLease(path)).toBeNull();
+  await again.release();
 });
 
 test('lanes that start together share one native lock instead of all but one reporting busy', async () => {
