@@ -266,6 +266,12 @@ export const CODES = {
   plan_output_failed: { class: 'server', summary: "Writing the plan output failed." },
   plan_stale: { class: 'caller', summary: "The saved plan has no valid repository identity." },
   port_in_use: { class: 'retryable', summary: "Google connect credential error: port in use.", docs: 'docs/guides/google-connect.md#troubleshooting' },
+  // #6278 (Lane B placeholder; Lane A owns the final entry): a write whose preparation never settled within its attempts.
+  preparation_stalled: { class: 'server', retryable: false, actor: 'agent', summary: "The write's preparation did not finish within its attempts, so the owner gave it up; a managed sync holds the file and keeps going.",
+    why: "A preparation that never settles would hold its worktree root forever; after the attempt limit the request is finished failed and a new sync admits a new request.",
+    docs: 'docs/guides/write-refusals.md#preparation_stalled',
+    suggestion: 'Inspect the write owner with gbrain sources writer status --source <id> --json (step and wait cause), fix what it names or upgrade gbrain, then gbrain sources retry-held <id> and the same sync.',
+    fix: { argv: ['gbrain', 'sources', 'status', '{source_id}', '--json'], consent: [], actor: 'agent', why: 'Lists the held files of the source with the step each stalled on, read-only.', requires_exclusive: false } },
   preview_changed: { class: 'caller', summary: "The state changed since the approved preview." },
   profile_incompatible: { class: 'caller', summary: "The stored profile is incompatible with this operation." },
   projection_owner_resident: { class: 'host_only', summary: "A resident owner holds the projection." },

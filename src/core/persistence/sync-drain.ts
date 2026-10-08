@@ -20,6 +20,7 @@ import { getCode, isRetryableConnError, isStatementTimeoutError } from '../retry
 import { currentRunDeadline, noteForwardProgress } from '../forward-progress.ts';
 import { serr } from '../console-prefix.ts';
 import { ERROR_CATALOGUE, type CatalogueName } from '../error-catalogue.ts';
+import { managedSyncResumeArgs, syncResumeCommand } from '../sync-reconcile.ts';
 
 export type DrainOutcome = 'synced' | 'resumable' | 'blocked';
 /** Why a drain ended short of `synced`. Each value has an error-catalogue entry (DX-A4). */
@@ -423,6 +424,8 @@ export interface ManagedSyncBacklog {
   eta_seconds: number | null;
   last_progress_at: string | null;
   resume_command: string;
+  /** #6278: the arguments after `gbrain sync` that resume this cursor with its stored options. */
+  resume_args: string[];
 }
 
 /**
@@ -431,16 +434,15 @@ export interface ManagedSyncBacklog {
  */
 export async function readManagedSyncBacklog(engine: BrainEngine, sourceIds?: string[]): Promise<ManagedSyncBacklog[]> {
   const rows = await engine.executeRaw<{ header: { sourceId: string; index: number; total: number; done?: boolean; progress?: { startedAt: number; startIndex: number; lastAt: number; lastIndex: number };
-    processingOptions?: { noEmbed?: boolean; noExtract?: boolean; noSchemaPack?: boolean } } }>(
+    processingOptions?: { noEmbed?: boolean; noExtract?: boolean; noSchemaPack?: boolean }; syncOptions?: Parameters<typeof managedSyncResumeArgs>[0]['syncOptions'] } }>(
     `SELECT completed_keys->0 AS header FROM op_checkpoints WHERE op='managed-sync' AND COALESCE(completed_keys->0->>'done','false')<>'true'`);
-  const flags = { noEmbed: '--no-embed', noExtract: '--no-extract', noSchemaPack: '--no-schema-pack' } as const;
   return rows.map(({ header }) => header).filter(h => h?.sourceId && (!sourceIds || sourceIds.includes(h.sourceId))).map(h => {
     const remaining = Math.max(0, Number(h.total) - Number(h.index));
     const p = h.progress;
     const estimate = p ? drainEstimate(remaining, p.lastIndex - p.startIndex, p.lastAt - p.startedAt) : { rate_pages_per_min: null, eta_seconds: null };
+    const args = managedSyncResumeArgs({ sourceId: h.sourceId, processingOptions: h.processingOptions, syncOptions: h.syncOptions });
     return { source_id: h.sourceId, index: Number(h.index), total: Number(h.total), remaining, ...estimate,
-      last_progress_at: p ? new Date(p.lastAt).toISOString() : null,
-      resume_command: `gbrain sync --source ${h.sourceId} --no-pull${(Object.keys(flags) as (keyof typeof flags)[]).filter(k => h.processingOptions?.[k]).map(k => ` ${flags[k]}`).join('')}` };
+      last_progress_at: p ? new Date(p.lastAt).toISOString() : null, resume_command: syncResumeCommand(args), resume_args: args };
   });
 }
 

@@ -17,7 +17,7 @@ import { assertSyncPageOrigin, sameSyncOrigin, syncOriginScope } from './sync-or
 import { assertManagedSyncActive, assertSyncDispatchActive, managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, syncProcessingOptions, SYNC_PROCESSING_KEYS, type SyncAuthority, type SyncProcessingOptions } from './sync-authority.ts';
 import { prepareManagedSyncMutation, type SyncCursorOptions, type SyncIntent } from './sync-prepare.ts';
 import { screeningRequest } from './noop-kernel.ts';
-import { noopWaiversEnabled, screenWaiver, waiveNoopEntry, waiveNoopRun, waiverBatchEnabled, type NoopWaiver, type WaiverRunEntry } from './sync-waivers.ts';
+import { noopWaiversEnabled, screenWaiver, unfinishedPageRequestParams, UNFINISHED_PAGE_REQUEST_SQL, waiveNoopEntry, waiveNoopRun, waiverBatchEnabled, type NoopWaiver, type WaiverRunEntry } from './sync-waivers.ts';
 import { resolve } from 'node:path';
 import { currentCompanyBrainSync, getCompanyBrainProfile, readCompanyBrainPlan } from '../company-brain/profile.ts';
 import { readCommittedBlob } from '../company-brain/revision.ts';
@@ -33,11 +33,12 @@ import { readJournalLimits } from './limits.ts';
 import { assertManagedSyncAllowed } from './worktree-refresh.ts';
 import type { GBrainConfig } from '../config.ts';
 import { admitGroup, freezeFollowers, groupableIntent, nextGroupSize, type BulkSettings } from './sync-group.ts';
-import { cancelWindow } from './sync-window.ts';
+import { cancelRows, cancelWindow } from './sync-window.ts';
+import { managedSyncResumeArgs } from '../sync-reconcile.ts';
 import { laneApplyMsPerMember, lanePolicy, openLanes } from './sync-lanes.ts';
 import { isContentRefusal } from '../import-screen.ts';
 import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
-import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
+import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, preparationStalledHold, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
 import { fenceReceiptLocation } from '../fence-repair/refusal.ts';
 import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-write.ts';
 import { faultPoint } from './fault-points.ts';
@@ -236,7 +237,8 @@ function writeDiagnostic(cursor: Cursor, pending: Pending, row: WriteRequest): M
   const terminal = isTerminalWriteState(row.state);
   const code = terminal ? row.error_code ?? (row.state === 'cancelled' ? 'cancelled' : 'storage_error') : 'write_pending';
   const blockedReason = ['writer_busy', 'writer_pool_capacity', 'owner_unavailable', 'recovery_required', 'writer_lock_unavailable',
-    'database_contention', 'consumer_stopping', 'revision_changed_repreparing', 'unexpected_file_bytes', 'unexpected_staging_bytes'].includes(row.blocked_reason ?? '') ? row.blocked_reason! : 'write_pending';
+    'database_contention', 'consumer_stopping', 'revision_changed_repreparing', 'unexpected_file_bytes', 'unexpected_staging_bytes',
+    'preparation_deadline', 'group_member_waiting'].includes(row.blocked_reason ?? '') ? row.blocked_reason! : 'write_pending';
   const detail = terminal ? writeFailureDiagnostic(code, row.error_message) : {
     reason: blockedReason, message: 'The write is accepted but not committed; the sync checkpoint has not advanced.',
     suggestion: 'Re-run the same sync options to resume this request. Do not submit a replacement request or skip the pending write.',
@@ -395,80 +397,164 @@ function advanceHeld(held: Cursor, converted?: string[]): Cursor {
   return next;
 }
 
+/** #6278: the terminal code an owner stamps on a request whose preparation never settled within its attempts (Lane A, consumer.ts). */
+export const PREPARATION_STALLED = 'preparation_stalled';
+const preparationStalled = (row: Pick<WriteRequest, 'state' | 'error_code'>) => row.state === 'failed' && row.error_code === PREPARATION_STALLED;
+/** The run's page requests, as `persistence_requests_sync_run_open` indexes them. */
+const SYNC_PAGE_KINDS_SQL = "intent->>'kind' IN ('managed_sync_import','managed_sync_delete')";
+/** The `gbrain sync` arguments a hold or receipt prints to resume this cursor with its own options. */
+const resumeArgsOf = (cursor: Cursor, run: { syncOptions: SyncCursorOptions; repoPath?: string }) =>
+  managedSyncResumeArgs({ sourceId: cursor.sourceId, processingOptions: cursor.processingOptions, syncOptions: cursor.syncOptions ?? run.syncOptions, repoPath: run.repoPath });
+
 /**
- * #5988 (E6): a cursor blocked by a failed content refusal converts in place with its stored
- * options: held when the screen holds the frozen entry, re-frozen under a new request when it
- * passes, but only once for the same bytes, so a refusal the screen misses stays blocked
- * without minting a receipt per run.
- * #6188: a failed fence refusal (typed, or a message an older gbrain stored) holds the same
- * bytes even when the screen admits them (`prepare_time`: the refusal read stored rows). A
- * compacted `invalid_params` / `take_row_collision` receipt, whose message is gone, converts
- * only when the re-screen of the current bytes holds them; an arbitrary `invalid_params` is
+ * #6278 (1.2b): the hold gate. Before this change both converters waited until
+ * no request on the whole source was unfinished, so one stuck preparation or a
+ * stream of maintenance writes on other pages kept every hold pending forever.
+ *
+ * Invariant the source-wide wait protected, kept by this narrower one: no entry
+ * after the held one publishes a change that depends on the held entry's
+ * outcome (the same path or origin, either side of a rename, a delete of the
+ * same slug), and the cursor never checkpoints past an entry whose request is
+ * still unfinished. It holds because (1) the failed entry's obsolete admitted
+ * suffix (its group's later members, the admit-ahead window, this run's lane
+ * groups: every queued request of the run admitted after it) is cancelled
+ * first, so no successor of this run can publish against the held entry and
+ * no queued successor can wait behind a blocked root while this gate waits for
+ * it; (2) the gate then waits only for requests that are still active in that
+ * suffix (claimed, recovering, or carrying a recovery record) and for any
+ * unfinished or recovery-bearing request that names the entry's page by slug,
+ * page id, path, origin or rename endpoint (`UNFINISHED_PAGE_REQUEST_SQL`);
+ * (3) the predicate is evaluated inside the transaction that writes the hold
+ * and swaps the cursor, after taking the page keys and before the cursor row
+ * (the lock order every waiver and publication uses), so a same-page write
+ * admitted meanwhile either committed before the hold or waits behind it and
+ * re-reads the page. The checkpoint's own validation then finds every
+ * non-committed receipt of the run superseded (`convertedFromFailed` carries
+ * the failed receipt and every earlier uncommitted receipt at the same index)
+ * or committed by a later request at its index. A hold never turns a failed
+ * predecessor into a committed one; cancelled successors are re-frozen under a
+ * fresh dependency chain when the run continues.
+ */
+async function holdUnderGate(engine: BrainEngine, input: { cursor: Cursor; key: string; pending: Pending; hold: HeldEntry; assertActive: () => void;
+  observedAt: string; waitMs: number; failedId: string; base?: Cursor }): Promise<Cursor | 'pending'> {
+  const { cursor, key, pending, assertActive } = input;
+  const principal = cursor.authority.writer.principal;
+  const base: Cursor = input.base ?? { ...cursor }; delete base.group; delete base.window; delete base.pending;
+  const [failedRow] = await engine.executeRaw<{ sequence: string | number | null }>('SELECT sequence::text AS sequence FROM persistence_requests WHERE id=$1::uuid', [input.failedId]);
+  const after = failedRow?.sequence == null ? null : String(failedRow.sequence);
+  const keys = [{ sourceId: cursor.sourceId, slug: pending.slug }, ...(pending.intent.renameFrom && pending.intent.renameFrom.slug !== pending.slug ? [{ sourceId: cursor.sourceId, slug: pending.intent.renameFrom.slug }] : [])];
+  const deadline = performance.now() + input.waitMs;
+  for (;;) {
+    assertActive();
+    if (cursor.window?.length) await cancelWindow(engine, cursor.window, principal);
+    if (after !== null) {
+      const queued = await engine.executeRaw<WriteRequest>(`SELECT * FROM persistence_requests WHERE worktree_id=$1::uuid AND intent->>'runId'=$2 AND state='queued'
+        AND ${SYNC_PAGE_KINDS_SQL} AND sequence>$3::bigint ORDER BY sequence`, [cursor.binding.worktree_id, cursor.runId, after]);
+      if (queued.length) await cancelRows(engine, queued);
+    }
+    const saved = await engine.transaction(async tx => {
+      assertActive();
+      await tx.lockPageKeys(keys);
+      const [samePage, suffix] = await Promise.all([
+        tx.executeRaw(UNFINISHED_PAGE_REQUEST_SQL, unfinishedPageRequestParams(cursor, pending)),
+        after === null ? Promise.resolve([]) : tx.executeRaw(`SELECT 1 FROM persistence_requests WHERE worktree_id=$1::uuid AND intent->>'runId'=$2 AND sequence>$3::bigint
+          AND ${SYNC_PAGE_KINDS_SQL} AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1`, [cursor.binding.worktree_id, cursor.runId, after]),
+      ]);
+      if (samePage.length || suffix.length) return null;
+      const stale = await tx.executeRaw<{ request_id: string }>(`SELECT request_id::text AS request_id FROM persistence_requests WHERE worktree_id=$1::uuid AND intent->>'runId'=$2
+        AND ${SYNC_PAGE_KINDS_SQL} AND intent->>'index'=$3 AND state IN ('failed','cancelled','conflict')`, [cursor.binding.worktree_id, cursor.runId, String(cursor.index)]);
+      const converted = [...new Set([...(cursor.convertedFromFailed ?? []), ...stale.map(row => row.request_id), pending.requestId])];
+      return writeCursor(tx, key, cursor, advanceHeld(base, converted), async inner => {
+        await heldWrite(cursor, input.hold, input.observedAt)(inner);
+        await recordSyncConversion(inner, cursor.sourceId, cursor.incarnation, { request_id: pending.requestId, path: pending.intent.path ?? null, slug: pending.slug, run_id: cursor.runId, outcome: 'held' });
+      }, true);
+    });
+    if (saved) { await faultPoint('sync:mid_checkpoint', { sourceId: cursor.sourceId }); return saved; }
+    if (performance.now() >= deadline) return 'pending';
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+}
+
+/**
+ * #5988 (E6): a cursor blocked by a failed content refusal converts in place
+ * with its stored options: held when the screen holds the frozen entry,
+ * re-frozen under a new request when it passes, but only once for the same
+ * bytes, so a refusal the screen misses stays blocked without minting a
+ * receipt per run.
+ * #6188: a failed fence refusal (typed, or a message an older gbrain stored)
+ * holds the same bytes even when the screen admits them (`prepare_time`: the
+ * refusal read stored rows). A compacted `invalid_params` /
+ * `take_row_collision` receipt, whose message is gone, converts only when the
+ * re-screen of the current bytes holds them; an arbitrary `invalid_params` is
  * never a fence hold.
+ * #6278: a `preparation_stalled` receipt (the owner gave up preparing it)
+ * holds the entry as it was frozen: an import by its bytes, a delete as a
+ * delete hold; the checkpoint never holds (the run stays blocked). Every hold
+ * is written behind the narrowed gate (`holdUnderGate`).
  */
 async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: string, assertActive: () => void,
   run: Parameters<typeof freezeEntry>[4] & { observedAt?: string }): Promise<Cursor> {
   const previous = blocked.pending!;
   const failed = await getWriteRequest(engine, blocked.authority.writer.principal, previous.requestId);
   if (!failed || !['failed', 'conflict', 'cancelled'].includes(failed.state)) return blocked;
+  const entry = blocked.entries[blocked.index];
+  if (preparationStalled(failed)) {
+    if (blocked.companyPlan || previous.intent.kind === 'managed_sync_checkpoint' || !entry || entry.path !== previous.intent.path) return blocked;
+    const hold = preparationStalledHold(entry, previous.slug, previous.pageId, failed, previous.intent.content ?? null, previous.intent.blobOid, resumeArgsOf(blocked, run));
+    const held = await holdUnderGate(engine, { cursor: blocked, key, pending: previous, hold, assertActive, observedAt: run.observedAt!, waitMs: 5000, failedId: failed.id });
+    return held === 'pending' ? blocked : held;
+  }
   const fence = fenceReceiptLocation(failed);
   const compacted = !fence && failed.compacted === true && failed.error_message == null && ['invalid_params', 'take_row_collision'].includes(failed.error_code ?? '');
   if (!fence && !compacted && !isContentRefusal(failed.error_code, failed.error_message)) return blocked;
-  const unfinished = await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1", [blocked.sourceId]);
-  assertActive();
-  if (unfinished.length) return blocked;
   const base: Cursor = { ...blocked }; delete base.pending;
   const again = await freezeEntry(engine, base, key, assertActive, run);
   const converted = [...(blocked.convertedFromFailed ?? []), previous.requestId];
-  const logged = (outcome: 'held' | 'refrozen') => (tx: BrainEngine) => recordSyncConversion(tx, blocked.sourceId, blocked.incarnation,
-    { request_id: previous.requestId, path: previous.intent.path ?? null, slug: previous.slug, run_id: blocked.runId, outcome });
-  const holdWith = (hold: HeldEntry) => saveCursor(engine, key, blocked, advanceHeld(base, converted), false, assertActive,
-    async tx => { await heldWrite(blocked, hold, run.observedAt!)(tx); await logged('held')(tx); });
+  const holdWith = async (hold: HeldEntry) => {
+    const held = await holdUnderGate(engine, { cursor: blocked, key, pending: previous, hold, assertActive, observedAt: run.observedAt!, waitMs: 5000, failedId: failed.id });
+    return held === 'pending' ? blocked : held;
+  };
   if ('hold' in again) return holdWith(again.hold);
   const sameBytes = again.intent.rawHash === previous.intent.rawHash && again.intent.content === previous.intent.content;
-  const entry = base.entries[base.index];
   if (fence && sameBytes && again.intent.kind === 'managed_sync_import' && again.intent.content !== null && entry?.path === again.intent.path) {
     return holdWith(prepareTimeFenceHold(entry, again.slug, again.pageId, fence, again.intent.content, again.intent.blobOid));
   }
   if (compacted || (previous.converted && sameBytes)) return blocked;
-  return saveCursor(engine, key, blocked, { ...blocked, convertedFromFailed: converted, pending: { ...again, converted: true } }, false, assertActive, logged('refrozen'));
+  const unfinished = await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1", [blocked.sourceId]);
+  assertActive();
+  if (unfinished.length) return blocked;
+  return saveCursor(engine, key, blocked, { ...blocked, convertedFromFailed: converted, pending: { ...again, converted: true } }, false, assertActive,
+    tx => recordSyncConversion(tx, blocked.sourceId, blocked.incarnation, { request_id: previous.requestId, path: previous.intent.path ?? null, slug: previous.slug, run_id: blocked.runId, outcome: 'refrozen' }));
 }
 
 /**
  * #6188 (E10): a page request of this run that failed with a fence refusal (or, #6194, a
- * `revision_conflict` proven to come from a concurrent database-only write) is held in the
- * same run instead of blocking it (the single path, and a bulk group's failed member, which
- * the group step leaves as the single pending entry). Other requests of the source settle
- * first, within the run's wait budget; when they are still running the run returns
- * `partial` and the next run's start-of-run conversion holds the entry. The failed request
- * is converted once (`convertedFromFailed`, so it no longer blocks the checkpoint), gets no
- * failure-ledger row, and is logged as a conversion. Null when it is not a fence refusal or
+ * `revision_conflict` proven to come from a concurrent database-only write, or, #6278, a
+ * `preparation_stalled` receipt for an import or a delete) is held in the same run instead
+ * of blocking it (the single path, and a bulk group's failed member, which the group step
+ * leaves as the single pending entry). The hold waits behind the narrowed gate
+ * (`holdUnderGate`) within the run's wait budget; when a request that can still change the
+ * entry's outcome is running the run returns `partial` and the next run's start-of-run
+ * conversion holds the entry. The failed request is converted once (`convertedFromFailed`,
+ * so it no longer blocks the checkpoint), gets no failure-ledger row, and is logged as a
+ * conversion. Null when it is not such a receipt, when the entry is the checkpoint, or when
  * the run does not hold files (`sync.holds=fail`, company-brain sources).
  */
 async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: string, pending: Pending, done: WriteRequest, assertActive: () => void,
-  run: { screen?: SyncScreenRun | null; observedAt?: string }, waitMs: number): Promise<Cursor | 'pending' | null> {
-  if (!run.screen || cursor.companyPlan || pending.intent.kind !== 'managed_sync_import' || typeof pending.intent.content !== 'string') return null;
-  const fence = fenceReceiptLocation(done);
+  run: { screen?: SyncScreenRun | null; observedAt?: string; syncOptions: SyncCursorOptions; repoPath?: string }, waitMs: number): Promise<Cursor | 'pending' | null> {
+  if (!run.screen || cursor.companyPlan || pending.intent.kind === 'managed_sync_checkpoint') return null;
   const entry = cursor.entries[cursor.index];
   if (!entry || entry.path !== pending.intent.path) return null;
+  const stalled = preparationStalled(done);
+  if (!stalled && (pending.intent.kind !== 'managed_sync_import' || typeof pending.intent.content !== 'string')) return null;
+  const fence = stalled ? null : fenceReceiptLocation(done);
   // #6194 (D4): a revision conflict proven to come from a concurrent database-only write is held the same way (sync-concurrent-write.ts).
-  const proof = fence ? null : await concurrentWriteProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pending, done });
-  if (!fence && !proof) return null;
-  const deadline = performance.now() + waitMs;
-  for (;;) {
-    const unfinished = await engine.executeRaw("SELECT id FROM persistence_requests WHERE source_id=$1 AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1", [cursor.sourceId]);
-    assertActive();
-    if (!unfinished.length) break;
-    if (performance.now() >= deadline) return 'pending';
-    await new Promise(resolve => setTimeout(resolve, 50));
-  }
-  const hold = fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content, pending.intent.blobOid)
-    : concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof!);
-  const base: Cursor = { ...cursor }; delete base.group;
-  return saveCursor(engine, key, cursor, advanceHeld(base, [...(cursor.convertedFromFailed ?? []), pending.requestId]), false, assertActive, async tx => {
-    await heldWrite(cursor, hold, run.observedAt!)(tx);
-    await recordSyncConversion(tx, cursor.sourceId, cursor.incarnation, { request_id: pending.requestId, path: pending.intent.path ?? null, slug: pending.slug, run_id: cursor.runId, outcome: 'held' });
-  });
+  const proof = stalled || fence ? null : await concurrentWriteProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pending, done });
+  if (!stalled && !fence && !proof) return null;
+  const hold = stalled ? preparationStalledHold(entry, pending.slug, pending.pageId, done, pending.intent.content ?? null, pending.intent.blobOid, resumeArgsOf(cursor, run))
+    : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content!, pending.intent.blobOid)
+      : concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof!);
+  return holdUnderGate(engine, { cursor, key, pending, hold, assertActive, observedAt: run.observedAt!, waitMs, failedId: done.id });
 }
 
 /**
@@ -477,7 +563,7 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
  * recorded in the failure ledger and blocks the run with its diagnostic.
  */
 async function settleFailedRequest(engine: BrainEngine, input: { cursor: Cursor; key: string; pending: Pending; done: WriteRequest; assertActive: () => void;
-  run: { screen?: SyncScreenRun | null; observedAt?: string; repoPath?: string }; syncOptions: SyncCursorOptions; processingOptions: SyncProcessingOptions;
+  run: { screen?: SyncScreenRun | null; observedAt?: string; repoPath?: string; syncOptions: SyncCursorOptions }; syncOptions: SyncCursorOptions; processingOptions: SyncProcessingOptions;
   remote: boolean; waitMs: number; signal?: AbortSignal }): Promise<{ cursor: Cursor } | { result: SyncResult }> {
   const { cursor, key, pending, done, syncOptions, processingOptions, remote } = input;
   const converted = await holdFailedFenceRequest(engine, cursor, key, pending, done, input.assertActive, input.run, input.waitMs);

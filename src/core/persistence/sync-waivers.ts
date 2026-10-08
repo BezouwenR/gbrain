@@ -25,17 +25,26 @@ export interface NoopWaiver { kind: 'import' | 'delete'; kernel: NoopKernelWaive
 /** DX-A15: `GBRAIN_SYNC_WAIVE_NOOP=0` admits every entry, for triage. */
 export function noopWaiversEnabled(env: NodeJS.ProcessEnv = process.env): boolean { return env.GBRAIN_SYNC_WAIVE_NOOP !== '0'; }
 
-const PAGE_MATCH = "r.source_id=$3 AND (r.slug=$4 OR r.page_id=$5::bigint OR r.intent->'renameFrom'->>'slug'=$4 OR r.intent->'renameFrom'->>'pageId'=$6)";
+const PAGE_MATCH = `r.source_id=$3 AND (r.slug=$4 OR r.page_id=$5::bigint OR r.intent->'renameFrom'->>'slug'=$4 OR r.intent->'renameFrom'->>'pageId'=$6
+  OR ($7::text IS NOT NULL AND (r.intent->>'path'=$7 OR r.intent->>'sourcePath'=$8 OR r.intent->'renameFrom'->>'sourcePath'=$8)))`;
 /**
  * CEO-A12/A34: an unfinished request for the page, by slug, page id or a rename
- * from it. Each branch matches one partial request index: worktree pending,
- * worktree recovery, and database-only pending by source incarnation.
+ * from it; #6278: also by the entry's file path or origin, or a rename from that
+ * origin (`$7`, `$8`; null skips the path match). Each branch matches one
+ * partial request index: worktree pending, worktree recovery, and
+ * database-only pending by source incarnation.
  */
 export const UNFINISHED_PAGE_REQUEST_SQL = `SELECT 1 FROM (
   (SELECT r.id FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.state IN ('queued','running','recovering') AND ${PAGE_MATCH} LIMIT 1)
   UNION ALL (SELECT r.id FROM persistence_requests r WHERE r.worktree_id=$1::uuid AND r.recovery IS NOT NULL AND ${PAGE_MATCH} LIMIT 1)
   UNION ALL (SELECT r.id FROM persistence_requests r WHERE r.source_incarnation=$2::uuid AND r.worktree_id IS NULL
     AND r.state IN ('queued','running','recovering') AND ${PAGE_MATCH} LIMIT 1)) unfinished LIMIT 1`;
+
+/** The parameters of `UNFINISHED_PAGE_REQUEST_SQL` for one frozen entry (slug, page id, file path and origin). */
+export function unfinishedPageRequestParams(cursor: Pick<WaiverCursor, 'sourceId' | 'incarnation' | 'binding'>, pending: Pick<WaiverEntry, 'slug' | 'pageId' | 'intent'>): unknown[] {
+  return [cursor.binding.worktree_id, cursor.incarnation, cursor.sourceId, pending.slug, pending.pageId, String(pending.pageId),
+    pending.intent.path ?? null, pending.intent.sourcePath ?? pending.intent.path ?? null];
+}
 
 /**
  * Screens a frozen, unadmitted entry. Returns null to admit, or the cursor that
@@ -59,7 +68,7 @@ export async function waiveNoopEntry<C extends WaiverCursor>(engine: BrainEngine
       try { await assertSyncPageOrigin(tx, cursor.sourceId, intent.sourcePath!, pending.pageId, true, syncOriginScope(cursor)); }
       catch { return null; }
     } else if (snapshot?.page.id !== pending.pageId || snapshot.page.deleted_at != null || snapshot.revision !== intent.expected_revision) return null;
-    const unfinished = await tx.executeRaw(UNFINISHED_PAGE_REQUEST_SQL, [cursor.binding.worktree_id, cursor.incarnation, cursor.sourceId, pending.slug, pending.pageId, String(pending.pageId)]);
+    const unfinished = await tx.executeRaw(UNFINISHED_PAGE_REQUEST_SQL, unfinishedPageRequestParams(cursor, pending));
     if (unfinished.length) return null;
     return advance(tx, waived);
   });
@@ -122,7 +131,7 @@ export async function waiveNoopRun<C extends WaiverCursor>(engine: BrainEngine, 
       const bySlug = new Map(pages.map(page => [page.slug, page]));
       const scope = syncOriginScope(cursor);
       const checks = await pipelined(tx, run.flatMap(({ pending, waived }) => [
-        () => tx.executeRaw(UNFINISHED_PAGE_REQUEST_SQL, [cursor.binding.worktree_id, cursor.incarnation, cursor.sourceId, pending.slug, pending.pageId, String(pending.pageId)]),
+        () => tx.executeRaw(UNFINISHED_PAGE_REQUEST_SQL, unfinishedPageRequestParams(cursor, pending)),
         () => waived.kind === 'delete'
           ? assertSyncPageOrigin(tx, cursor.sourceId, pending.intent.sourcePath!, pending.pageId, true, scope).then(() => true, () => false)
           : Promise.resolve(true),
