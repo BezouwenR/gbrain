@@ -10,7 +10,7 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
-## [0.60.107.0] - 2026-10-07
+## [0.60.108.0] - 2026-10-08
 
 **Managed Postgres sync catches up more than twice as fast, starts committing in about 20 seconds instead of 80, and a page you save during a catch-up no longer waits behind it.**
 
@@ -57,6 +57,33 @@ Same 16-core machine and same Postgres, 57 ms round trips, default settings, mas
 - Write receipts no longer call an ordinary publication in progress `blocked` / `recovery_required`: a request needs recovery only when it is recovering or holds a recovery record without a live claim, and the requests behind a live publication show as waiting (#6275).
 - Remote `put_page` skips the similar-pages advisory while `put_page.similar_pages` is off (the default) and runs it with JIT off when on; remote `get_page` / `fetch` read the page with JIT off, so brains past about 1,000 pages stop paying JIT compile time on every call (#6276).
 - Bench: `scripts/bench/managed-sync-catchup.ts` reports feeder and lane timing, steady state, per-write foreground spans, an open-loop foreground row and `--pool-size`; results in `docs/eval/managed-sync-catchup.md`.
+
+## [0.60.107.0] - 2026-10-08
+
+**A page the quarantine gate hid stays hidden: no more planted markers, no facts mined from it, and no body handed to remote agents.**
+
+The content-quality gate quarantines junk and unsafe pages so search skips them. Four paths still leaked them. Any non-remote writer could plant or fake the gate's own markers; a quarantined page still fed automatic fact extraction and its facts and takes fences; `get_page` and `fetch` returned its body verbatim; and `put_page` never told the agent its page had been hidden.
+
+### What you see
+
+| Where | What changed |
+|---|---|
+| Gate-owned frontmatter | `quarantine`, `embed_skip`, `content_flag`, `atoms_scan_hash` and `quarantine_override` are stripped from a local `put_page`, a connector, an ingest event or any other non-owner write. Sync and import of your own files, reindex, repair, reconcile, the cycle and `quarantine clear` keep them. |
+| Facts and takes | A quarantined page is not mined for facts (`facts_backstop.skipped: quarantined`) and its fences are not projected. Rows projected before it was quarantined stay. |
+| `get_page` / `fetch` | Carry `quarantined` (fetch: `metadata.quarantined`) and a `page_quarantined` notice. Remote callers get no body or text unless an admin-scoped caller passes `include_quarantined: true`; local reads keep the body. |
+| `put_page` / `put_pages` | A write the gate hid reports `quarantined: { reason, detail }` with a notice. |
+
+### Things to watch
+
+- **Scripts that planted markers through `put_page`** (for example to force `embed_skip`) now have them stripped; use the owner paths above or `gbrain quarantine clear --force`.
+- **Remote agents reading a quarantined page** get the notice instead of its text; an admin can still ask for it.
+
+### Itemized changes
+
+- `stripGateOwnedMarkers` (`src/core/import-screen.ts`) runs once per write; only callers passing `preserveGateMarkers: true` keep the markers. Managed `quarantine clear` submits the owner-internal `managed_quarantine_clear` intent so `quarantine_override` stays writable. `opts.remote` keeps only its fence-merge and hidden-row meaning.
+- `isFactsBackstopEligible` refuses a quarantined page; the canonical projection and the unmanaged `extract_facts` / `extract_takes` reconcilers skip it.
+- `readQuarantined` shapes `get_page` and `fetch`; `include_quarantined` is honored only for admin scope.
+- New key-files cluster `docs/architecture/key-files/quarantine.md`.
 
 ## [0.60.106.0] - 2026-10-07
 
