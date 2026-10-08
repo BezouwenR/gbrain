@@ -98,9 +98,10 @@ export class PhaseDeadlineError extends Error {
     this.name = 'PhaseDeadlineError';
   }
 }
-const PHASE_DEADLINE_CODES = new Set(['57014', 'CONNECTION_DESTROYED', 'CONNECTION_CLOSED']);
+/** A server-honoured cancel (57014) keeps its SQLSTATE as before; only a connection the engine had to discard is reclassified. */
+const PHASE_DEADLINE_CODES = new Set(['CONNECTION_DESTROYED', 'CONNECTION_CLOSED']);
 function isPhaseDeadlineOutcome(error: { name?: unknown; code?: unknown } | null): boolean {
-  return !!error && (error.name === 'AbortError' || typeof error.code === 'string' && PHASE_DEADLINE_CODES.has(error.code));
+  return !!error && typeof error.code === 'string' && PHASE_DEADLINE_CODES.has(error.code);
 }
 
 export class PersistenceConsumer {
@@ -638,8 +639,8 @@ export class PersistenceConsumer {
         throw this.abort.signal.reason;
       }
       this.lastPhaseError = name; this.lastPhaseTiming = this.timingText(observation, startedAt);
-      // #6278: past the phase deadline, the statement's end (the server's 57014, or the client-side discard of a
-      // round-trip a pooler never completed) is the deadline itself: the tick moves on instead of reporting storage_error.
+      // #6278: past the phase deadline, the client-side discard of a round-trip a pooler never completed is the
+      // deadline itself: the tick moves on instead of reporting storage_error.
       if (observation.deadline_exceeded && isPhaseDeadlineOutcome(cancelled)) throw new PhaseDeadlineError(name, error);
       throw error;
     }
@@ -648,9 +649,11 @@ export class PersistenceConsumer {
   private report(error: unknown): void {
     if (this.stopping && error === this.abort.signal.reason) return;
     if (error instanceof PhaseDeadlineError) {
-      // The timer already logged deadline_exceeded for this phase; record it and let the next tick run.
+      // The timer already logged deadline_exceeded for this phase: record it under the phase, hand it to onError
+      // (fail-closed scheduling still sees one failure per tick), write no second line, and let the next tick run.
       this.lastError = { code: 'deadline_exceeded', at: new Date().toISOString(), phase: error.phase };
       this.lastPhaseError = undefined; this.lastPhaseTiming = undefined;
+      this.opts.onError?.(error);
       return;
     }
     const code = (error as { code?: unknown })?.code;

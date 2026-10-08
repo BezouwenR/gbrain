@@ -40,7 +40,7 @@ GBRAIN_CANCEL_SETTLE_MS=5000 gbrain serve                      # a longer settle
 ### Itemized changes
 
 - `src/core/postgres-engine.ts`: `runUnsafe` arms a settle timer after `cancel()`; a statement still pending at `cancelSettleMs()` has its reserved connection discarded (`CONNECTION_DESTROYED`), once. `GBRAIN_CANCEL_SETTLE_MS` (>= 100) overrides the 2 s default.
-- `src/core/persistence/consumer.ts`: a phase past its deadline that ends with 57014, `CONNECTION_DESTROYED` or `CONNECTION_CLOSED` throws `PhaseDeadlineError` (`code: deadline_exceeded`); `report()` records it under the phase without a second log line.
+- `src/core/persistence/consumer.ts`: a phase past its deadline that ends with `CONNECTION_DESTROYED` or `CONNECTION_CLOSED` (the discarded connection) throws `PhaseDeadlineError` (`code: deadline_exceeded`); `report()` records it under the phase without a second log line.
 - `src/core/persistence/bounded-reads.ts` and `coordinator.ts`: a discarded connection after the budget is the preparation deadline, never `storage_error` or `database_contention`.
 - Doctor `persistence_session_timeouts` gains the `transaction_mode_pooler` warning (`resolvePrepare(url) === false`).
 - Tests: `test/postgres-engine-cancel-settle.test.ts` (never-settling statement is discarded at the window; a honoured cancel is not), `test/persistence-consumer-log.test.ts` (the consumer logs one `deadline_exceeded`, no `storage_error`, and ticks again), `test/e2e/persistence-pooler-wedge-postgres.test.ts` (a wedged `expired_claims` statement inside a real 60-page managed catch-up: cancel swallowed, discarded at the window, the run drains `synced`; hangs on the previous release).
