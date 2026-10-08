@@ -20,7 +20,7 @@
  * frontmatter repair, fence repair, and writer status then retry-held and the
  * option-preserving sync. Never frontmatter repair for a stalled hold.
  */
-import { afterAll, expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -136,8 +136,11 @@ test('docs/guides/repair.md "Held files": every command runs and prints every li
   expect(run(['git', '-C', checkout, 'status', '--porcelain']).out).toBe('');
 }, 600_000);
 
+let engine: PGLiteEngine;
+beforeAll(async () => { engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema(); }, 120_000);
+afterAll(async () => { await disposePersistenceConsumer(engine); await engine.disconnect(); });
+
 test('#6278: a source holding frontmatter, fence and preparation-stalled files routes each kind apart on every surface', () => withEnv({ GBRAIN_HOME: join(work, 'mixed-home'), GBRAIN_SYNC_FAILURES_DIR: join(work, 'mixed-home') }, async () => {
-  const engine = new PGLiteEngine(); await engine.connect({}); await engine.initSchema();
   const id = `mixed-${randomUUID().replace(/-/g, '').slice(0, 12)}`, root = join(work, id);
   const git = (...args: string[]) => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   try {
@@ -211,7 +214,5 @@ test('#6278: a source holding frontmatter, fence and preparation-stalled files r
     expect(await readHeldPages(engine, [1])).toBeInstanceOf(Map);
   } finally {
     installFaultHook(undefined);
-    await disposePersistenceConsumer(engine);
-    await engine.disconnect();
   }
 }), 180_000);
