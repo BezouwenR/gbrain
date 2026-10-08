@@ -26,7 +26,7 @@ export type DrainOutcome = 'synced' | 'resumable' | 'blocked';
 /** Why a drain ended short of `synced`. Each value has an error-catalogue entry (DX-A4). */
 export type DrainStopReason = 'deadline' | 'drain_stalled' | 'database_contention' | 'recovery_required' | 'owner_unavailable'
   | 'unexpected_file_bytes' | 'unexpected_staging_bytes' | 'blocked_by_failures'
-  /** #6278: a preparation this process owned outlived its ceiling; exiting ended it, the same command resumes and the next pass holds the entry if it stalls again. */
+  /** #6278: a preparation this process owned outran its budget and allowance; exiting ended it, the same command resumes and the next pass holds the entry if it stalls again. */
   | 'preparation_abandoned'
   /** #6278: the run's breaker tripped on `preparation_stalled` receipts (one systemic diagnostic instead of a pile of holds). */
   | 'preparation_systemic';
@@ -468,7 +468,7 @@ export function drainNext(result: SyncResult, resumeCommand: string, sourceId: s
     const abandoned = d?.stop_reason === 'preparation_abandoned';
     return { command: resumeCommand, safe_to_loop: true, retry_after_ms: d?.retry_after_ms ?? 0, ...estimate,
       why: abandoned
-        ? `A write's preparation outlived its ceiling in this process${d?.stall?.step ? ` (stuck at step ${d.stall.step}${d.stall.waiting_on && d.stall.waiting_on !== 'unknown' ? `, waiting on ${d.stall.waiting_on}` : ''})` : ''}, so the sync exited to end it; `
+        ? `A write's preparation outran its budget in this process${d?.stall?.step ? ` (stuck at step ${d.stall.step}${d.stall.waiting_on && d.stall.waiting_on !== 'unknown' ? `, waiting on ${d.stall.waiting_on}` : ''})` : ''}, so the sync exited to end it; `
           + 'its cursor and accepted writes are intact. The same command resumes where it stopped, and an entry that stalls again is held instead of re-entered.'
         : 'The sync stopped at its deadline with its cursor and accepted writes intact; the same command resumes where it stopped.', ...(docs ? { docs } : {}) };
   }

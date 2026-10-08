@@ -56,7 +56,7 @@ describe('claim-aware no-progress window', () => {
     expect(syncOutcome(result)).toBe('resumable');
     const next = drainNext(result, RESUME, 's')!;
     expect(next).toMatchObject({ command: RESUME, safe_to_loop: true, docs: 'docs/guides/write-refusals.md#drain-preparation-abandoned' });
-    expect(next.why).toContain('outlived its ceiling in this process');
+    expect(next.why).toContain('outran its budget in this process');
     expect(drainJsonFields(result, RESUME, 's')).toMatchObject({ outcome: 'resumable', next: { safe_to_loop: true } });
   });
 
