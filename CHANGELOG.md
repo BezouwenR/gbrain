@@ -56,6 +56,7 @@ Same 16-core machine and same Postgres, 57 ms round trips, default settings, mas
 - A sync group member after an uncommitted member is cancelled, never published ahead of it (#6252).
 - Write receipts no longer call an ordinary publication in progress `blocked` / `recovery_required`: a request needs recovery only when it is recovering or holds a recovery record without a live claim, and the requests behind a live publication show as waiting (#6275).
 - Remote `put_page` skips the similar-pages advisory while `put_page.similar_pages` is off (the default) and runs it with JIT off when on; remote `get_page` / `fetch` read the page with JIT off, so brains past about 1,000 pages stop paying JIT compile time on every call (#6276).
+- `gbrain sources refresh` refuses `git_unavailable` when a git read of the checkout's branch or remote (`symbolic-ref`, `remote`, `config --get`) fails or times out, instead of reading it as a detached HEAD or no remote and skipping the fetch; a checkout that is not Git refuses `refresh_no_upstream` with its own message.
 - Bench: `scripts/bench/managed-sync-catchup.ts` reports feeder and lane timing, steady state, per-write foreground spans, an open-loop foreground row and `--pool-size`; results in `docs/eval/managed-sync-catchup.md`.
 
 ## [0.60.110.0] - 2026-10-08
