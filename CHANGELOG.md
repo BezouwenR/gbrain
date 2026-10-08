@@ -49,7 +49,7 @@ gbrain doctor --only fence_integrity --json                # legacy fact rows th
 - **A held file stays out of the index** until `gbrain sources retry-held <id>` and the same sync import it. That's deliberate: the file is fine, the owner stalled.
 - **This bounds and names a stuck write; it doesn't claim to remove what hung it.** If it recurs, writer status and the hold carry the step and the wait cause.
 - **Adoption writes normalized text back into `facts.fact`.** It's a data change: ids, vectors and provenance stay, trailing whitespace and CR characters go.
-- **Reads that bypass `executeRaw`** (`readPageSnapshot`, the import pipeline's own statements) are not bounded yet; a lock arriving on one of those still waits for the lock or the ceiling.
+- **Reads that bypass `executeRaw`** (`readPageSnapshot`, the import pipeline's own statements, the group-memoized origin read) are not bounded yet; under a `pages` lock they keep their connections until the lock drops or the ceiling, so the head member reaches its hold at two budgets while the rest of the group waits for the lock (#6318).
 - **Not fixed here:** `fence_repair` and chronicle refusing with `owner_unavailable` while a sync runs (the third problem in #6278) is a separate change. `persistence.max_claim_ms` keeps its meaning as doctor's warning threshold, and a stuck publication still has detection only (TODOS.md).
 
 ### Itemized changes
