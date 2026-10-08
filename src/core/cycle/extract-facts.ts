@@ -552,7 +552,7 @@ export async function runExtractFacts(
         : 'could not be fenced this run, so those pages keep their fact index and skip reconciliation while the other pages reconcile. ' +
           'The FACTS_FENCE_FAILED warnings name each page and why; ' +
           'a page whose canonical file does not exist on this host is fenced by the cycle on the host that holds the file; ' +
-          'a row the fence codec cannot render stays active and searchable (doctor fence_integrity lists it). ' +
+          'a row the fence codec cannot render stays active and searchable (doctor fence_integrity lists it); the phantom-redirect pass waits until the source has no unfenced rows. ' +
           'Individual rows can instead be drained via `forget_fact`.'),
     );
     // #3683: a guard-triggered run books its halt here for doctor
@@ -578,8 +578,11 @@ export async function runExtractFacts(
   // Idempotency-by-construction: phantom predicate filters out `deleted_at
   // IS NOT NULL` so a half-redirected page (soft-deleted, .md still on
   // disk) won't be re-redirected.
+  // #6278: the pass moves rows by their fence position and would strand a
+  // legacy row (no position) on a deleted phantom, so it still waits for the
+  // whole source to be fenced; the reconcile walk below is per page.
   let phantomResult: PhantomPassResult = emptyPhantomPassResult();
-  if (opts.brainDir) {
+  if (opts.brainDir && legacyCount === 0) {
     try {
       phantomResult = await runPhantomRedirectPass(
         engine,

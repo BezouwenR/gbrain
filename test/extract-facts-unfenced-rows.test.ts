@@ -245,7 +245,7 @@ for (const backend of testBackends()) {
       expect(claims.some(c => c.includes('left Acme') || c.includes('uses tabs') || c === '')).toBe(false);
       // No second fence-owned row for any adopted claim (the legacy duplicate keeps its text, unfenced).
       expect(await managed.executeRaw(`SELECT id FROM facts WHERE fact = 'Alice example likes tea' AND row_num IS NOT NULL`)).toHaveLength(1);
-      expect(await managed.executeRaw(`SELECT id FROM facts WHERE fact = 'Alice example likes tea' AND row_num IS NULL`)).toEqual([{ id: ids.duplicate }]);
+      expect((await managed.executeRaw<{ id: number }>(`SELECT id FROM facts WHERE fact = 'Alice example likes tea' AND row_num IS NULL`)).map(r => Number(r.id))).toEqual([ids.duplicate]);
       // Another page of the source reconciled in the same run.
       const [staleRow] = await managed.executeRaw<{ expired: boolean }>('SELECT expired_at IS NOT NULL AS expired FROM facts WHERE id = $1', [staleId]);
       expect(staleRow.expired).toBe(true);

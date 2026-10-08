@@ -32,8 +32,9 @@
  * project, so it is written back into `facts.fact` with the row number (the
  * canonical projection expires any adopted row whose text differs from its
  * fence row). A row the codec would change further, or whose normalized
- * claim and source another active fence row or planned row already carries
- * (the reconciler indexes a duplicate once and would retire the second),
+ * claim, source and visibility another active fence row or planned row
+ * already carries (the reconciler indexes a duplicate once and would retire
+ * the second),
  * stays a legacy row exactly as it is: never deleted or expired, recorded as
  * an `UnadoptableFactRecord` (source, page, fact id, reason class; never the
  * claim text) and named in `failed_pages` with the stable token
@@ -279,21 +280,23 @@ export async function planFence(engine: BrainEngine, sourceId: string, entitySlu
   const assignments: Array<{ id: string; row_num: number; fact: string }> = [];
   const rejected: UnadoptableFactRecord[] = [];
   // The reconciler indexes active rows with one claim and source once (#1781)
-  // and retires the later copy, so a claim the page already carries, or that
-  // an earlier row of this group plans, is not adopted a second time.
-  const dupKey = (claim: string, source: string | undefined) => `${claim}\u0000${source || FENCE_SOURCE_DEFAULT}`;
+  // and retires the later copy, so a claim the page already carries with the
+  // same source and visibility (the projection's identity), or that an
+  // earlier row of this group plans, is not adopted a second time. A private
+  // and a world row with one text are two facts and both adopt, as before.
+  const dupKey = (claim: string, source: string | undefined, visibility: string) => `${claim}\u0000${source || FENCE_SOURCE_DEFAULT}\u0000${visibility}`;
   const planned = new Set<string>();
   const ownedKeys = new Set(existingFence.facts.filter(f => {
     const owner = occupied.get(f.rowNum);
     return f.active && owner !== undefined && owner.fact === f.claim && (owner.source ?? '') === (f.source ?? '');
-  }).map(f => dupKey(f.claim, f.source)));
+  }).map(f => dupKey(f.claim, f.source, f.visibility)));
   for (const row of group) {
     const oracle = adoptableClaim(row);
     if ('rejected' in oracle) {
       rejected.push({ source_id: sourceId, slug: entitySlug, fact_id: Number(row.id), reason: 'fence_unrenderable', class: oracle.rejected });
       continue;
     }
-    const key = dupKey(oracle.claim, row.source);
+    const key = dupKey(oracle.claim, row.source, row.visibility);
     if (planned.has(key) || ownedKeys.has(key)) {
       rejected.push({ source_id: sourceId, slug: entitySlug, fact_id: Number(row.id), reason: 'duplicate_claim', class: 'duplicate_claim' });
       continue;
