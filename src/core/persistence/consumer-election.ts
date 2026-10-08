@@ -47,6 +47,7 @@ import {
   type ConsumerHeartbeat, type ConsumerPool, type ConsumerProcessIdentity, type ListedConsumer,
 } from './consumer-heartbeat.ts';
 import { DEFAULT_PREPARATION_POLICY } from './preparation-budget.ts';
+import { consumerConnectionRoute, consumerStatementEngine } from './consumer-lane.ts';
 import { readWriteSwitchSnapshot } from './switches.ts';
 
 export type ConsumerMode = 'probing' | 'full' | 'waiter_only' | 'promoted';
@@ -116,8 +117,11 @@ export class WaiterOnlyConsumer implements PersistenceConsumerLike {
   private delayMs: number;
   private wakeRequested = false;
   private readonly self = consumerIdentity();
+  /** The probe reads through the consumer's statement route (the direct lane when the engine has one). */
+  private readonly statements: BrainEngine;
   constructor(readonly engine: BrainEngine, readonly config: GBrainConfig, private readonly makeConsumer: () => PersistenceConsumer, private readonly opts: WaiterOnlyConsumerOpts) {
     this.delayMs = opts.pollMs ?? 250;
+    this.statements = consumerStatementEngine(engine);
   }
   get mode(): ConsumerMode { return this._mode; }
   /** The owner this process defers to (waiter-only), or null. */
@@ -160,16 +164,23 @@ export class WaiterOnlyConsumer implements PersistenceConsumerLike {
     if (ownConsumerForced !== null) { await this.becomeFull('full', `forced:${ownConsumerForced}`); return; }
     const cancel = new AbortController();
     const timer = setTimeout(() => cancel.abort(new Error('probe_timeout')), this.opts.phaseMs ?? 5000);
+    // The deadline settles the await itself: a round-trip the pooler never completes (the #6278 class) must not park the probe.
+    const bounded = <T>(work: Promise<T>): Promise<T> => new Promise<T>((resolve, reject) => {
+      const onAbort = () => reject(cancel.signal.reason);
+      if (cancel.signal.aborted) { onAbort(); return; }
+      cancel.signal.addEventListener('abort', onAbort, { once: true });
+      work.then(resolve, reject).finally(() => cancel.signal.removeEventListener('abort', onAbort));
+    });
     let rows: ListedConsumer[];
     let ceiling: number;
     try {
       if (this._mode === 'probing') {
-        const on = await (this.opts.singleConsumer ? this.opts.singleConsumer() : readWriteSwitchSnapshot(this.engine, { signal: cancel.signal }).then(s => s.switches.single_consumer));
+        const on = await bounded(this.opts.singleConsumer ? this.opts.singleConsumer() : readWriteSwitchSnapshot(this.statements, { signal: cancel.signal }).then(s => s.switches.single_consumer));
         if (this.stopping) return;
         if (!on) { await this.becomeFull('full', 'single_consumer_off'); return; }
       }
-      ceiling = await (this.opts.ceilingMs ? this.opts.ceilingMs() : readWriteSwitchSnapshot(this.engine, { signal: cancel.signal }).then(s => s.preparation.ceilingMs, () => DEFAULT_PREPARATION_POLICY.ceilingMs));
-      rows = await (this.opts.readConsumers ? this.opts.readConsumers(cancel.signal) : listHostConsumers(this.engine, this.opts.hostId, { signal: cancel.signal }));
+      ceiling = await bounded(this.opts.ceilingMs ? this.opts.ceilingMs() : readWriteSwitchSnapshot(this.statements, { signal: cancel.signal }).then(s => s.preparation.ceilingMs, () => DEFAULT_PREPARATION_POLICY.ceilingMs));
+      rows = await bounded(this.opts.readConsumers ? this.opts.readConsumers(cancel.signal) : listHostConsumers(this.statements, this.opts.hostId, { signal: cancel.signal }));
     } catch (error) {
       if (this.stopping) return;
       if (cancel.signal.aborted) {
@@ -257,7 +268,7 @@ export class WaiterOnlyConsumer implements PersistenceConsumerLike {
     const election = { mode: this._mode, kind: this.opts.kind, owner: this.electedOwner(), heartbeat_failures: this.heartbeat?.failures ?? 0 };
     if (this.inner) return { ...this.inner.status(), consumer_election: election };
     return { accepting: !this.stopping, active_preparations: 0, active_worktrees: 0, restart_required: false, sampled_at: new Date().toISOString(),
-      observation_scope: 'current_process_reset_on_restart', consumer_election: election };
+      observation_scope: 'current_process_reset_on_restart', connection: consumerConnectionRoute(this.engine), consumer_election: election };
   }
   async stop(): Promise<void> {
     this.stopping = true;

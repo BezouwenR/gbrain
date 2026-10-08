@@ -206,19 +206,23 @@ export function startConsumerHeartbeat(engine: DirectEngine, hostId: string, opt
     process.stderr.write(`[persistence] phase=consumer_heartbeat reason=renewal_failed message="${message}"; this process keeps consuming; `
       + 'other consumers on this host may stop deferring to it after 60 s; fix: gbrain sources writer status --json; docs: docs/ENGINES.md#persistence-consumer-log\n');
   };
+  // The deadline settles the await itself (a round-trip a pooler never completes must not park the heartbeat); a late result is dropped.
+  const bounded = <T>(work: Promise<T>, cancel: AbortController, ms: number): Promise<T> => new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => { cancel.abort(new Error(`consumer heartbeat statement exceeded ${ms} ms`)); reject(cancel.signal.reason); }, ms);
+    work.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
   const renewOnce = async (): Promise<void> => {
     const cancel = new AbortController();
-    const timer = setTimeout(() => cancel.abort(new Error(`consumer heartbeat renewal exceeded ${deadlineMs} ms`)), deadlineMs);
     try {
       const status = opts.report();
       const mode = typeof opts.mode === 'function' ? opts.mode() : opts.mode;
-      await execute(RENEW_SQL, [hostId, self.pid, self.nonce, self.pid_ns, opts.kind, mode, status.restart_required, status.root_barrier_age_ms,
+      await bounded(execute(RENEW_SQL, [hostId, self.pid, self.nonce, self.pid_ns, opts.kind, mode, status.restart_required, status.root_barrier_age_ms,
         status.pool ? JSON.stringify(status.pool) : null, paths.host_json_path, paths.persistence_home,
-        paths.minted_under ? JSON.stringify(paths.minted_under) : null, VERSION, CONSUMER_PURGE_MS], cancel.signal);
+        paths.minted_under ? JSON.stringify(paths.minted_under) : null, VERSION, CONSUMER_PURGE_MS], cancel.signal), cancel, deadlineMs);
       streak = 0;
     } catch (error) {
       if (!stopped) report(error);
-    } finally { clearTimeout(timer); }
+    }
   };
   const renew = (): Promise<void> => {
     if (stopped) return Promise.resolve();
@@ -239,10 +243,8 @@ export function startConsumerHeartbeat(engine: DirectEngine, hostId: string, opt
       clearInterval(cadence);
       await inFlight;
       const cancel = new AbortController();
-      const timer = setTimeout(() => cancel.abort(), 1_000);
-      try { await execute('DELETE FROM persistence_consumers WHERE host_id=$1::uuid AND pid=$2::integer AND nonce=$3', [hostId, self.pid, self.nonce], cancel.signal); }
+      try { await bounded(execute('DELETE FROM persistence_consumers WHERE host_id=$1::uuid AND pid=$2::integer AND nonce=$3', [hostId, self.pid, self.nonce], cancel.signal), cancel, 1_000); }
       catch { /* the row lapses on its own; the next renewal on this host purges it */ }
-      finally { clearTimeout(timer); }
     },
   };
 }

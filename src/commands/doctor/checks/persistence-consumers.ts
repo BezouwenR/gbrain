@@ -75,16 +75,19 @@ export async function hostIdentityMismatchCheck(engine: BrainEngine): Promise<Ch
     // The ok details carry no `minted_under`: the machine id and hostname differ per machine, and the doctor goldens pin this shape.
     const details = { count: mismatches.length, host_id: me.id, host_json_path: me.path, mismatches, docs: IDENTITY_DOCS };
     if (!mismatches.length) return { name: 'host_identity_mismatch', status: 'ok', details, message: `This process's host identity (${me.path}) owns every binding this filesystem holds.` };
-    const first = mismatches[0]!;
+    // The owners whose identity file is known (a heartbeat row) come first: they carry the one-line fix.
+    const ordered = [...mismatches].sort((a, b) => Number(b.fix_env !== null) - Number(a.fix_env !== null) || Number(b.reason === 'same_machine_id') - Number(a.reason === 'same_machine_id'));
     const minted = (value: Record<string, unknown> | 'unknown' | null) => value && value !== 'unknown'
       ? `HOME=${String(value.home ?? '')} GBRAIN_HOME=${value.gbrain_home == null ? '(unset)' : String(value.gbrain_home)}` : 'minted_under: unknown';
+    const fix = ordered.find(m => m.fix_env)?.fix_env;
     return { name: 'host_identity_mismatch', status: 'warn', details: { ...details, minted_under: me.minted_under ?? 'unknown' },
       message: `host_identity_mismatch: ${mismatches.length} managed worktree(s) on this filesystem belong to another host identity. `
-        + `This process reads ${me.path} (host ${me.id}, ${minted(me.minted_under)}); the binding for ${first.source_ids.join(', ') || first.worktree_id} at ${first.local_path} `
-        + `is owned by host ${first.owner_host_id} (${first.owner_host.host_json_path}, ${minted(first.owner_host.minted_under)})`
-        + `${first.reason === 'same_machine_id' ? ', minted on this same machine' : ', and this process\'s identity was minted after that binding under a different home'}. `
-        + 'Every write from this process on that source reports owner_unavailable (host_mismatch) and its maintenance never runs. '
-        + `Fix on the supervisor of this process: ${first.fix_env ?? 'set GBRAIN_HOME to the owner\'s home (the parent of its .gbrain directory)'}, then restart it; never delete or regenerate either host.json.`,
+        + `This process reads ${me.path} (host ${me.id}, ${minted(me.minted_under)}). `
+        + ordered.slice(0, 3).map(m => `The binding for ${m.source_ids.join(', ') || m.worktree_id} at ${m.local_path} is owned by host ${m.owner_host_id} (${m.owner_host.host_json_path}, ${minted(m.owner_host.minted_under)})`
+          + `${m.reason === 'same_machine_id' ? ', minted on this same machine' : ', and this process\'s identity was minted after that binding under a different home'}.`).join(' ')
+        + `${mismatches.length > 3 ? ` (first 3 of ${mismatches.length} shown.)` : ''} `
+        + 'Every write from this process on those sources reports owner_unavailable (host_mismatch) and their maintenance never runs. '
+        + `Fix on the supervisor of this process: ${fix ?? 'set GBRAIN_HOME to the owner\'s home (the parent of its .gbrain directory)'}, then restart it; never delete or regenerate either host.json.`,
       fix: agentFix(STATUS_ARGV, 'Read-only: shows local_host_id, each binding\'s owner_host_id and host.consumers with the owner\'s identity file path.', 'host_identity_mismatch', { docs: IDENTITY_DOCS }) };
   } catch (error) {
     return checkError('host_identity_mismatch', 'compare the host identity with the binding owners', error, { details: { count: 'unknown', health: 'unknown', docs: IDENTITY_DOCS } });

@@ -28,6 +28,7 @@ import { refreshFenceClear } from './worktree-refresh-schema.ts';
 import { faultPoint } from './fault-points.ts';
 import { releaseAbandonedClaims } from './effect-journal.ts';
 import { readWriteSwitchSnapshot, writeSwitchOn } from './switches.ts';
+import { consumerConnectionRoute, consumerStatementEngine, poolerExposureLine } from './consumer-lane.ts';
 
 type PhaseObservation = { name: string; started_at: string; deadline_exceeded: boolean; attempt: number; first_conn_ms?: number };
 /** #5373: set by a task that abandons a still-running preparation after losing its claim; its root is freed only once `until` settles. */
@@ -175,6 +176,9 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private preparing = new Map<string, { request_id: string; started_at: string; deadline_exceeded: boolean; attempt: number }>();
   private executing = new Set<string>();
   private abandonedReleased = false;
+  /** #6317: the engine the tick's own statements run through (the direct route when the engine has one; consumer-lane.ts). */
+  private readonly statements: BrainEngine;
+  private routeLogged = false;
   readonly hostId: string;
   constructor(readonly engine: BrainEngine, readonly config: GBrainConfig, readonly prepare: PrepareMutation,
     private opts: { hostId?: string; concurrency?: number; pollMs?: number; idleMaxMs?: number; phaseMs?: number; preparationMs?: number;
@@ -190,6 +194,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       /** #6278: abandoned preparations past the ceiling before this process stops claiming (default DEFAULT_ZOMBIE_CAP). */
       zombieCap?: number } = {}) {
     this.hostId = opts.hostId ?? localHostId();
+    this.statements = consumerStatementEngine(engine);
   }
   private get checkoutObservable(): ((listener: () => void) => () => void) | undefined {
     const engine = this.engine as { onCheckout?: unknown };
@@ -197,6 +202,9 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   }
   start(): void {
     this.stopping = false; this.abort = new AbortController(); this.fullTickRequested = true; this.idleDelayMs = this.pollMs;
+    // #6317: one loud line when every round-trip of this consumer goes through a transaction-mode pooler with no direct route.
+    const exposure = poolerExposureLine(consumerConnectionRoute(this.engine));
+    if (exposure && !this.routeLogged && !this.opts.onError) { this.routeLogged = true; process.stderr.write(`${exposure}\n`); }
     if (this.opts.requestsOnly) this.projectionWorker = this.effectsWorker = this.topologyWorker = this.maintenanceWorker = PARKED_WORKER;
     this.schedule(0);
   }
@@ -245,7 +253,9 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     const excluded = [...this.activeRoots, ...[...this.rootRetryAfter].filter(([, at]) => at > now).map(([root]) => root)];
     for (const [id, at] of this.topologyRetryAfter) if (at <= now) this.topologyRetryAfter.delete(id);
     const retryingTopologies = [...this.topologyRetryAfter.keys()];
-    const [row] = await this.phase('idle_probe', async signal => this.probeQuery<{ work: boolean }>(this.laneInUse ? undefined : await this.acquireIdleLane(signal), `SELECT (
+    // On the direct route the probe needs no reserved pool lane: the direct pool is small and keeps its connections.
+    const direct = consumerConnectionRoute(this.engine).lane === 'direct';
+    const [row] = await this.phase('idle_probe', async signal => this.probeQuery<{ work: boolean }>(this.laneInUse || direct ? undefined : await this.acquireIdleLane(signal), `SELECT (
       EXISTS (SELECT 1 FROM persistence_requests r LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
         WHERE ${claimableWriteSql(foregroundPrioritySql(), '$5::text[]')}
         AND ($3::boolean OR r.blocked_reason IS DISTINCT FROM 'writer_pool_capacity'))
@@ -355,8 +365,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     } finally { this.laneInUse = false; }
   }
   private async probeQuery<T>(lane: ReservedConnection | undefined, sql: string, params: unknown[], signal?: AbortSignal): Promise<T[]> {
-    if (!lane) return this.engine.executeRaw<T>(sql, params, { signal });
-    if (this.laneInUse) return this.engine.executeRaw<T>(sql, params, { signal });
+    if (!lane) return this.statements.executeRaw<T>(sql, params, { signal });
+    if (this.laneInUse) return this.statements.executeRaw<T>(sql, params, { signal });
     this.probeOnLane = true;
     const query = lane.executeRaw<T>(sql, params);
     void query.then(() => { this.probeOnLane = false; }, () => { this.probeOnLane = false; });
@@ -419,7 +429,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     }
     // Lane runs size themselves to the pool's long-hold budget; a single write keeps its warm lane.
     // The switches are read under the tick's phase deadline, so a saturated pool cannot hold the tick.
-    const fast = await this.phase('switches', signal => readWriteSwitchSnapshot(this.engine, { signal }))
+    const fast = await this.phase('switches', signal => readWriteSwitchSnapshot(this.statements, { signal }))
       .then(snapshot => {
         this.policy = { ...snapshot.preparation, deadlines: snapshot.switches.preparation_deadlines, ...this.opts.preparationBudgets };
         return snapshot.switches.single_write_group;
@@ -465,7 +475,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     for (const [root, retryAt] of this.rootRetryAfter) if (retryAt <= now) this.rootRetryAfter.delete(root);
     if (scan) {
       const excluded = [...this.activeRoots, ...this.rootRetryAfter.keys()];
-      const recovery = await this.phase('recovery_scan', signal => this.engine.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
+      const recovery = await this.phase('recovery_scan', signal => this.statements.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
         JOIN persistence_worktrees w ON w.id=r.worktree_id
         WHERE w.owner_host_id=$1::uuid AND r.recovery IS NOT NULL AND NOT(r.worktree_id::text=ANY($2::text[]))
         AND NOT EXISTS (SELECT 1 FROM persistence_requests earlier WHERE earlier.worktree_id=r.worktree_id
@@ -488,7 +498,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
         }
       }
       // #6278: a claim that expired while its owner was preparing (the kill case) counts one preparation attempt.
-      await this.phase('expired_claims', signal => this.engine.executeRaw(`WITH expired AS (
+      await this.phase('expired_claims', signal => this.statements.executeRaw(`WITH expired AS (
         SELECT r.id FROM persistence_requests r WHERE r.state='running' AND r.recovery IS NULL
         AND r.publication_started=false AND r.claim_expires_at<now() AND ${PERSISTENCE_PROTOCOL_PREDICATE}
         AND (r.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=r.worktree_id AND w.owner_host_id=$1::uuid))
@@ -498,7 +508,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
         FROM expired WHERE r.id=expired.id`, [this.hostId, this.policy.deadlines], { signal }));
     }
     if (publicationConcurrency(this.engine) === 0) {
-      await this.phase('capacity', signal => this.engine.executeRaw(`UPDATE persistence_requests SET blocked_reason='writer_pool_capacity'
+      await this.phase('capacity', signal => this.statements.executeRaw(`UPDATE persistence_requests SET blocked_reason='writer_pool_capacity'
         WHERE state='queued' AND blocked_reason IS DISTINCT FROM 'writer_pool_capacity' AND ${PERSISTENCE_PROTOCOL_PREDICATE}`, undefined, { signal }));
       return;
     }
@@ -517,12 +527,12 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
         if (!row) break;
         if (String(row.intent?.kind ?? '').startsWith('managed_sync_')) this.owesSyncTurn.delete(row.worktree_id ?? `db:${row.source_incarnation}`);
         else if (row.passed_sync) this.passedSync.add(row.id);
-        if (this.stopping) { await releaseUnpublishedClaim(this.engine, row, 'consumer_stopping'); break; }
+        if (this.stopping) { await releaseUnpublishedClaim(this.statements, row, 'consumer_stopping'); break; }
         const key = row.worktree_id ?? `db:${row.source_incarnation}`;
         attemptedRoots.add(key);
         // #5984 lanes: the FIFO head of an open lane run runs as the run's first lane.
         if (laneOf(row)) { this.startLaneTask(row, key); continue; }
-        if (this.activeRoots.has(key)) { await releaseUnpublishedClaim(this.engine, row, 'writer_busy'); break; }
+        if (this.activeRoots.has(key)) { await releaseUnpublishedClaim(this.statements, row, 'writer_busy'); break; }
         this.activeRoots.add(key);
         // Lane heads keep being claimed beside a foreground write on a lane root (it joins their lease).
         if (laneRootKeys.includes(key)) this.besideLanes.add(key);
@@ -598,6 +608,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       abandoned_preparations: this.abandoned.size,
       outlived_ceiling: [...this.zombies.values()].map(value => ({ ...value })),
       restart_required: this.restartRequired(),
+      // #6317: which connection this consumer's statements take, and whether the ordinary pool is a transaction-mode pooler.
+      connection: consumerConnectionRoute(this.engine),
       ...(this.lastError ? { last_error: { ...this.lastError } } : {}) };
   }
   /**
@@ -724,7 +736,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
         claimed_at: new Date(clock.claimedAt).toISOString(), abandoned_at: at, outlived_ceiling_at: at });
       void settled.then(() => { this.zombies.delete(row.id); });
       this.log('preparation', 'ceiling_exceeded', `request ${row.request_id} step=${clock.step ?? 'none'} waiting_on=${clock.waitingOn}${this.restartRequired() ? ' restart_required' : ''}`);
-      await floorPreparationAttempts(this.engine, row.id, this.policy.maxAttempts).catch(error => this.report(error));
+      await floorPreparationAttempts(this.statements, row.id, this.policy.maxAttempts).catch(error => this.report(error));
     });
   }
   private async execute(row: WriteRequest, root: RootHold): Promise<boolean> {
@@ -769,13 +781,13 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     // whether or not the preparer settles; its late result never publishes (#6278).
     const deadline = async (): Promise<boolean> => {
       root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work, clock.claimedAt));
-      if (!lease.held || this.stopping) { await releaseUnpublishedClaim(this.engine, row, releaseReason()); return false; }
+      if (!lease.held || this.stopping) { await releaseUnpublishedClaim(this.statements, row, releaseReason()); return false; }
       if ((row.preparation_attempts ?? 0) + 1 >= policy.maxAttempts) {
         const done = await finishPreparationStalled(this.engine, row, stallInfo(), true);
         this.log('preparation', 'preparation_stalled', failureLogText(done));
         return this.settled(done);
       }
-      await releaseUnpublishedClaim(this.engine, row, 'preparation_deadline', { charge: true });
+      await releaseUnpublishedClaim(this.statements, row, 'preparation_deadline', { charge: true });
       return false;
     };
     try {
@@ -784,14 +796,14 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       if (raced === CLAIM_LOST) {
         root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work, clock.claimedAt));
         await endLostLease(lease);
-        await releaseUnpublishedClaim(this.engine, row, 'claim_lost');
+        await releaseUnpublishedClaim(this.statements, row, 'claim_lost');
         return false;
       }
       if ('deadline' in raced) return deadline();
       const prepared = raced.result;
       if (budget !== undefined && !prep.signal.aborted && prep.late()) prep.expire();
       if (!lease.held || this.stopping || prep.signal.aborted) {
-        await releaseUnpublishedClaim(this.engine, row, releaseReason()); return false;
+        await releaseUnpublishedClaim(this.statements, row, releaseReason()); return false;
       }
       this.preparing.delete(row.id);
       preparationActive = false;
@@ -812,7 +824,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       }
       // #6278: the preparer's rejection on our own abort (its reason, an AbortError, a cancelled statement) is a release, never a receipt.
       if (preparationActive && (prep.signal.aborted || observation.deadline_exceeded || preparationAbortReason(error, prep.signal))) {
-        await releaseUnpublishedClaim(this.engine, row, releaseReason());
+        await releaseUnpublishedClaim(this.statements, row, releaseReason());
         return false;
       }
       const current = await getWriteRequestById(this.engine, row.id);
@@ -835,7 +847,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     // A bulk-sync group member released mid-group follows the member before it, not only the previous group (#6153 class).
     const lane = laneOf(row);
     const order = await claimedHeadOrder(this.engine, row, lane !== null);
-    if (order === 'wait') { await releaseUnpublishedClaim(this.engine, row, 'group_member_waiting'); return false; }
+    if (order === 'wait') { await releaseUnpublishedClaim(this.statements, row, 'group_member_waiting'); return false; }
     if (order) { for (const done of order) this.settled(done); return true; }
     const group = publicationGroupKey(row);
     if (!group || this.engine.kind !== 'postgres') return this.execute(row, root);
