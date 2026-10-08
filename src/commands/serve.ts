@@ -578,7 +578,8 @@ function installFactsDrain(engine: BrainEngine, opts: ServeOptions, deps: StdioL
  */
 function installResidentTickers(engine: BrainEngine, opts: ServeOptions, deps: StdioLifecycleDeps, shuttingDown: () => boolean): { stop(): Promise<void> } {
   const factsDrain = installFactsDrain(engine, opts, deps, shuttingDown);
-  const movementWatch: MovementWatch = startMovementWatch(engine, { log: deps.log, setInterval: deps.setInterval as typeof setInterval, clearInterval: deps.clearInterval as typeof clearInterval });
+  // The watch keeps its own unref'd timer: the injected lifecycle timers are the parent watchdog's and the idle sweep's, which tests count.
+  const movementWatch: MovementWatch = startMovementWatch(engine, { log: deps.log });
   return { stop: async () => { movementWatch.stop(); await factsDrain?.stop(); } };
 }
 
