@@ -817,7 +817,7 @@ export async function writeHealthFacts(engine: BrainEngine, rows: WriteRequest[]
           AND (s.state IN ('running','recovering') OR s.recovery IS NOT NULL) ORDER BY s.sequence LIMIT 1) AS started_sequence,
         (SELECT s.sequence FROM persistence_requests s WHERE s.worktree_id=w.id
           AND (s.state IN ('running','recovering') OR s.recovery IS NOT NULL)
-          AND NOT (s.state='running' AND s.recovery IS NULL AND s.intent ? 'lane') ORDER BY s.sequence LIMIT 1) AS started_unlaned,
+          AND NOT (s.state='running' AND s.recovery IS NULL AND s.operation='submit_job') ORDER BY s.sequence LIMIT 1) AS started_unlaned,
         ${STUCK_RECOVERY('r')} AS recovering,
         r.blocked_reason IN ('unexpected_file_bytes','unexpected_staging_bytes') AS inspect_owner FROM persistence_requests r
         WHERE r.worktree_id=w.id AND (r.state IN ('queued','running','recovering') OR r.recovery IS NOT NULL)
@@ -841,8 +841,8 @@ export async function writeHealthFacts(engine: BrainEngine, rows: WriteRequest[]
   for (const row of pending) {
     const fact = byRoot.get(row.worktree_id ?? `db:${row.source_incarnation}`);
     if (!fact) continue;
-    // #5984 Phase 4.5: a foreground write publishing beside running lane groups is not waiting on them.
-    const head = row.state === 'queued' ? fact.sequence : row.worktree_id && !String(row.intent?.kind ?? '').startsWith('managed_sync_') ? fact.started_unlaned : fact.started_sequence;
+    // #5984 Phase 4.5: a foreground write publishing beside running lane groups (claimed sync jobs) is not waiting on them.
+    const head = row.state === 'queued' ? fact.sequence : row.worktree_id && row.operation !== 'submit_job' ? fact.started_unlaned : fact.started_sequence;
     result.set(row.id, { observed_at, recovery_required: fact.recovery_required,
       owner_unavailable: fact.owner_unavailable,
       inspect_owner: fact.inspect_owner,

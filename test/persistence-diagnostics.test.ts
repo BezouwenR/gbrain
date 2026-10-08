@@ -200,14 +200,15 @@ test('#5984 4.5: a foreground write publishing beside running lane groups is not
     const worktree = randomUUID();
     await engine.executeRaw("INSERT INTO persistence_worktrees(id,owner_host_id,state) VALUES($1,$2,'active')", [worktree, randomUUID()]);
     await engine.executeRaw('UPDATE persistence_requests SET worktree_id=$2 WHERE id=ANY($1::uuid[])', [[lane.id, foreground.id], worktree]);
+    await engine.executeRaw("UPDATE persistence_requests SET operation='submit_job' WHERE id=$1::uuid", [lane.id]);
     await engine.executeRaw("UPDATE persistence_requests SET state='running',execution_token=gen_random_uuid() WHERE id=ANY($1::uuid[])", [[lane.id, foreground.id]]);
     const earlier = async () => {
       const rows = await engine.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid', [foreground.id]);
       return (await writeHealthFacts(engine, rows)).get(foreground.id)?.earlier_write;
     };
     expect(await earlier()).toBe(false);
-    // A running sync row outside a lane run (the single path, which holds the worktree alone) still comes first.
-    await engine.executeRaw("UPDATE persistence_requests SET intent=intent-'lane' WHERE id=$1::uuid", [lane.id]);
+    // A recovering sync row still comes first.
+    await engine.executeRaw("UPDATE persistence_requests SET state='recovering' WHERE id=$1::uuid", [lane.id]);
     expect(await earlier()).toBe(true);
     await engine.executeRaw("UPDATE persistence_requests SET state='cancelled',execution_token=NULL,completed_at=now() WHERE id=ANY($1::uuid[])", [[lane.id, foreground.id]]);
   }
