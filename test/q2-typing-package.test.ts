@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { packageBranchName, withEnabledUnits } from '../scripts/q2-typing-package.ts';
 import { parseTypingUnits } from '../src/core/link-typing-units.ts';
 
+// test-reads-source-ok[structural]: the package script rewrites this file's text; the test checks that rewrite on the real file.
 const source = readFileSync(join(import.meta.dir, '../src/core/link-typing-units.ts'), 'utf8');
 
 test('the package commit changes exactly the ENABLED_TYPING_UNITS line, in the given order', () => {
