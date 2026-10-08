@@ -304,6 +304,9 @@ export async function drainManagedSync(engine: BrainEngine, opts: SyncOpts, anno
   const drainStartedAt = opts.drainStartedAt ?? Date.now();
   const { preparationConfigView } = await import('./config-snapshot.ts');
   const bulk = await resolveBulkSettings(await preparationConfigView(engine), opts.noBulk, opts.lanes);
+  // #5984 G3: open the pool's connections while the run's startup reads go one at a time, so the waiver screen and
+  // the first group do not wait for connection setup.
+  if (bulk.enabled) void Promise.all(Array.from({ length: Math.min(8, (bulk.lanes ?? 1) + 2) }, () => engine.executeRaw('SELECT 1').catch(() => undefined)));
   // #5984 lanes: one lane run per drain; its groups carry the id and this process claims them out of FIFO order.
   const laneRun = bulk.enabled && (bulk.lanes ?? 1) > 1 ? randomUUID() : undefined;
   const { closeLaneRun } = await import('./sync-lanes.ts');
