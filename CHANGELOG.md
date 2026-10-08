@@ -23,6 +23,8 @@ gbrain now warms PowerShell once per process before the protection step: a trivi
 | First backup on a cold Windows machine (PowerShell start over 15 s) | Fails with `private_backup_path_unavailable` | Succeeds |
 | PowerShell that hangs during protection | Fails after one 15 s launch | Fails after one 15 s launch (unchanged) |
 
+The `core-memory-locks-postgres` E2E test also stops failing intermittently: its source-topology step could wait out its 1-second lock limit behind 18 concurrent core writes and report the retryable `write_pending`, which the test did not retry. It now retries with the same `request_id`, as that error's fix text says. The deadlock and commit-count assertions are unchanged.
+
 ## To take advantage of v0.60.111.0
 
 `gbrain upgrade` installs the binary. There are no schema migrations.
