@@ -810,3 +810,50 @@ What is left between the steady state and the wall figure is the startup:
 discovery and already-deleted files run one at a time before the first
 group. At 57 ms that is about 80 s for this corpus, which is why the wall
 rate of a short backlog stays below 150 even when the lanes run at it.
+
+## Feeder, lanes to 16 and foreground priority (lanes/startup/foreground plan)
+
+Before and after on one Ubicloud `standard-16` VM (Ubuntu 24.04, Postgres in
+Docker, toxiproxy at 57 ms), default settings unless a row says otherwise:
+master `a865f8f8` against the branch at `d00f4d035`. The 57 ms `cli` rows ran
+on 1,500 files time-boxed at 10 min (8 min for the lane sweep); the 10k row
+ran to completion. **Steady** is pages/min between the 10% and 90% commits;
+**first commit** is from the sync process's first statement.
+
+| Gate | Master | Branch | Target | Result |
+|---|---|---|---|---|
+| G1 steady, 10k corpus | 174.8 | 372.7 | >= 300 | met |
+| G2 10k backlog wall | 74.5 min | 33.5 min | <= 40 min | met |
+| G3 first commit, 1,500 files (34 waived first) | 78.9 s | 20.3 s | <= 15 s | missed |
+| G4 steady at 4 / 6 / 8 / 12 / 16 lanes, pool 20 | falls past 6 | 333.5 / 369.4 / 418.1 / 418.8 / 409.3 | non-decreasing within the 6-lane spread | see below |
+| G5 `put_page` idle p50 / p95 | 8.6 / 11.6 s | 2.53 / 2.78 s | <= 3 / 4 s | met |
+| G6 `put_page` during catch-up p50 / p95 | 11.3 / 17.1 s | 6.9 / 8.4 s | <= idle + 1 s (provisional) | missed |
+| G7 catch-up while a write arrives every 5 s | 4.6 | 58.2 (15% of idle) | >= 50% of idle | missed |
+| G8 steady at ~0 ms | 2,404 | 2,862 | >= 700 | met |
+
+The three repeated default (6-lane) runs gave 381.3, 378.9 and 374.5 pages/min.
+
+**G3.** Of the 20 s before the first commit, about 5.4 s is startup reads (90
+serial round trips: configuration, source, writer and checkpoint reads), 5.6 s
+is the 34 waived deletions (screened four at a time, then one waiver
+transaction), 3.3 s is the first group's freeze and admission, 2.7 s its
+preparation and about 3.5 s its publication. Each is a serial chain of round
+trips; no single step holds the missing 5 s.
+
+**G6 and G7.** A foreground write waits for the sync groups already
+publishing, then publishes alone while no new group starts (about 2 s at 57
+ms). With a write every 5 s and about 6.3 s from admission to visible, one is
+almost always pending, so lanes average 1.1 busy. Letting each foreground
+commit start a full round of groups instead of one did not move it (local
+4-core bench, 55.2 to 57.4 pages/min, within noise): the foreground
+publication's exclusive time sets the ceiling. Reaching half the idle rate
+needs a foreground write to publish beside lane groups, which the plan's
+ordering rule (no sync group starts while a disjoint-page write waits) does
+not allow.
+
+**Admit-ahead fix.** Before `d00f4d035`, admit-ahead asked for more requests
+at once than the writer's outstanding-request limit (100) allowed whenever
+groups were large (16 pages at ~0 ms) or lanes were many (8+); the admission
+was refused and lanes ran one at a time. The sweep at `4004f1f2f` shows it:
+8 / 12 / 16 lanes at 88.1 / 69.2 / 56.5 pages/min. Now the batch takes only the
+room left after the cursor's next group and a reserve of 10.
