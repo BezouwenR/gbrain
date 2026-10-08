@@ -2754,18 +2754,17 @@ export class PostgresEngine implements BrainEngine {
       }
       function onAbort() {
         if (!pending || cancellation) return;
-        try { cancellation = pending.cancel().catch(() => { retired = true; }); }
-        catch { retired = true; }
         // #6278: a transaction-mode pooler may swallow the cancel request and leave the backend in ClientRead,
         // so the statement never settles on its own. Past the settle window the reserved connection is
         // discarded, which rejects the statement client-side (CONNECTION_DESTROYED) and frees the awaiting caller.
-        const statement = pending;
+        pending.then(() => { settled = true; }, () => { settled = true; });
         settleTimer = setTimeout(() => {
           if (settled) return;
           retired = true; discarded = true;
-          try { owner.discard(); } catch { /* the reservation is already gone */ }
+          owner.discard();
         }, cancelSettleMs());
-        statement.then(() => { settled = true; }, () => { settled = true; });
+        try { cancellation = pending.cancel().catch(() => { retired = true; }); }
+        catch { retired = true; }
       }
     })();
   }
