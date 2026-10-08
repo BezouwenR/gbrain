@@ -46,7 +46,7 @@ import { pipelined } from '../page-state/transactions.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { principalAttribution } from './attribution.ts';
 import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
-import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, readSyncHoldPolicy, recordSyncConversion, recoveredReport, writeGitHold, type FencesTally } from './sync-holds.ts';
+import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, holdsEscalated, readGitSourceHolds, readSyncHoldPolicy, recordSyncConversion, recoveredReport, requestGitHoldRetry, writeGitHold, type FencesTally, type SyncHoldPolicy } from './sync-holds.ts';
 
 export interface ManagedSyncWriteDiagnostic {
   source_id: string;
@@ -81,6 +81,8 @@ interface Cursor extends SyncDiscovery { runId: string; index: number; authority
     fences?: FencesTally };
   /** #5988: failed content-refusal requests this run converted in place. */
   convertedFromFailed?: string[];
+  /** #6278 (1.5): the systemic breaker over this run's `preparation_stalled` receipts; recorded with the cursor CAS that consumes each. */
+  breaker?: CursorBreaker;
   /** #5984: the active drain window (reset when a new drain starts), so a backlog ETA never counts downtime. */
   progress?: CursorProgress;
   /** #5984 bulk: the frozen head (also `pending`) and the members admitted with it, in manifest order. */
@@ -92,6 +94,54 @@ interface Cursor extends SyncDiscovery { runId: string; index: number; authority
    */
   window?: Pending[][]; }
 export interface CursorProgress { startedAt: number; startIndex: number; lastAt: number; lastIndex: number }
+/**
+ * #6278 (1.5): the breaker state a run carries in its cursor. `stalled` lists the `preparation_stalled` receipts this run
+ * processed (held, or the one that tripped), so a restart neither double-counts a receipt nor loses the trip; `streak`
+ * counts consecutive stalled entries with no committed page between them. A tripped cursor holds nothing more: the
+ * run stops `blocked` / `preparation_systemic`, and the next run re-freezes the entry and schedules the run's earlier
+ * stalled holds for a re-screen instead of holding.
+ */
+export interface CursorBreaker { stalled: string[]; streak: number; tripped?: { at: string; rule: 'count' | 'consecutive'; stalled: number; streak: number; step: string | null; request_id: string } }
+/** The second trip rule: this many consecutive stalled entries with no commit between them. */
+export const BREAKER_STREAK = 5;
+/** The breaker after this receipt: the count rule is `holdsEscalated`'s "greater than" rule over the run's screened imports, the streak rule is `BREAKER_STREAK`. */
+function breakerAfter(cursor: Cursor, done: Pick<WriteRequest, 'request_id' | 'error_detail'>, policy: Pick<SyncHoldPolicy, 'escalateCount' | 'escalatePct'>): CursorBreaker {
+  const prior = cursor.breaker ?? { stalled: [], streak: 0 };
+  if (prior.tripped || prior.stalled.includes(done.request_id)) return prior;
+  const stalled = [...prior.stalled, done.request_id], streak = prior.streak + 1;
+  const screened = cursor.entries.slice(0, cursor.index + 1).filter(entry => entry.action === 'import').length;
+  const rule = holdsEscalated(policy, stalled.length, { held: stalled.length, screened }) ? 'count' : streak >= BREAKER_STREAK ? 'consecutive' : null;
+  const step = done.error_detail && typeof done.error_detail === 'object' && typeof (done.error_detail as Record<string, unknown>).step === 'string' ? String((done.error_detail as Record<string, unknown>).step) : null;
+  return { stalled, streak, ...(rule ? { tripped: { at: new Date().toISOString(), rule, stalled: stalled.length, streak, step, request_id: done.request_id } } : {}) };
+}
+/** The cursor after a committed page: a commit ends the breaker's consecutive streak. */
+function committedBreaker(cursor: Cursor): Pick<Cursor, 'breaker'> {
+  return cursor.breaker?.streak ? { breaker: { ...cursor.breaker, streak: 0 } } : {};
+}
+/** #6278: the systemic stop a sync result carries when the breaker trips (`drain.stop_reason: preparation_systemic`). */
+export interface ManagedSyncBreaker {
+  code: 'preparation_systemic';
+  rule: 'count' | 'consecutive';
+  /** `preparation_stalled` receipts this run saw, and how many in a row without a committed page. */
+  stalled: number;
+  consecutive: number;
+  step: string | null;
+  request_id: string;
+  fix: import('../agent-output.ts').Action;
+}
+function breakerResult(cursor: Cursor, pending: Pending, done: WriteRequest, remote: boolean): SyncResult {
+  const trip = cursor.breaker!.tripped!;
+  const where = trip.step ? ` at step ${trip.step}` : '';
+  const fix: ManagedSyncBreaker['fix'] = { argv: ['gbrain', 'sources', 'writer', 'status', '--source', cursor.sourceId, '--json'], consent: [], actor: remote ? 'host_admin' : 'agent', requires_exclusive: false,
+    docs: 'docs/guides/write-refusals.md#preparation_systemic', verify: { argv: ['gbrain', 'sources', 'status', cursor.sourceId, '--json'] },
+    why: `${trip.stalled} write(s) of this sync could not finish preparing${where} (${trip.rule === 'consecutive' ? `${trip.streak} in a row with no page committed between them` : 'more than a source should hold'}), `
+      + 'so the run stopped instead of holding every file: the write owner, not the files, is the likely cause. Writer status (read-only) shows the owner process, its gbrain version and the step '
+      + 'each stuck write reached; fix what it names or upgrade gbrain, then rerun the same sync: it re-freezes the stopped entry and re-screens the files this run held.',
+    ...(remote ? { user_message: `A managed sync of source ${cursor.sourceId} stopped because ${trip.stalled} writes could not finish preparing. Please run 'gbrain sources writer status --source ${cursor.sourceId} --json' on the brain host, fix what it names, then rerun the sync.` } : {}) };
+  return { ...result(cursor, 'blocked_by_failures'), failedFiles: 1, failureCodes: [{ code: PREPARATION_STALLED, count: trip.stalled }],
+    breaker: { code: 'preparation_systemic', rule: trip.rule, stalled: trip.stalled, consecutive: trip.streak, step: trip.step, request_id: trip.request_id, fix },
+    ...(remote ? {} : { managedWrite: writeDiagnostic(cursor, pending, done) }) };
+}
 /** #5984: the cursor's progress after advancing to `index`, in the drain window that started at `drainStartedAt`. */
 function stampProgress(prior: CursorProgress | undefined, fromIndex: number, index: number, drainStartedAt: number): CursorProgress {
   const now = Date.now();
@@ -500,8 +550,26 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
   const entry = blocked.entries[blocked.index];
   if (preparationStalled(failed)) {
     if (blocked.companyPlan || previous.intent.kind === 'managed_sync_checkpoint' || !entry || entry.path !== previous.intent.path) return blocked;
+    const converted = [...(blocked.convertedFromFailed ?? []), previous.requestId];
+    if (blocked.breaker?.tripped) {
+      // A run that tripped the breaker holds nothing: its stopped entry is re-frozen under a fresh request (the attempt
+      // counter starts at zero) and the stalled holds it wrote before the trip are scheduled for a re-screen.
+      const base: Cursor = { ...blocked, convertedFromFailed: converted }; delete base.pending; delete base.breaker;
+      const again = await freezeEntry(engine, base, key, assertActive, run);
+      const rescreen = ((await readGitSourceHolds(engine, { sourceIds: [blocked.sourceId], runId: blocked.runId }))[0]?.holds ?? [])
+        .filter(hold => hold.code === PREPARATION_STALLED).map(hold => hold.path);
+      const inTx = async (tx: BrainEngine) => {
+        if (rescreen.length) await requestGitHoldRetry(tx, blocked.sourceId, blocked.incarnation, rescreen);
+        if ('hold' in again) await heldWrite(blocked, again.hold, run.observedAt!)(tx);
+        await recordSyncConversion(tx, blocked.sourceId, blocked.incarnation, { request_id: previous.requestId, path: previous.intent.path ?? null, slug: previous.slug, run_id: blocked.runId, outcome: 'refrozen' });
+      };
+      return saveCursor(engine, key, blocked, 'hold' in again ? advanceHeld(base, converted) : { ...base, pending: again }, false, assertActive, inTx);
+    }
+    const breaker = breakerAfter(blocked, failed, run.screen!.policy);
+    if (breaker.tripped) return saveCursor(engine, key, blocked, { ...blocked, breaker }, false, assertActive);
     const hold = preparationStalledHold(entry, previous.slug, previous.pageId, failed, previous.intent.content ?? null, previous.intent.blobOid, resumeArgsOf(blocked, run));
-    const held = await holdUnderGate(engine, { cursor: blocked, key, pending: previous, hold, assertActive, observedAt: run.observedAt!, waitMs: 5000, failedId: failed.id });
+    const base: Cursor = { ...blocked, breaker }; delete base.pending; delete base.group; delete base.window;
+    const held = await holdUnderGate(engine, { cursor: blocked, key, pending: previous, hold, assertActive, observedAt: run.observedAt!, waitMs: 5000, failedId: failed.id, base });
     return held === 'pending' ? blocked : held;
   }
   const fence = fenceReceiptLocation(failed);
@@ -541,12 +609,20 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
  * the run does not hold files (`sync.holds=fail`, company-brain sources).
  */
 async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: string, pending: Pending, done: WriteRequest, assertActive: () => void,
-  run: { screen?: SyncScreenRun | null; observedAt?: string; syncOptions: SyncCursorOptions; repoPath?: string }, waitMs: number): Promise<Cursor | 'pending' | null> {
+  run: { screen?: SyncScreenRun | null; observedAt?: string; syncOptions: SyncCursorOptions; repoPath?: string }, waitMs: number): Promise<Cursor | 'pending' | { tripped: Cursor } | null> {
   if (!run.screen || cursor.companyPlan || pending.intent.kind === 'managed_sync_checkpoint') return null;
   const entry = cursor.entries[cursor.index];
   if (!entry || entry.path !== pending.intent.path) return null;
   const stalled = preparationStalled(done);
   if (!stalled && (pending.intent.kind !== 'managed_sync_import' || typeof pending.intent.content !== 'string')) return null;
+  let base: Cursor | undefined;
+  if (stalled) {
+    // #6278 (1.5): the breaker counts the receipt first; at the trip the run stops and converts neither this receipt nor a later one.
+    if (cursor.breaker?.tripped) return { tripped: cursor };
+    const breaker = breakerAfter(cursor, done, run.screen.policy);
+    if (breaker.tripped) return { tripped: await saveCursor(engine, key, cursor, { ...cursor, breaker }, false, assertActive) };
+    base = { ...cursor, breaker }; delete base.pending; delete base.group; delete base.window;
+  }
   const fence = stalled ? null : fenceReceiptLocation(done);
   // #6194 (D4): a revision conflict proven to come from a concurrent database-only write is held the same way (sync-concurrent-write.ts).
   const proof = stalled || fence ? null : await concurrentWriteProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pending, done });
@@ -554,7 +630,7 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
   const hold = stalled ? preparationStalledHold(entry, pending.slug, pending.pageId, done, pending.intent.content ?? null, pending.intent.blobOid, resumeArgsOf(cursor, run))
     : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content!, pending.intent.blobOid)
       : concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof!);
-  return holdUnderGate(engine, { cursor, key, pending, hold, assertActive, observedAt: run.observedAt!, waitMs, failedId: done.id });
+  return holdUnderGate(engine, { cursor, key, pending, hold, assertActive, observedAt: run.observedAt!, waitMs, failedId: done.id, base });
 }
 
 /**
@@ -568,6 +644,7 @@ async function settleFailedRequest(engine: BrainEngine, input: { cursor: Cursor;
   const { cursor, key, pending, done, syncOptions, processingOptions, remote } = input;
   const converted = await holdFailedFenceRequest(engine, cursor, key, pending, done, input.assertActive, input.run, input.waitMs);
   if (converted === 'pending') return { result: result(cursor, 'partial', input.signal?.aborted ? 'timeout' : 'writer_pending') };
+  if (converted && 'tripped' in converted) return { result: breakerResult(converted.tripped, pending, done, remote) };
   if (converted) { input.assertActive(); return { cursor: converted }; }
   const { failure, ledgerRecorded } = await recordManagedSyncFailure(engine, { source_id: cursor.sourceId, source_incarnation: cursor.incarnation, path: pending.intent.path ?? '<checkpoint>',
     code: done.error_code ?? (done.state === 'cancelled' ? 'cancelled' : 'storage_error'), message: done.error_message ?? 'The accepted sync request did not commit.',
@@ -898,6 +975,7 @@ async function groupStep(engine: BrainEngine, cursor: Cursor, key: string, bulk:
     committed++;
   }
   if (committed === members.length) bulk.perMemberMs = (performance.now() - admitted) / members.length;
+  if (committed) Object.assign(next, committedBreaker(cursor));
   next.index = cursor.index + committed;
   if (committed) next.progress = stampProgress(cursor.progress, cursor.index, next.index, drainStartedAt);
   const stuck = members[committed];
@@ -1257,7 +1335,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         return withLinks(cursor, result(cursor, cursor.from === null ? 'first_sync' : 'synced'));
       }
       // The frozen manifest is shared; only the cursor header changes per page.
-      const next: Cursor = { ...cursor, index: cursor.index + 1, counts: { ...cursor.counts }, progress: stampProgress(cursor.progress, cursor.index, cursor.index + 1, drainStartedAt) }; delete next.pending; delete next.group;
+      const next: Cursor = { ...cursor, ...committedBreaker(cursor), index: cursor.index + 1, counts: { ...cursor.counts }, progress: stampProgress(cursor.progress, cursor.index, cursor.index + 1, drainStartedAt) }; delete next.pending; delete next.group;
       countCommitted(next.counts, pending, done.outcome);
       cursor = await saveCursor(engine, key, cursor, next);
       opts.onProgress?.({ phase: 'managed_sync.page_committed', bankedFiles: cursor.index, total: cursor.entries.length });

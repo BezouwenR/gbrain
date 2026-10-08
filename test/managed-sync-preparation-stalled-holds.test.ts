@@ -306,6 +306,60 @@ test('bulk groups: a stalled first, middle or last member is held, the committed
   }
 }), 300_000);
 
+// ── #6278 (B2): the systemic breaker ──
+
+test('breaker: five consecutive stalled entries with no commit between stop the run with one systemic diagnostic; the next run re-freezes and re-screens instead of holding', () => each(async engine => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 7; i++) files[`notes/s${i}.md`] = note(`S${i}`);
+  const s = await source(engine, files);
+  stallPaths(engine, s.id, new Set(Object.keys(files)));
+  const tripped = await s.sync();
+  expect(tripped).toMatchObject({ status: 'blocked_by_failures', failureCodes: [{ code: 'preparation_stalled', count: 5 }],
+    breaker: { code: 'preparation_systemic', rule: 'consecutive', stalled: 5, consecutive: 5 } });
+  expect(tripped.breaker!.fix.argv).toEqual(['gbrain', 'sources', 'writer', 'status', '--source', s.id, '--json']);
+  expect(tripped.managedWrite?.write_error).toBe('preparation_stalled');
+  // Four holds were written before the trip; the fifth receipt is counted, not held, and the cursor still points at it.
+  expect((await s.holds()).map(hold => hold.path).sort()).toEqual(['notes/s0.md', 'notes/s1.md', 'notes/s2.md', 'notes/s3.md']);
+  expect(await s.failedRequests()).toHaveLength(5);
+  const [cursor] = await engine.executeRaw<{ c: { index: number; breaker: { stalled: string[]; streak: number; tripped?: { rule: string } }; pending: { intent: { path: string } } } }>(
+    "SELECT completed_keys->0 AS c FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [s.id]);
+  expect(cursor!.c).toMatchObject({ index: 4, pending: { intent: { path: 'notes/s4.md' } }, breaker: { streak: 5, tripped: { rule: 'consecutive' } } });
+  expect(cursor!.c.breaker.stalled).toHaveLength(5);
+  // Cause fixed: the next run re-freezes the stopped entry under a fresh request (nothing held), finishes, and scheduled the run's four stalled holds for a re-screen.
+  installFaultHook(undefined);
+  const resumed = await s.sync();
+  expect(resumed).toMatchObject({ status: 'first_sync', added: 3 });
+  expect(resumed.converted_from_failed).toEqual([...cursor!.c.breaker.stalled]);
+  expect(await s.failedRequests()).toHaveLength(5);
+  expect(await engine.getPage('notes/s4', { sourceId: s.id })).not.toBeNull();
+  expect(await s.holds()).toHaveLength(4);
+  const rescreened = await s.sync();
+  expect(rescreened).toMatchObject({ status: 'synced', added: 4 });
+  expect(await s.holds()).toEqual([]);
+}), 240_000);
+
+test('breaker: the count rule trips above sync.hold_escalate_count (greater than), and a committed page resets the consecutive streak', () => each(async engine => {
+  await engine.setConfig('sync.hold_escalate_count', '2');
+  try {
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 4; i++) files[`notes/s${i}.md`] = note(`S${i}`);
+    const s = await source(engine, files);
+    stallPaths(engine, s.id, new Set(Object.keys(files)));
+    const tripped = await s.sync();
+    expect(tripped).toMatchObject({ status: 'blocked_by_failures', breaker: { rule: 'count', stalled: 3, consecutive: 3 } });
+    expect(await s.holds()).toHaveLength(2);
+  } finally { await engine.unsetConfig('sync.hold_escalate_count'); }
+  // Streak: four stalled, one committed, four stalled: eight holds and no trip.
+  const files: Record<string, string> = { 'notes/m-ok.md': note('Ok') };
+  for (let i = 0; i < 4; i++) { files[`notes/a${i}.md`] = note(`A${i}`); files[`notes/z${i}.md`] = note(`Z${i}`); }
+  const t = await source(engine, files);
+  stallPaths(engine, t.id, new Set(Object.keys(files).filter(path => path !== 'notes/m-ok.md')));
+  const result = await t.sync();
+  expect(result).toMatchObject({ status: 'first_sync', added: 1, held_count: 8 });
+  expect(result.breaker).toBeUndefined();
+  expect(result.holds_escalated).toBeUndefined();
+}), 240_000);
+
 test('preparationStallMeta keeps the receipt step vocabulary only and tolerates receipts without detail', () => {
   const full = preparationStallMeta({ request_id: 'r1', error_detail: { step: 'origin_check', waiting_on: 'db', attempts: 2, message: 'never stored' } }, ['--source', 'x', '--no-pull']);
   expect(full).toEqual({ request_id: 'r1', step: 'origin_check', waiting_on: 'db', attempts: 2, gbrain_version: VERSION, sync_argv: ['--source', 'x', '--no-pull'] });
