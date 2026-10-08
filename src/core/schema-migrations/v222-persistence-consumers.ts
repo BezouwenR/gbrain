@@ -14,8 +14,8 @@ import { buildIndexOnline, migrationNotice } from './helpers.ts';
 // partial `(worktree_id, completed_at DESC) WHERE state='committed'` index is
 // the movement watermark read; Postgres builds it CONCURRENTLY here (the blob
 // omits it, like the #5762 sync-run indexes), PGLite inline.
-export const v221: Migration = {
-  version: 221,
+export const v222: Migration = {
+  version: 222,
   name: 'persistence_consumers',
   idempotent: true,
   sql: PERSISTENCE_CONSUMERS_TABLE_SQL,
