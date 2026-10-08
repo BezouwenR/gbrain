@@ -1,5 +1,5 @@
 /**
- * #6278 (v221): `persistence_requests.preparation_attempts`. Protects: a fresh
+ * #6278 (v220): `persistence_requests.preparation_attempts`. Protects: a fresh
  * PGLite install has the column (integer, NOT NULL, default 0, non-negative)
  * and an upgraded brain gets it with 0 on every existing request, whatever its
  * state, without the runner touching the rows. Fails when the migration is

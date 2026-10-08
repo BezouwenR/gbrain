@@ -89,7 +89,7 @@ export interface WriteRequest {
   blocked_reason: string | null;
   compacted: boolean;
   publication_started: boolean;
-  /** #6278 (v221): preparations cut off by a deadline or an expired `preparing` claim; reset by a commit. Absent on rows read before the migration. */
+  /** #6278 (v220): preparations cut off by a deadline or an expired `preparing` claim; reset by a commit. Absent on rows read before the migration. */
   /** #6176 (v217): the owner's claim-phase stamp (claim-phase.ts), read back by `claimStateOf`; absent on rows read before the migration. */
   claim_phase?: unknown;
   preparation_attempts?: number;

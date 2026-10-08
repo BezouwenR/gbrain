@@ -1,5 +1,5 @@
 /**
- * #6278 (v221) on Postgres: the `preparation_attempts` column on a fresh
+ * #6278 (v220) on Postgres: the `preparation_attempts` column on a fresh
  * install and on an upgraded brain holding queued, running, failed and
  * compacted requests. PGLite twin: test/persistence-preparation-attempts-migration.test.ts.
  */

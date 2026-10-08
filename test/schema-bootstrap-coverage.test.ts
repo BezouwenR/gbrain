@@ -1052,7 +1052,7 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // as v178/v198: persistence_requests is migration-created on PGLite, no
   // index references the column, and every reader treats NULL as no recorded phase.
   'persistence_requests.claim_phase',
-  // #6278 (migration v221) — preparation attempt counter. Same posture as
+  // #6278 (migration v220) — preparation attempt counter. Same posture as
   // v178/v198/v217: migration-created on PGLite, no index references the
   // column, and every reader treats a missing value as 0 attempts.
   'persistence_requests.preparation_attempts',

@@ -11,8 +11,8 @@ import type { Migration } from './types.ts';
 // preparation cannot stall a catch-up on every pass. Existing rows start at 0;
 // a commit resets the counter. The column is also in the `persistence_requests`
 // CREATE TABLE of src/schema.sql for fresh installs; no index references it.
-export const v221: Migration = {
-  version: 221,
+export const v220: Migration = {
+  version: 220,
   name: 'persistence_request_preparation_attempts',
   idempotent: true,
   sql: `
