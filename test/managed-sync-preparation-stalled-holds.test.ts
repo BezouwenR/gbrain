@@ -25,7 +25,8 @@ import { claimWorktree } from '../src/core/persistence/ownership.ts';
 import { disposePersistenceConsumer } from '../src/core/persistence/service.ts';
 import { performManagedSync } from '../src/core/persistence/sync-run.ts';
 import { installFaultHook, type FaultPoint } from '../src/core/persistence/fault-points.ts';
-import { readGitSourceHolds, holdRescreenDue, GIT_HOLD_SUMMARY_OP } from '../src/core/persistence/sync-holds.ts';
+import { readGitSourceHolds, holdRescreenDue, readGitHoldRetryPaths, GIT_HOLD_SUMMARY_OP } from '../src/core/persistence/sync-holds.ts';
+import { drainManagedSync, readManagedSyncBacklog } from '../src/core/persistence/sync-drain.ts';
 import { preparationStallMeta } from '../src/core/persistence/sync-screen.ts';
 import { readHeldCoverage, coverageRoute } from '../src/core/persistence/held-reads.ts';
 import { retryHeld } from '../src/commands/sources-retry-held.ts';
@@ -306,6 +307,100 @@ test('bulk groups: a stalled first, middle or last member is held, the committed
   }
 }), 300_000);
 
+// ── #6278 (B7): retry-held against a backlog ──
+
+/** The committed import request for `path`, with the attempt counter the owner left on it. */
+const committedAttempts = async (engine: BrainEngine, sourceId: string, path: string) => (await engine.executeRaw<{ n: number }>(
+  "SELECT preparation_attempts::int AS n FROM persistence_requests WHERE source_id=$1 AND intent->>'path'=$2 AND state='committed' ORDER BY sequence DESC LIMIT 1", [sourceId, path]))[0]?.n;
+
+test('retry-held against an unfinished cursor: the printed sync finishes the backlog and re-screens the scheduled file in the same drain (Phase 4.1b)', () => each(async engine => {
+  const s = await source(engine, { 'notes/a.md': note('A'), 'notes/stuck.md': note('Stuck'), 'notes/z1.md': note('Z1'), 'notes/z2.md': note('Z2'), 'notes/z3.md': note('Z3') });
+  stallPaths(engine, s.id, new Set(['notes/stuck.md']));
+  // A sliced pass holds the stalled entry and yields with entries left: the cursor is a backlog, as after the lock run's queue_capacity exit.
+  const sliced = await performManagedSync(engine, { sourceId: s.id, noPull: true, noEmbed: true, noExtract: true }, { maxPages: 2, maxMs: 60_000 });
+  expect(sliced).toMatchObject({ status: 'partial', reason: 'writer_yield', held_count: 1 });
+  expect(sliced.managedCursor!.index).toBeLessThan(5);
+  const [failed] = await s.failedRequests();
+  expect(failed).toMatchObject({ error_code: 'preparation_stalled', path: 'notes/stuck.md' });
+  const [backlog] = await readManagedSyncBacklog(engine, [s.id]);
+  expect(backlog!.remaining).toBeGreaterThan(0);
+  // The cause is gone; the operator follows the route: retry-held prints the backlog's own resume command.
+  installFaultHook(undefined);
+  const retry = await retryHeld(engine, s.id);
+  expect(retry).toMatchObject({ scheduled: 1, items: [{ key: 'notes/stuck.md', code: 'preparation_stalled', action: 'retry_scheduled' }] });
+  expect(retry.fix!.argv).toEqual(['gbrain', 'sync', ...backlog!.resume_args]);
+  expect(await readGitHoldRetryPaths(engine, s.id, await s.incarnation())).toEqual(['notes/stuck.md']);
+  // The printed sync, drained as the CLI drains it: the backlog finishes, then the scheduled re-screen runs before the drain reports synced.
+  const drained = await drainManagedSync(engine, { sourceId: s.id, noPull: true, noEmbed: true, noExtract: true }, false);
+  expect(drained.drain).toMatchObject({ outcome: 'synced', remaining: 0 });
+  expect(drained.drain!.passes).toBeGreaterThanOrEqual(2);
+  // The report covers both runs: the backlog cursor's four pages (two from the sliced pass) plus the re-screened one; the drain itself wrote three.
+  expect(drained).toMatchObject({ status: 'synced', added: 5, modified: 0 });
+  expect(drained.drain!.written).toBe(5 - sliced.added);
+  expect(drained.holds_outstanding ?? 0).toBe(0);
+  expect(await engine.getPage('notes/stuck', { sourceId: s.id })).not.toBeNull();
+  for (const slug of ['notes/a', 'notes/z1', 'notes/z2', 'notes/z3']) expect(await engine.getPage(slug, { sourceId: s.id })).not.toBeNull();
+  expect(await s.holds()).toEqual([]);
+  expect(await s.summary()).toMatchObject({ count: 0, stalled: 0 });
+  expect(await committedAttempts(engine, s.id, 'notes/stuck.md')).toBe(0);
+  expect(await readGitHoldRetryPaths(engine, s.id, await s.incarnation())).toEqual([]);
+  expect(await s.failedRequests()).toHaveLength(1);
+  expect(await s.ledger()).toEqual([]);
+  expect(await s.sync()).toMatchObject({ status: 'up_to_date' });
+}), 240_000);
+
+test('retry-held while the stall persists: the file is re-held once under the new receipt, counted once, with one hold row', () => each(async engine => {
+  const s = await source(engine, { 'notes/a.md': note('A'), 'notes/stuck.md': note('Stuck') });
+  stallPaths(engine, s.id, new Set(['notes/stuck.md']));
+  expect(await s.sync()).toMatchObject({ status: 'first_sync', added: 1, held_count: 1 });
+  const [first] = await s.failedRequests();
+  await retryHeld(engine, s.id);
+  const rescreened = await s.sync();
+  expect(rescreened).toMatchObject({ status: 'synced', added: 0, held_count: 1, holds_outstanding: 1 });
+  const failed = await s.failedRequests();
+  expect(failed).toHaveLength(2);
+  expect(failed.map(row => row.error_code)).toEqual(['preparation_stalled', 'preparation_stalled']);
+  const holds = await s.holds();
+  expect(holds).toHaveLength(1);
+  expect(holds[0]).toMatchObject({ path: 'notes/stuck.md', code: 'preparation_stalled', meta: { stall: { request_id: failed[1]!.request_id } } });
+  expect(holds[0]!.meta.stall!.request_id).not.toBe(first!.request_id);
+  expect(await s.summary()).toMatchObject({ count: 1, stalled: 1 });
+  expect(await readGitHoldRetryPaths(engine, s.id, await s.incarnation())).toEqual([]);
+  expect(await engine.getPage('notes/stuck', { sourceId: s.id })).toBeNull();
+  // It waits again: no third receipt without another retry.
+  expect(await s.sync()).toMatchObject({ status: 'up_to_date', holds_outstanding: 1 });
+  expect(await s.failedRequests()).toHaveLength(2);
+}), 180_000);
+
+test('a scheduled re-screen survives a run killed before it reached the file; a run killed after freezing it carries it in its manifest and leaves no stale schedule', () => each(async engine => {
+  const s = await source(engine, { 'notes/a.md': note('A'), 'notes/stuck.md': note('Stuck') });
+  stallPaths(engine, s.id, new Set(['notes/stuck.md']));
+  expect(await s.sync()).toMatchObject({ status: 'first_sync', held_count: 1 });
+  installFaultHook(undefined);
+  await retryHeld(engine, s.id);
+  const incarnation = await s.incarnation();
+  // Killed before discovery: the schedule is untouched.
+  const aborted = new AbortController(); aborted.abort();
+  expect((await s.sync({ signal: aborted.signal })).status).toBe('partial');
+  expect(await readGitHoldRetryPaths(engine, s.id, incarnation)).toEqual(['notes/stuck.md']);
+  // Killed right after the fresh cursor is saved: the manifest carries the entry and the schedule was consumed with the same save.
+  let killed = 0;
+  installFaultHook(async (point, detail) => { if (point === 'sync:mid_checkpoint' && detail.sourceId === s.id && killed++ === 0) throw new Error('injected kill after the cursor save'); });
+  await expect(s.sync()).rejects.toThrow('injected kill');
+  installFaultHook(undefined);
+  expect(killed).toBe(1);
+  const [cursor] = await engine.executeRaw<{ c: { entries?: Array<{ path: string }>; total: number; index: number } }>(
+    "SELECT completed_keys->0 AS c FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [s.id]);
+  expect(cursor!.c).toMatchObject({ total: 1, index: 0 });
+  expect(await readGitHoldRetryPaths(engine, s.id, incarnation)).toEqual([]);
+  // The next run resumes that cursor and imports the file; nothing is left scheduled, so the run after it has nothing to do.
+  expect(await s.sync()).toMatchObject({ status: 'synced', added: 1 });
+  expect(await engine.getPage('notes/stuck', { sourceId: s.id })).not.toBeNull();
+  expect(await s.holds()).toEqual([]);
+  expect(await readGitHoldRetryPaths(engine, s.id, incarnation)).toEqual([]);
+  expect(await s.sync()).toMatchObject({ status: 'up_to_date' });
+}), 180_000);
+
 // ── #6278 (B2): the systemic breaker ──
 
 test('breaker: five consecutive stalled entries with no commit between stop the run with one systemic diagnostic; the next run re-freezes and re-screens instead of holding', () => each(async engine => {
@@ -325,10 +420,11 @@ test('breaker: five consecutive stalled entries with no commit between stop the 
     "SELECT completed_keys->0 AS c FROM op_checkpoints WHERE op='managed-sync' AND completed_keys->0->>'sourceId'=$1", [s.id]);
   expect(cursor!.c).toMatchObject({ index: 4, pending: { intent: { path: 'notes/s4.md' } }, breaker: { streak: 5, tripped: { rule: 'consecutive' } } });
   expect(cursor!.c.breaker.stalled).toHaveLength(5);
-  // Cause fixed: the next run re-freezes the stopped entry under a fresh request (nothing held), finishes, and scheduled the run's four stalled holds for a re-screen.
+  // Cause fixed: the next run re-freezes the stopped entry under a fresh request (nothing held), finishes, and scheduled the run's four stalled holds
+  // for a re-screen. B7: that schedule is the same catch-up's work, so the pass yields (`writer_yield`) for the drain's next pass to discover and take it.
   installFaultHook(undefined);
   const resumed = await s.sync();
-  expect(resumed).toMatchObject({ status: 'first_sync', added: 3 });
+  expect(resumed).toMatchObject({ status: 'partial', reason: 'writer_yield', added: 3, managedCursor: { index: 7, total: 7 } });
   expect(resumed.converted_from_failed).toEqual([...cursor!.c.breaker.stalled]);
   expect(await s.failedRequests()).toHaveLength(5);
   expect(await engine.getPage('notes/s4', { sourceId: s.id })).not.toBeNull();

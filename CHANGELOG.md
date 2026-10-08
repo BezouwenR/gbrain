@@ -79,7 +79,8 @@ gbrain doctor --only fence_integrity --json                # legacy fact rows th
 | `gbrain sync` | The file is held as `preparation_stalled` (a held deletion keeps its page), the rest of the source imports and the checkpoint advances. Nothing repairs it: `gbrain sources status`, `retry-held` and doctor `git_held_files` point at writer status, then `retry-held` and the same sync. A stalled hold re-screens by itself when gbrain is upgraded. |
 | A run that stalls many files | More than `sync.hold_escalate_count` / `sync.hold_escalate_pct` of the screened imports, or five in a row with no page committed between them, stops the run `blocked` / `preparation_systemic` (exit 1) with the last step, not a pile of holds. The next run re-freezes the stopped file and re-screens the files that run held. |
 | `writer status` and doctor `persistence_write_stall` | A running write shows its `step`, how long it has been there, what it waits on (`git`, `fs`, `db`, `pool`, or `unknown` when nothing observed it) and the owner process (kind, pid, gbrain version). Past its budget, `claim.stall` reads `preparation_overdue`. |
-| The sync's progress line | `stalled <N>s on <step>` instead of an ETA that assumes nothing is stuck. `drain_stalled` now fires on a claim that is only being renewed (it never could before), allowing a live preparation its budget plus 30 s. |
+| The sync's progress line | `stalled <N>s on <step>` instead of an ETA that assumes nothing is stuck. `drain_stalled` now fires on a claim that is only being renewed (it never could before), allowing a live preparation its budget plus 30 s. While another writer's requests fill the write cap it prints `waiting for write capacity (N outstanding of M)`, and after 30 s the run stops `blocked` / `write_capacity` with `next` instead of dying with `queue_capacity`. |
+| `gbrain sources retry-held` with a backlog | The printed sync finishes the backlog and re-screens the scheduled files in the same run, so one command clears a `preparation_stalled` hold. |
 | A preparation that ignores cancellation | The owner frees the root at `persistence.preparation_ceiling_ms` (600 s), and the request's next claim finishes it `preparation_stalled`. An owner that holds one such stuck preparation stops claiming and logs `restart_required`. A sync whose own process still holds a preparation past its budget plus 30 s exits `resumable` / `preparation_abandoned` (exit 0, safe to rerun), which also ends the stuck work. |
 | A preparation read blocked on a table lock | Through a transaction-mode pooler (Supavisor, PgBouncer), gbrain's `statement_timeout` never reached the server, so a read waiting on an exclusive lock on `pages` (an index build, a migration, `VACUUM FULL`) waited forever while the claim kept renewing. Preparation reads now run with a transaction-local `statement_timeout` equal to the remaining budget, so the server ends the wait at the budget and the member is released `preparation_deadline` with nothing left running. Doctor's new `persistence_session_timeouts` check reports a pooler that drops the session timeout. |
 | Fact-fence adoption | A legacy fact with surrounding whitespace or CRLF line endings adopts under its own id, and `facts.fact` takes the trimmed, LF text the fence holds. A fact the fence would change further (whitespace-only, `~~x~~`, a literal `<br>`), or one the page already carries, stays as it is, active and searchable, and shows as `FACTS_FENCE_FAILED: <slug> (fence_unrenderable: ...)` and in doctor `fence_integrity`. |
@@ -92,7 +93,7 @@ gbrain doctor --only fence_integrity --json                # legacy fact rows th
 - **A held file stays out of the index** until `gbrain sources retry-held <id>` and the same sync import it. That's deliberate: the file is fine, the owner stalled.
 - **This bounds and names a stuck write; it doesn't claim to remove what hung it.** If it recurs, writer status and the hold carry the step and the wait cause.
 - **Adoption writes normalized text back into `facts.fact`.** It's a data change: ids, vectors and provenance stay, trailing whitespace and CR characters go.
-- **Reads that bypass `executeRaw`** (`readPageSnapshot`, the import pipeline's own statements) are not bounded yet; a lock arriving on one of those still waits for the lock or the ceiling.
+- **Reads that bypass `executeRaw`** (`readPageSnapshot`, the import pipeline's own statements, the group-memoized origin read) are not bounded yet; under a `pages` lock they keep their connections until the lock drops or the ceiling, so the head member reaches its hold at two budgets while the rest of the group waits for the lock (#6318).
 - **Not fixed here:** `fence_repair` and chronicle refusing with `owner_unavailable` while a sync runs (the third problem in #6278) is a separate change. `persistence.max_claim_ms` keeps its meaning as doctor's warning threshold, and a stuck publication still has detection only (TODOS.md).
 
 ### Itemized changes
@@ -103,13 +104,15 @@ gbrain doctor --only fence_integrity --json                # legacy fact rows th
 - Writer status and doctor: blockers carry `operation`, `intent_kind`, `preparation_attempts`, the claim's step, `waiting_on`, `budget_ms`, owner and `claim.stall`; the result carries `preparation_policy`. `preparation_deadline` and `preparation_stalled` have next actions. `preparation_stalled` and `fence_unrenderable` are registered codes (`gbrain errors <code>`), and `docs/guides/write-refusals.md` is one reference for both.
 - Sync holds: a `managed_sync_import` or `managed_sync_delete` member finished `preparation_stalled` is held (import by its bytes, delete as a delete hold, rename with its endpoints) in the run and at the next run's start. Both hold paths now write behind a narrowed gate: the failed entry's admitted suffix is cancelled first, then the hold waits only for requests naming that entry's page (slug, page id, path, origin, rename endpoints), where it used to wait for every unfinished request on the source, so a stuck write or a stream of maintenance writes no longer keeps every fence hold pending. The waiver and origin-equivalence preparations that run on the feeder race the same sync budget and fail open.
 - Drain: the no-progress detector keys on state, blocked reason and the head claim's phase and step, not on lease columns every renewal bumps; `preparation_abandoned` and `preparation_systemic` join the stop reasons with their `next` commands and docs. `gbrain sources retry-held` and every hold fix print the sync with the run's own options (`managedSyncResumeArgs`).
+- `sources retry-held` against a backlog: the printed sync used to finish the unfinished cursor and report `synced` with the scheduled re-screens untouched (only a fresh discovery reads the schedule), so a `preparation_stalled` hold survived the documented route. A pass that finishes its cursor while re-screens are scheduled now yields (`writer_yield`) and the drain's next pass discovers and takes them, so one run of the printed command clears the hold; the drain report sums the runs it finished. Discovery consumes the schedule in the same transaction as the fresh cursor save (a kill between them can neither lose it nor leave a stale copy) and consumes every scheduled path, including ones already in the manifest or no longer eligible.
+- A sync admission refused for write capacity (`queue_capacity`: other writers' requests, such as a fact-adoption queue on the same `local_cli` principal, hold `persistence.limits.principal_outstanding`) no longer escapes the drain as an uncaught exit with no summary and a failure-ledger row naming `--retry-failed`. The drain retries with backoff, prints `waiting for write capacity (N outstanding of M)`, and past its 30 s no-progress window ends `blocked` / `write_capacity` (new stop reason; `drain.capacity` carries the counts) with `next` pointing at writer status. The refusal's `detail` carries `outstanding=N limit=M`; cumulative caps are unchanged.
 - Facts: `planUnfencedFacts` uses the fence codec as its oracle (`adoptableClaim`), writes the parsed text back with the row number on the managed and unmanaged paths, and records rows it leaves alone as typed `UnadoptableFactRecord`s (never the claim text). `prepareFactFenceAdoption` refuses a planning mismatch with the registered `fence_unrenderable`. `submitMaintenance` scans every content-carrying intent with the canonical projection's fence check. `extract_facts` skips only the pages that still hold unadopted rows; doctor `fence_integrity` counts `unrenderable_legacy_facts` with `next: report`.
 - Bounded reads: `executeRaw(sql, params, { timeoutMs })` on Postgres pipelines `BEGIN; SET LOCAL statement_timeout; <statement>; COMMIT` as one round trip (`postgres-engine/bounded-statement.ts`); `boundedReads(engine, clock)` (`persistence/bounded-reads.ts`) gives every preparer's unmemoized raw read the remaining budget and the claim's signal, and a `57014`/`55P03` from such a read is the deadline (charged release, `preparation_stalled` at the limit), never `storage_error`. New doctor wave check `persistence_session_timeouts` (`session_timeouts_not_applied`).
 - Docs: write-refusals (`preparation_stalled`, `fence_unrenderable`, drain stops), live-sync timing knobs, the troubleshooting runbook "catch-up stuck / held N files" and symptom row, the repair guide's preparation route, `docs/ENGINES.md` log reasons, `AGENTS.md`, and KEY_FILES entries.
 
 Fixes #6278.
 
-## To take advantage of v0.60.109.0
+## To take advantage of v0.60.112.0
 
 `gbrain upgrade` applies migration v220 (one added column). Restart every long-running owner on the new version, then check:
 
@@ -123,9 +126,9 @@ If a catch-up stops or files are held, follow [catch-up stuck](docs/guides/troub
 
 ## [0.60.111.0] - 2026-10-08
 
-**Managed Postgres sync catches up more than twice as fast, starts committing in about 20 seconds instead of 80, and a page you save during a catch-up no longer waits behind it.**
+**Managed Postgres sync catches up more than twice as fast, starts committing in about 18 seconds instead of 80, and a page you save during a catch-up no longer waits behind it.**
 
-When a git source falls behind on a managed brain whose database is far away (57 ms round trips in our test), `gbrain sync` used to spend most of its time with idle connections: one process prepared the next batch of pages one statement at a time while up to six publishers waited. A 10,000-page backlog took about 75 minutes, the first page landed after about 80 seconds, and a `put_page` from your agent took 9 to 12 seconds even when nothing else was running. Now batches are prepared in bulk, publishers stay busy, a single page write takes about 2.5 seconds, and a foreground write goes ahead of queued sync batches that don't touch the same page.
+When a git source falls behind on a managed brain whose database is far away (57 ms round trips in our test), `gbrain sync` used to spend most of its time with idle connections: one process prepared the next batch of pages one statement at a time while up to six publishers waited. A 10,000-page backlog took about 75 minutes, the first page landed after about 80 seconds, and a `put_page` from your agent took 9 to 12 seconds even when nothing else was running. Now batches are prepared in bulk, publishers stay busy, a single page write takes about 2.5 seconds, and a foreground write publishes beside the running sync batches when it doesn't touch the same page.
 
 ### How to use it
 
@@ -142,18 +145,18 @@ Same 16-core machine and same Postgres, 57 ms round trips, default settings, mas
 
 | What you do | Before | Now |
 |---|---|---|
-| Catch up a 10,000-page backlog | 74.5 min | 33.5 min |
-| Pages per minute once the catch-up is running | 175 | 373 |
-| Time until the first page is committed | 79 s | 20 s |
-| Save one page with nothing else running (typical / slow) | 8.6 s / 11.6 s | 2.5 s / 2.8 s |
-| Save one page during a catch-up (typical / slow) | 11.3 s / 17.1 s | 6.9 s / 8.4 s |
-| Catch-up speed while your agent saves a page every 5 s | 4.6 pages/min | 58 pages/min |
-| Catch-up next to the database (about 0 ms) | 2,404 pages/min | 2,862 pages/min |
+| Catch up a 10,000-page backlog | 74.5 min | 33.6 min |
+| Pages per minute once the catch-up is running | 175 | 368 |
+| Time until the first page is committed | 79 s | 18 s |
+| Save one page with nothing else running (typical / slow) | 8.6 s / 11.6 s | 2.5 s / 2.7 s |
+| Save one page during a catch-up (typical / slow) | 11.3 s / 17.1 s | 3.1 s / 4.1 s |
+| Catch-up speed while your agent saves a page every 5 s | 0.4 pages/min, 115 of 120 saves failed | 174 pages/min, no saves failed |
+| Catch-up next to the database (about 0 ms) | 2,404 pages/min | 3,332 pages/min |
 
 ### Things to watch
 
 - **More publishers help up to a point.** With a 20-connection pool, 8 to 16 publishers all run at about 400 to 410 pages/min against 378 at the default 6. The drain prints a `[sync] lanes:` line saying what limited it (the pool, the server's free connections or your setting).
-- **Writes during a catch-up still cost something.** A page write waits for the sync batches already publishing, so during a catch-up it takes about 7 s, and a steady stream of writes slows the catch-up to about 15% of its idle speed.
+- **Writes during a catch-up still cost something.** A page save takes about 1.5 s longer at the slow end than with nothing running, and a save every 5 s slows the catch-up to about 45% of its idle speed. With a save every 5 s the slowest saves (p95) take about 22 s.
 - **Every new path has a switch** that accepts `0` or `false`: `persistence.single_write_group`, `persistence.preadmit_cache`, `sync.waive_batch`, `sync.foreground_priority` (environment: `GBRAIN_SINGLE_WRITE_GROUP`, `GBRAIN_PREADMIT_CACHE`, `GBRAIN_SYNC_WAIVE_BATCH`, `GBRAIN_SYNC_FOREGROUND_PRIORITY`). A running `serve` picks up a config change within 5 seconds.
 
 ### Itemized changes
@@ -162,7 +165,7 @@ Same 16-core machine and same Postgres, 57 ms round trips, default settings, mas
 - Lanes: up to 16 (`sync.lanes`, `--lanes`), clamped by the pool and the server's free connections; groups are sized by measured apply time inside a 5 s budget (2 s while foreground writes are recent), and the first group is one or two pages. Group publication pipelines the page apply.
 - Startup: runs of entries that need no write (already-deleted files, unchanged imports) are waived in one transaction instead of one each.
 - Single page writes publish as a group of one on a warm reserved connection, with a per-process cache of pre-admission reads that admission rechecks under lock, and the writer's own admission claims the request directly.
-- Foreground priority: a page write passes queued, unstarted sync groups that don't name its page (slug, page id or rename source); a sync group naming the page keeps its place; after each foreground commit the drain may start a group, so a stream of writes can't stall it. Every reader of request sequence order was audited for writes committed out of order; receipt health now judges a claimed write only against earlier started writes.
+- Foreground priority: a page write that names no queued or running sync group's page (slug, page id or rename source) publishes beside the running lane groups in the sync process; new lane groups wait only while such a write waits to be claimed, and background effects defer to lanes instead of interrupting them. A sync group naming the page keeps its place. Every reader of request sequence order was audited for writes committed out of order; receipt health now judges a claimed write only against earlier started writes.
 - Postgres: described parameter types are shared across a pool's connections (patched `postgres@3.4.9`, `GBRAIN_PG_TYPE_CACHE=0` turns it off); managed link extraction derives four pages at once with one config read per run.
 - A sync group member after an uncommitted member is cancelled, never published ahead of it (#6252).
 - Write receipts no longer call an ordinary publication in progress `blocked` / `recovery_required`: a request needs recovery only when it is recovering or holds a recovery record without a live claim, and the requests behind a live publication show as waiting (#6275).

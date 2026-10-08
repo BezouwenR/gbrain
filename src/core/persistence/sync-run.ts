@@ -10,7 +10,7 @@ import { throwIfAborted } from '../abort-check.ts';
 import { digest, sha256 } from './digest.ts';
 import { getWriteRequest, admitWriteInTransaction, foregroundPriority, intentDigest, receiptFor } from './journal.ts';
 import { preparationConfigView } from './config-snapshot.ts';
-import { retryWriteAdmission } from './admission-retry.ts';
+import { isWriteCapacityWait, retryWriteAdmission } from './admission-retry.ts';
 import { assertPersistenceAccepting, awaitWrite, foregroundWriteCompletions, startPersistenceConsumer, type WriteWait } from './service.ts';
 import { assertSyncEntryOrigin, discoverManagedSync, resolveManagedSyncContext, readSyncContent, readSyncFile, syncGit, type SyncDiscovery } from './sync-discovery.ts';
 import { isImageFilePath } from '../sync.ts';
@@ -48,7 +48,7 @@ import { pipelined } from '../page-state/transactions.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { principalAttribution } from './attribution.ts';
 import { recordSyncRunTrend } from '../fence-repair/census-store.ts';
-import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, holdsEscalated, readGitSourceHolds, readSyncHoldPolicy, recordSyncConversion, recoveredReport, requestGitHoldRetry, writeGitHold, type FencesTally, type SyncHoldPolicy } from './sync-holds.ts';
+import { addFencesNormalized, addRecovered, buildHoldReport, clearGitHold, clearGitHoldRetryPaths, heldGitPaths, fencesNormalizedReport, holdsEscalated, readGitHoldRetryPaths, readGitSourceHolds, readSyncHoldPolicy, recordSyncConversion, recoveredReport, requestGitHoldRetry, writeGitHold, type FencesTally, type SyncHoldPolicy } from './sync-holds.ts';
 
 export interface ManagedSyncWriteDiagnostic {
   source_id: string;
@@ -206,7 +206,9 @@ async function writeCursor(tx: BrainEngine, key: string, before: Cursor | null, 
   if (before === null) {
     if (synchronous) await tx.executeRaw("SELECT set_config('synchronous_commit','on',true)");
     await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb) ON CONFLICT DO NOTHING`, [`${OP}-manifest`, next.runId, JSON.stringify(next.entries)]);
-    await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb) ON CONFLICT DO NOTHING`, [OP, key, JSON.stringify([header(next)])]);
+    const inserted = await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb) ON CONFLICT DO NOTHING RETURNING fingerprint`, [OP, key, JSON.stringify([header(next)])]);
+    // #6278 (B7): what rides a fresh cursor's save (the retry schedule it consumed) commits only with the insert that won.
+    if (inserted.length) await inTx?.(tx);
   } else {
     // #5984: the settings, the compare-and-swap and the manifest touch go out together; a won swap is the saved cursor.
     const [, saved] = await pipelined(tx, [
@@ -265,8 +267,10 @@ async function replaceCursor(engine: BrainEngine, key: string, before: CursorHea
       return current;
     }
     await tx.executeRaw(`INSERT INTO op_checkpoints(op,fingerprint,completed_keys) VALUES($1,$2,$3::text::jsonb)`, [`${OP}-manifest`, next.runId, JSON.stringify(next.entries)]);
-    await tx.executeRaw('UPDATE op_checkpoints SET completed_keys=$4::text::jsonb,updated_at=now() WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb',
+    const swapped = await tx.executeRaw('UPDATE op_checkpoints SET completed_keys=$4::text::jsonb,updated_at=now() WHERE op=$1 AND fingerprint=$2 AND completed_keys=$3::text::jsonb RETURNING fingerprint',
       [OP, key, JSON.stringify([before]), JSON.stringify([header(next)])]);
+    // #6278 (B7): the re-screens the replacing manifest took are consumed with the swap that records them.
+    if (swapped.length && next.retryTaken?.length) await clearGitHoldRetryPaths(tx, next.sourceId, next.incarnation, next.retryTaken);
     const current = (await readCursor(tx, key, next))!;
     assertActive();
     return current;
@@ -1038,6 +1042,20 @@ async function cursorMovedAdmission(engine: BrainEngine, key: string, admitting:
   throw error;
 }
 
+/**
+ * The result of a committed checkpoint. #6278 (B7): `sources retry-held` schedules re-screens that only discovery honours,
+ * and a cursor discovered before them (a backlog the retry was scheduled against, or a run the retry overlapped) never sees
+ * them, so the pass yields (`writer_yield`, as at a slice boundary) and the drain's next pass retires the finished cursor and
+ * discovers again, taking them; a single-pass caller re-enters the same way.
+ */
+async function finishCheckpoint(engine: BrainEngine, key: string, cursor: Cursor, company: boolean, assertActive: () => void): Promise<SyncResult> {
+  await clearManagedSyncFailureAfterSuccess(engine, key);
+  if (cursor.counts.added + cursor.counts.modified + cursor.counts.deleted > 0) await refreshProjectionStatistics(engine);
+  assertActive();
+  const scheduled = company ? [] : await readGitHoldRetryPaths(engine, cursor.sourceId, cursor.incarnation);
+  assertActive();
+  return scheduled.length ? result(cursor, 'partial', 'writer_yield') : result(cursor, cursor.from === null ? 'first_sync' : 'synced');
+}
 /** A finished cursor is deleted (compare-and-swap) before the next run discovers; returns whichever cursor replaced it. */
 async function retireCompletedCursor(engine: BrainEngine, key: string, completed: Cursor, assertActive: () => void): Promise<Cursor | null> {
   await engine.transaction(async tx => {
@@ -1206,8 +1224,9 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
       }
       if (company) await company.protect([{ op: OP, fingerprint: key, kind: 'managed_cursor' }, { op: `${OP}-manifest`, fingerprint: fresh.runId, kind: 'manifest' }]);
       assertActive();
-      cursor = await saveCursor(engine, key, null, fresh, false, assertActive);
-      if (fresh.retryTaken?.length) await clearGitHoldRetryPaths(engine, fresh.sourceId, fresh.incarnation, fresh.retryTaken);
+      // #6278 (B7): the re-screens this manifest took are consumed by the save that records them (a kill between the two loses nothing).
+      cursor = await saveCursor(engine, key, null, fresh, false, assertActive,
+        fresh.retryTaken?.length ? tx => clearGitHoldRetryPaths(tx, fresh.sourceId, fresh.incarnation, fresh.retryTaken!) : undefined);
     }
     assertActive();
     if (cursor.incarnation !== context.incarnation || cursor.binding.worktree_id !== context.binding.worktree_id ||
@@ -1340,10 +1359,7 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
         if (!cursor?.done) throw syncRunRefusal('storage_error', 'Committed sync checkpoint lost its cursor.',
           { sourceId: context.sourceId, processingOptions: pending.intent.processingOptions, syncOptions: pending.intent.syncOptions ?? syncOptions, repoPath: pending.intent.repoPath ?? frozenRun.repoPath },
           `The final checkpoint request ${pending.requestId} of this sync committed, but its cursor could not be read back to finish the run.`);
-        await clearManagedSyncFailureAfterSuccess(engine, key);
-        if (cursor.counts.added + cursor.counts.modified + cursor.counts.deleted > 0) await refreshProjectionStatistics(engine);
-        assertActive();
-        return withLinks(cursor, result(cursor, cursor.from === null ? 'first_sync' : 'synced'));
+        return withLinks(cursor, await finishCheckpoint(engine, key, cursor, !!company, assertActive));
       }
       // The frozen manifest is shared; only the cursor header changes per page.
       const next: Cursor = { ...cursor, ...committedBreaker(cursor), index: cursor.index + 1, counts: { ...cursor.counts }, progress: stampProgress(cursor.progress, cursor.index, cursor.index + 1, drainStartedAt) }; delete next.pending; delete next.group;
@@ -1374,8 +1390,9 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     }
     if (!opts.dryRun) {
       const code = error instanceof OperationError ? error.code : 'storage_error';
-      // A refresh fence is transient admission back-pressure, not a sync failure to record.
-      if (!['permission_denied', 'worktree_refreshing', 'refresh_recovery_required'].includes(code)) {
+      // A refresh fence, or an admission refused while other requests hold the writer's outstanding cap (#6278: the drain
+      // waits for them), is transient admission back-pressure, not a sync failure to record.
+      if (!['permission_denied', 'worktree_refreshing', 'refresh_recovery_required'].includes(code) && !isWriteCapacityWait(error)) {
         const [stored] = cursor ? [] : await engine.executeRaw<{ completed_keys: [CursorHeader] }>('SELECT completed_keys FROM op_checkpoints WHERE op=$1 AND fingerprint=$2', [OP, key]);
         const failedCursor = cursor ?? stored?.completed_keys?.[0];
         const { failure } = await recordManagedSyncFailure(engine, { source_id: context.sourceId, source_incarnation: context.incarnation, path: cursor?.entries[cursor.index]?.path ?? failedCursor?.pending?.intent.path ?? `<${phase}>`, code,

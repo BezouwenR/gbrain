@@ -28,7 +28,16 @@ sudo systemctl start docker
 
 step "bun ${BUN_VERSION}"
 if ! command -v bun >/dev/null || [ "$(bun --version)" != "$BUN_VERSION" ]; then
-  curl -fsSL https://bun.sh/install | BUN_INSTALL="$HOME/.bun" bash -s "bun-v${BUN_VERSION}" >/dev/null
+  # The pinned release zip, as scripts/ubicloud/setup-ci-vm.sh installs it: no script piped into a shell.
+  arch=x64
+  [ "$(uname -m)" = aarch64 ] && arch=aarch64
+  tmp=$(mktemp -d)
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 1 -o "$tmp/bun.zip" "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${arch}.zip"
+  python3 -m zipfile -e "$tmp/bun.zip" "$tmp"
+  mkdir -p "$HOME/.bun/bin"
+  install -m 755 "$tmp/bun-linux-${arch}/bun" "$HOME/.bun/bin/bun"
+  ln -sf bun "$HOME/.bun/bin/bunx"
+  rm -rf "$tmp"
 fi
 export PATH="$HOME/.bun/bin:$PATH"
 grep -q '.bun/bin' "$HOME/.bashrc" || echo 'export PATH="$HOME/.bun/bin:$PATH"' >> "$HOME/.bashrc"

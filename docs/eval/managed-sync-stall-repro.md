@@ -429,3 +429,136 @@ already running"); the bench records that in `adoption.jsonl` (`json_head`).
   these rates, so under the reporter's `timeout 3600` loop it is two passes
   by arithmetic, not by a stall; under the reporter's actual `timeout 14400`
   it would be one.
+
+### Phase 4.1b: lock scenario on a99c00565
+
+Same lock scenario (3,000-entry backlog, heavy adoption, pool 10, 57 ms,
+PgBouncer transaction mode, `LOCK TABLE pages IN ACCESS EXCLUSIVE MODE` held
+through the pooler 14:34:10-14:39:07 and 14:44:07-14:49:07, 15 s sampler)
+on `capy/6278-preparation-deadline` a99c00565: lane A9 (preparation reads
+under a transaction-local `statement_timeout` of the remaining budget), lane
+B6 (the `stalled <N>s on <step>` line reads the live head during a pass) and
+the drain's owner-pid fix. Captures under `stall-lock-b/`.
+
+- **Release at the budget: the head member, yes; the pool, no.** The
+  consumer logged `phase=preparation reason=deadline_exceeded` at the 120 s
+  mark and the progress line went `stalled 120s on import_content (waiting
+  on db)` → `stalled 7s on preparing` → `stalled 16s on origin_check (waiting
+  on db)`: the group head was released `preparation_deadline`, reclaimed
+  within about 10 s and charged (attempt 2). At 240 s (14:38:10) it was
+  finished `failed` / `preparation_stalled` at step `origin_check` (`waiting
+  on db`, `preparation_attempts: 2`), the hold for `companies/scale-0-3152.md`
+  was written with that step, and the 73 members behind it were cancelled
+  ("an earlier page of the same sync did not commit") to be re-frozen. Time
+  to hold: 240 s, inside budget × attempts + slack. The other members' release
+  statements queued behind the pool: a release `UPDATE` issued at 14:36:06
+  completed only at 14:39:07, when the lock dropped, and the four
+  `import_content` members and five unstamped followers stayed `running` for
+  the whole hold.
+- **Connections were not freed.** 9 of the sync's 10 pool connections sat in
+  `Lock` / `relation` for all 300 s of both episodes, exactly as on the
+  previous head. Every one of the nine is an autocommit statement outside
+  the bounded path (`xact_age` = `query_age`, no `BEGIN`): the import
+  pipeline's content-hash lookup (`SELECT id, slug FROM pages WHERE source_id
+  = $1 AND deleted_at IS NULL AND (content_hash = $2 OR …)`, four
+  connections), `readPageSnapshot` (`WITH chosen AS (SELECT p.* FROM pages
+  …)`), the `page_projections` join, and the group-memoized origin read
+  (`SELECT id,slug,source_path FROM pages WHERE source_id=$1 AND
+  source_path=ANY($2)`, three to four connections; `preparationReads` drops
+  the member's bound by design). The bound itself ran: the trace shows 2,035
+  `BEGIN; SET LOCAL statement_timeout = 116000-120000` transactions in the
+  pass, but no statement was ever ended by it (zero 57014 on a `pages` read)
+  because the statements that block under this lock are not the ones it
+  wraps. The reclaimed head member's own bounded `origin_check` read never
+  appears in `pg_stat_activity`: with nine connections pinned it waited for
+  a connection (`waiting_on: db` on the stamp) until the consumer's race
+  finished it at 240 s.
+- **Lock drop to first commit:** episode 1, 14:39:07 → about 14:41:15 (two
+  minutes: the cut group's 73 cancelled pages were re-frozen and re-admitted
+  before anything committed; previous head: 28 s, with no cut). Episode 2,
+  14:49:07 → 14:55:56, through the queued adoption writes (85) the lock had
+  stalled, the same flood as before. `preparation_abandoned`,
+  `ceiling_exceeded` and `restart_required`: none (correct, nothing reached
+  the ceiling). The adoption write the second lock caught went
+  `preparation_stalled` at `page_snapshot` after two cut-offs (14:48:19), as
+  on the previous head.
+- **The progress line prints.** 127 lines in the pass, with the step, the
+  wait cause and the allowance: `[sync] 165/3000 processed · stalled 120s on
+  import_content (waiting on db) · allowed 2m30s`, then `origin_check`,
+  `page_snapshot` in the second episode, and `stalled 306s on queued` once
+  nothing was running. Two things to know when reading it: while the head is
+  a fresh adoption write every few seconds (the flood after the lock) it
+  prints `stalled 2s on preparing` every 10 s for ten minutes, because the
+  number is the head claim's step age, not the time since the last committed
+  sync page (the `queued` form does show the queue age: `stalled 636s on
+  queued`); and after the head was reclaimed the line switched to the oldest
+  running member (`stalled 250s…300s on import_content`), which is the right
+  head but a different request from the one it had been naming.
+- **The run did not finish on its own.** Pass 1 ended after 1,501 s with
+  242 pages committed and `Error [queue_capacity]: Write capacity exhausted:
+  principal outstanding requests` (exit 1, no drain summary; the error names
+  `--retry-failed` as the fix), and pass 2 failed the same way six seconds
+  in. `persistence.limits.principal_outstanding` is 100 and the
+  `local_cli` principal (shared by the sync and the `dream` on the host)
+  held 89 queued adoption writes plus one running when the sync admitted its
+  next window. The same condition existed in the previous head's lock run
+  (99 queued + 1 running at 09:57:29) without killing the pass, so whether a
+  pass survives it depends on the window size against the remaining
+  capacity; none of the four earlier runs hit it. Ten minutes later, after
+  the adoption queue drained, the `retry-held` route (`gbrain sources
+  retry-held bench`, then the printed `gbrain sync --source bench --no-pull
+  --no-embed`, `--no-embed` carried this time from the stalled hold's
+  `sync_argv`) imported the rest: 2,755 entries in 1,006 s, `Managed sync
+  synced`, 2,979 of 3,000 committed = 3,000 − 20 fence holds − 1 stalled
+  hold. That last one is the open point: `companies/scale-0-3152.md` was
+  scheduled by `retry-held` (`retry_scheduled`) and the sync re-held it
+  ("21 file(s) held this run", `summary.stalled: 1`) with no lock present
+  and nothing else in the way, so the documented route did not re-import the
+  stalled file on this head.
+
+Against the previous head, then: the stall line and the step evidence are
+there, the single path and the group head reach `preparation_stalled` and a
+hold at 240 s, the 73-page group cut and re-freeze works, and
+`preparation_abandoned` correctly stays silent; what A9 was meant to buy, a
+member release that frees its connection while the lock is still held, did
+not happen because the reads that hold the connections under a `pages`
+lock are the import pipeline's, the snapshot's, the projection's and the
+group memo's, none of which runs through `executeRaw` with the bound. The
+pass's `queue_capacity` exit and the re-held stalled file are the two new
+findings.
+
+### Lane B7: the two 4.1b findings, traced on the local probes
+
+- **The stalled file was never re-screened, not re-held.** Only discovery
+  reads the `sources retry-held` schedule (`sync-discovery.ts`,
+  `readGitHoldRetryPaths`), and `retry-held` against an unfinished cursor
+  prints that cursor's resume command (`sources-retry-held.ts`,
+  `gitFollowUpSync`: the backlog's `resume_args`). The printed sync resumed
+  the pass-1 cursor, finished its 2,755 remaining entries and reported
+  `synced` with the cursor's cumulative `counts.held` (20 fence holds plus the
+  one stalled hold from pass 1: "21 file(s) held this run", `summary.stalled:
+  1`); the schedule stayed pending for a run nobody was told to start.
+  `convertBlockedCursor` took no part (the entry pass 1 died on was never
+  admitted, so its receipt does not exist), and a re-screened entry starts
+  with `preparation_attempts` 0. Fixed in `sync-run.ts`: a checkpoint that
+  commits while re-screens are scheduled returns `partial` / `writer_yield`,
+  so the drain's next pass retires the cursor and discovers again (taking
+  them); discovery consumes the schedule inside the fresh cursor's save.
+  Probe: `test/managed-sync-preparation-stalled-holds.test.ts` ("retry-held
+  against an unfinished cursor"), sliced pass → hold → `retry-held` → the
+  printed sync drained: one `drainManagedSync` call imports the file, clears
+  the hold, `summary.stalled: 0`, attempts 0.
+- **`queue_capacity` at admission was uncaught on the base branch too.** The
+  admission path (`admitGroup` / `admitWriteInTransaction`,
+  `admissionRoom`) is identical to `origin/capy/sync-feeder-fast-writes`; the
+  refusal escaped `groupStep` → `performManagedSync`'s catch (which recorded a
+  `managed-sync-failure` naming `--retry-failed`) → `runDrain`, whose
+  `transientDelay` does not know the code, so the CLI exited 1 with no drain
+  summary. Whether a pass survives the 99+1 condition depends only on the
+  group size against the room left, which is why the previous head's run
+  did not hit it. Fixed in `sync-drain.ts`: the refusal (now carrying
+  `outstanding=N limit=M` on `detail`) is retried with backoff, prints
+  `waiting for write capacity (N outstanding of M)`, ends `blocked` /
+  `write_capacity` with `next` after the no-progress window, and is left out
+  of the failure ledger. Probe: `test/sync-drain-write-capacity.test.ts`
+  (the sync writer's own outstanding counter set to the cap).
