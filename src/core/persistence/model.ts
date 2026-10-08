@@ -89,6 +89,8 @@ export interface WriteRequest {
   blocked_reason: string | null;
   compacted: boolean;
   publication_started: boolean;
+  /** #6278 (v221): preparations cut off by a deadline or an expired `preparing` claim; reset by a commit. Absent on rows read before the migration. */
+  preparation_attempts?: number;
   created_at: Date | string;
   updated_at: Date | string;
   completed_at: Date | string | null;
