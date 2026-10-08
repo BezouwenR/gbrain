@@ -1,5 +1,6 @@
 import { isEmbedSkipped } from '../embed-skip.ts';
 import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
+import { boundedReads } from './bounded-reads.ts';
 import { isQuarantined, quarantineOutcome } from '../quarantine.ts';
 import { existsSync, readFileSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
@@ -254,12 +255,16 @@ async function pageDatabaseOnlyPublication(engine: SqlEngine, row: WriteRequest,
  * `coordinated`: the caller publishes this mutation itself through the coordinator, whose
  * page guard and revision check on `row.slug` cover this import (the put_page apply diet).
  */
-/** `options.clock` (#6278): the claim's phase clock; each await boundary names its step through `enterClaimStep`. */
-export async function preparePageMutation(engine: BrainEngine, row: WriteRequest, _config: GBrainConfig,
+/**
+ * `options.clock` (#6278): the claim's phase clock; each await boundary names its step through `enterClaimStep`, and the
+ * preparation's raw reads run bounded by its remaining budget (`boundedReads`; a statement carrying the foreground `signal` keeps it).
+ */
+export async function preparePageMutation(unbounded: BrainEngine, row: WriteRequest, _config: GBrainConfig,
   preparedIntent?: { content: string; expectedRevision: string; tags?: string[] }, signal?: AbortSignal,
   options: { allowMissingFile?: boolean; coordinated?: boolean; clock?: ClaimPhaseClock } = {}): Promise<PreparedMutation> {
   signal?.throwIfAborted();
   const clock = options.clock;
+  const engine = boundedReads(unbounded, clock);
   enterClaimStep(clock, 'page_snapshot', undefined, 'db');
   if (!row.intent) throw pageRefusal('storage_error', 'A pending write lost its normalized intent.', row,
     `The request has no stored intent for ${row.slug} (its payload was compacted or never recorded), so it cannot be published and wrote nothing.`);

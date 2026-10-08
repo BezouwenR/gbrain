@@ -153,8 +153,11 @@ export function preparationReads(engine: BrainEngine): BrainEngine {
     return value;
   };
   return new Proxy(engine, { get(target, key) {
-    if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal }) =>
-      STABLE_IN_PREPARATION.has(flat(sql)) && !opts?.signal ? once(JSON.stringify([flat(sql), params ?? null]), () => target.executeRaw(sql, params, opts)) : target.executeRaw(sql, params, opts);
+    // A shared read takes no member's signal: a caller's own signal bypasses the memo, and (#6278) a bounded preparation read
+    // (`timeoutMs`, whose signal only covers its connection wait) is answered once with the member's bound and signal dropped.
+    if (key === 'executeRaw') return (sql: string, params?: unknown[], opts?: { signal?: AbortSignal; timeoutMs?: number }) =>
+      STABLE_IN_PREPARATION.has(flat(sql)) && (!opts?.signal || opts.timeoutMs !== undefined)
+        ? once(JSON.stringify([flat(sql), params ?? null]), () => target.executeRaw(sql, params)) : target.executeRaw(sql, params, opts);
     if (key === 'getConfig') return (name: string) => once(`config:${name}`, () => target.getConfig(name));
     if (key === 'getAllConfig') return () => once('config:*', () => target.getAllConfig()).then(all => ({ ...all }));
     const value = Reflect.get(target, key, target);
@@ -554,11 +557,12 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
         const wave = rows.slice(start, start + width);
         const now = Date.now();
         const cancels = wave.map(() => new AbortController());
-        wave.forEach((_row, offset) => { clocks[start + offset] = startClaimPhase(now, cancels[offset]!.signal); });
+        const budgets = wave.map(row => policy.deadlines ? preparationBudgetMs(row, policy, foregroundMs) : undefined);
+        wave.forEach((_row, offset) => { clocks[start + offset] = startClaimPhase(now, cancels[offset]!.signal, budgets[offset]); });
         if (policy.deadlines) await markDispatched(engine, wave.map((row, offset) => ({ row, stamp: stampOf(start + offset)! })));
         const wavePreps = wave.map((row, offset) => {
           const i = start + offset;
-          const budget = policy.deadlines ? preparationBudgetMs(row, policy, foregroundMs) : undefined;
+          const budget = budgets[offset];
           // The member's signal reaches its preparer through its clock (enterClaimStep), never as a blanket statement signal: see the memo rule.
           const prep = startPreparation(async signal => {
             signal.addEventListener('abort', () => cancels[offset]!.abort(signal.reason), { once: true });
@@ -580,6 +584,8 @@ export async function executeClaimedGroup(engine: BrainEngine, rows: WriteReques
             prepared[i] = 'deadline' in outcome ? { released: 'preparation_deadline' } : { ok: outcome.result };
           } catch (error) {
             const reason = preparationAbortReason(error, prep.signal);
+            // #6278: a bounded read the server ended inside the budget reports the deadline itself; it cuts the group like the timer would.
+            if (reason === 'preparation_deadline' && policy.deadlines) prep.expire();
             prepared[i] = reason === 'preparation_deadline' || reason === 'group_member_waiting' || reason === 'claim_lost' ? { released: reason } : { error };
           } finally { inFlight.delete(i); }
         }));

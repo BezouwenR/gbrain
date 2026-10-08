@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { ABANDONED_STOP_GRACE_MS, PersistenceConsumer } from '../src/core/persistence/consumer.ts';
+import { PreparationDeadlineError } from '../src/core/persistence/bounded-reads.ts';
 import { resetWriteSwitches } from '../src/core/persistence/switches.ts';
 import { admitWrite, getWriteRequestById, WRITE_PROGRESS_SQL } from '../src/core/persistence/journal.ts';
 import { cancelWriteRequest } from '../src/core/persistence/control.ts';
@@ -347,6 +348,39 @@ test('the release that brings the counter to the limit finishes the request fail
     expect(await engine.readPageSnapshot(row.slug, { sourceId: row.source_id })).toBeNull();
     await assertConservation(engine);
   } finally { await disposePersistenceConsumer(engine); await consumer.stop(); }
+}), 10_000);
+
+/**
+ * #6278 (plan item 1.4): a bounded read the server ended inside the budget (a session `lock_timeout` shorter than the budget)
+ * reports the deadline itself. Protects: the consumer handles it as the deadline, never as the preparer's own failure: the
+ * claim is released `preparation_deadline` and charged, the release that reaches the limit finishes the request
+ * `failed`/`preparation_stalled`, and no `storage_error` receipt is written. Fails when the catch path releases it uncharged
+ * (`consumer_stopping`) or writes a terminal receipt from the raw error.
+ */
+test('a server-reported deadline inside the budget is a charged preparation_deadline release, then preparation_stalled at the limit (#6278)', async () => withEnv(env, async () => {
+  const sources = await fixtures(engine, config);
+  const row = await admitWrite(engine, admission(config, sources[0], 'server-deadline/foreground', 'bounded body'));
+  let attempts = 0;
+  const second = Promise.withResolvers<void>();
+  const consumer = new PersistenceConsumer(engine, { engine: 'pglite' }, async (_e, _current, _c, _signal, clock) => {
+    if (++attempts === 2) await second.promise;
+    if (clock) clock.step = 'origin_check';
+    throw new PreparationDeadlineError('origin_check', '55P03', Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' }));
+  }, { hostId: config.hostId, pollMs: 20, preparationMs: 5_000, preparationBudgets: { maxAttempts: 2 }, onError: () => {} });
+  try {
+    consumer.start();
+    // The first attempt's release was charged (inside the budget, so only the error could have reported the deadline).
+    await waitFor(() => attempts === 2, { timeoutMs: 3_000 });
+    expect(await getWriteRequestById(engine, row.id)).toMatchObject({ state: 'running', preparation_attempts: 1 });
+    second.resolve();
+    const waited = await awaitWrite(engine, row, { engine: 'pglite' }, { waitMs: 5_000 });
+    expect(waited.kind).toBe('terminal');
+    expect(waited.row).toMatchObject({ state: 'failed', error_code: 'preparation_stalled', preparation_attempts: 2 });
+    expect(waited.row.error_message).toContain('step origin_check');
+    expect(attempts).toBe(2);
+    expect(await engine.readPageSnapshot(row.slug, { sourceId: row.source_id })).toBeNull();
+    await assertConservation(engine);
+  } finally { second.resolve(); await disposePersistenceConsumer(engine); await consumer.stop(); }
 }), 10_000);
 
 test('a stopping consumer gives abandoned preparations a bounded grace instead of waiting forever (#6278)', async () => withEnv(env, async () => {

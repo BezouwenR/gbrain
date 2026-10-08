@@ -702,9 +702,10 @@ export class PersistenceConsumer {
     // #6278: every kind has a budget with the switch on; off, only remember and intent-less put_page/edit_page (#5616) keep the 30 s one.
     const foregroundMs = this.opts.preparationMs ?? 30_000;
     const budget = policy.deadlines ? preparationBudgetMs(row, policy, foregroundMs) : preparationKind(row) === 'foreground' ? foregroundMs : undefined;
-    // #6278: the clock carries the preparation's cancellation for `enterClaimStep`; a query takes the signal only on the foreground path (as before).
+    // #6278: the clock carries the preparation's cancellation for `enterClaimStep` and, with the switch on, its deadline for the
+    // server-side bound on lock-prone reads (boundedReads); a query takes the signal only on the foreground path (as before).
     const cancel = new AbortController();
-    const clock = startClaimPhase(Date.now(), cancel.signal);
+    const clock = startClaimPhase(Date.now(), cancel.signal, policy.deadlines ? budget : undefined);
     // #6278: a request already at the attempt limit (a kill loop charged it at each reclaim) is finished without preparing again.
     if (policy.deadlines && (row.preparation_attempts ?? 0) >= policy.maxAttempts) {
       try {
@@ -730,6 +731,19 @@ export class PersistenceConsumer {
       this.leaseTiming(), () => prep.abort({ code: 'claim_lost' }));
     const releaseReason = () => !lease.held ? 'claim_lost' : observation.deadline_exceeded ? 'preparation_deadline' : 'consumer_stopping';
     const stallInfo = () => ({ step: clock.step, waiting_on: clock.waitingOn, limit: policy.maxAttempts });
+    // The budget passed (on the timer, or reported by a bounded read the server ended): the claim is released now, charged,
+    // whether or not the preparer settles; its late result never publishes (#6278).
+    const deadline = async (): Promise<boolean> => {
+      root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work));
+      if (!lease.held || this.stopping) { await releaseUnpublishedClaim(this.engine, row, releaseReason()); return false; }
+      if ((row.preparation_attempts ?? 0) + 1 >= policy.maxAttempts) {
+        const done = await finishPreparationStalled(this.engine, row, stallInfo(), true);
+        this.log('preparation', 'preparation_stalled', failureLogText(done));
+        return this.settled(done);
+      }
+      await releaseUnpublishedClaim(this.engine, row, 'preparation_deadline', { charge: true });
+      return false;
+    };
     try {
       // With the switch on the budget wins the race even against a preparer that ignores its signal; off, the preparer's own settlement decides.
       const raced = await lease.whileHeld(policy.deadlines ? prep.outcome : prep.work.then(result => ({ result })));
@@ -739,18 +753,7 @@ export class PersistenceConsumer {
         await releaseUnpublishedClaim(this.engine, row, 'claim_lost');
         return false;
       }
-      if ('deadline' in raced) {
-        // The claim is released now, charged, whether or not the preparer settles; its late result never publishes (#6278).
-        root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work));
-        if (!lease.held || this.stopping) { await releaseUnpublishedClaim(this.engine, row, releaseReason()); return false; }
-        if ((row.preparation_attempts ?? 0) + 1 >= policy.maxAttempts) {
-          const done = await finishPreparationStalled(this.engine, row, stallInfo(), true);
-          this.log('preparation', 'preparation_stalled', failureLogText(done));
-          return this.settled(done);
-        }
-        await releaseUnpublishedClaim(this.engine, row, 'preparation_deadline', { charge: true });
-        return false;
-      }
+      if ('deadline' in raced) return deadline();
       const prepared = raced.result;
       if (budget !== undefined && !prep.signal.aborted && prep.late()) prep.expire();
       if (!lease.held || this.stopping || prep.signal.aborted) {
@@ -768,6 +771,11 @@ export class PersistenceConsumer {
       return settled ? isTerminal(done) : this.settled(done);
     } catch (error) {
       if (preparationActive && budget !== undefined && prep.late()) observation.deadline_exceeded = true;
+      // #6278: a bounded read the server ended inside the budget (a shorter session lock_timeout) reports the deadline itself.
+      if (preparationActive && policy.deadlines && !prep.signal.aborted && preparationAbortReason(error, prep.signal) === 'preparation_deadline') {
+        prep.expire();
+        return deadline();
+      }
       // #6278: the preparer's rejection on our own abort (its reason, an AbortError, a cancelled statement) is a release, never a receipt.
       if (preparationActive && (prep.signal.aborted || observation.deadline_exceeded || preparationAbortReason(error, prep.signal))) {
         await releaseUnpublishedClaim(this.engine, row, releaseReason());

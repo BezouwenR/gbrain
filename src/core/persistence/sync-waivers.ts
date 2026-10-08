@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { prepareManagedSyncMutation, type SyncIntent } from './sync-prepare.ts';
+import { startClaimPhase } from './claim-phase.ts';
 import { inspectUnchanged, screeningRequest, type NoopKernelWaiver } from './noop-kernel.ts';
 import { validateSyncAuthority, type SyncAuthority } from './sync-authority.ts';
 import { readSyncFile } from './sync-discovery.ts';
@@ -239,7 +240,9 @@ export async function unchangedSyncImport(engine: BrainEngine, cursor: WaiverCur
     const snapshot = await engine.readPageSnapshot(pending.slug, { sourceId: cursor.sourceId, includeDeleted: true });
     const row = screeningRequest({ source_id: cursor.sourceId, source_incarnation: cursor.incarnation, slug: pending.slug, page_id: pending.pageId,
       worktree_id: cursor.binding.worktree_id, authority: cursor.authority.writer, intent, request_id: pending.requestId });
-    const prepared = await raceSyncBudget(prepareManagedSyncMutation(engine, row, config), await syncPreparationBudgetMs(engine), signal);
+    // #6278 (1.4): the clock carries the budget, so the preparation's lock-prone reads end on the server at it (boundedReads).
+    const budgetMs = await syncPreparationBudgetMs(engine);
+    const prepared = await raceSyncBudget(prepareManagedSyncMutation(engine, row, config, startClaimPhase(Date.now(), undefined, budgetMs)), budgetMs, signal);
     if (prepared.file || prepared.target === 'skill_bundle') return null;
     const file = { root: cursor.root, path: join(cursor.root, intent.path), content: intent.content };
     const inspected = await inspectUnchanged(engine, { prepared: { ...prepared, target: 'page', file }, snapshot, sourcePath: intent.sourcePath, databaseOnly: false,
