@@ -3,6 +3,7 @@ import type { ParsedPage } from '../import-file.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 import { writerLintForPutPage } from '../output/post-write.ts';
 import type { WriteRequest } from './model.ts';
+import type { TimelineRowsRemoved } from './canonical-projections.ts';
 import type { PageSnapshot } from '../page-state/types.ts';
 import { prepareFactsBackstop } from './effect-facts.ts';
 import { parseLineGrammar } from '../line-grammar.ts';
@@ -22,8 +23,13 @@ const LINE_GRAMMAR_FINDINGS_MAX = 5;
 async function similarPagesAdvisory(engine: BrainEngine, row: WriteRequest, page: ParsedPage): Promise<Record<string, unknown> | undefined> {
   if (!['put_page', 'capture'].includes(row.operation) || row.page_id != null || row.slug.startsWith('wiki/agents/')
     || page.frontmatter?.dream_generated === true || (page.type as string) === 'extract_receipt' || isQuarantined(page.frontmatter)) return undefined;
-  const found = await findSimilarPages(engine, { sourceId: row.source_id, slug: row.slug, title: page.title ?? '',
-    excludePrivate: row.authority.excludePrivate ?? row.authority.remote });
+  // #6276: off by default, so the default path sends no statement; on Postgres the check runs with JIT off (its
+  // correlated visibility subplans cross the JIT cost threshold on larger brains and compile on every call).
+  if (!/^(true|1|yes|on)$/i.test((await engine.getConfig('put_page.similar_pages').catch(() => null))?.trim() ?? '')) return undefined;
+  const input = { sourceId: row.source_id, slug: row.slug, title: page.title ?? '', excludePrivate: row.authority.excludePrivate ?? row.authority.remote };
+  const found = engine.kind === 'postgres'
+    ? await engine.transaction(async tx => { await tx.executeRaw('SET LOCAL jit = off'); return findSimilarPages(tx, input); })
+    : await findSimilarPages(engine, input);
   if (!found?.candidates.length) return undefined;
   const first = found.candidates[0];
   return {
@@ -69,6 +75,17 @@ async function lineGrammarAdvisory(engine: BrainEngine, row: WriteRequest, page:
 
 const LINT_MESSAGES: Record<string,string> = { citation:'Paragraph has no citation marker.',
   link:'A link target is unavailable.', 'back-link':'A reverse link is missing.', 'triple-hr':'An ambiguous timeline separator was found.' };
+
+/**
+ * #5969: the timeline rows this write deleted (rows whose bullets the new body dropped). Dates only:
+ * page-write receipts never carry stored text.
+ */
+export function timelineRowsRemovedAdvisory(row: WriteRequest, removed: TimelineRowsRemoved): Record<string, unknown> {
+  return { ...removed,
+    warning: `This write deleted ${removed.count} timeline row(s) of ${row.slug} dated ${removed.earliest}${removed.latest !== removed.earliest ? ` to ${removed.latest}` : ''}, because the content dropped their bullets.`,
+    fix: readFix(`Lists ${row.slug}'s recent versions, read-only. If the rows were removed by mistake, revert_version with the id of the version before this write restores them (as new rows).`,
+      { mcp: { tool: 'get_versions', arguments: { slug: row.slug, limit: 5, include_body: false } } }) };
+}
 
 export function remoteLinkHint(row: WriteRequest): Record<string, unknown> {
   return row.authority.remote && !row.authority.autoLinkTrusted ? { auto_links: { skipped: 'remote',

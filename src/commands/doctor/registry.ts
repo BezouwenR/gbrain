@@ -82,9 +82,12 @@ import { queueHealthEntry, indexAuditEntry, imageAssetsEntry } from './checks/qu
 import { globalMaintenanceTimeoutsEntry } from './checks/global-maintenance-timeouts.ts';
 import { legacyJobAuthorityEntry } from './checks/legacy-job-authority.ts';
 import { legacyTokenGrantsEntry } from './checks/legacy-token-grants.ts';
+import { grantNewOpsEntry } from './checks/grant-new-ops.ts';
 import { syncFreshnessEntry, searchModeEntry } from './checks/sync-search.ts';
+import { persistenceConsumersEntry } from './checks/persistence-consumers.ts';
 import { gitConvergenceEntry } from './checks/git-convergence.ts';
 import { retrievalFeedbackEntry } from './checks/retrieval-feedback.ts';
+import { transcriptSecretExposureEntry } from './checks/transcript-secrets.ts';
 import { autoChronicleEntry } from './checks/auto-chronicle.ts';
 import { factsDrainEntry } from './checks/facts-drain.ts';
 import { factTakeVectorsEntry } from './checks/vector-coverage.ts';
@@ -99,6 +102,7 @@ import { agentContractEntry } from './checks/agent-contract.ts';
 import { chatFallbackChainEntry } from './checks/chat-fallback.ts';
 import { behaviorChangesEntry } from './checks/behavior-changes.ts';
 import { fenceIntegrityEntry } from './checks/fence-integrity.ts';
+import { managedSyncMovementEntry } from './checks/managed-sync-movement.ts';
 import { STOP_DOCTOR, type DoctorContext, type DoctorEntry } from './context.ts';
 import type { Check } from '../doctor.ts';
 import { infoCheck } from './check-fix.ts';
@@ -159,6 +163,7 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   globalMaintenanceTimeoutsEntry,
   legacyJobAuthorityEntry,
   legacyTokenGrantsEntry,
+  grantNewOpsEntry,
   indexAuditEntry,
   imageAssetsEntry,
   syncFreshnessEntry,
@@ -171,8 +176,11 @@ export const DOCTOR_CHECK_REGISTRY: readonly DoctorEntry[] = [
   factTakeVectorsEntry,
   plannerStatsEntry,
   retrievalFeedbackEntry,
+  transcriptSecretExposureEntry,
   revisionBackfillEntry,
   coreMemoryEntry,
+  managedSyncMovementEntry,
+  persistenceConsumersEntry,
   fenceIntegrityEntry,
   searchModeEntry,
 ];

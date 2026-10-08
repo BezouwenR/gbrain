@@ -216,6 +216,13 @@ import { v212 } from './v212-decide-review-proposals.ts';
 import { v213 } from './v213-core-edit-notices.ts';
 import { v214 } from './v214-wanted-links.ts';
 import { v215 } from './v215-facts-attributed-to.ts';
+import { v216 } from './v216-chronicle-campaign-stamps.ts';
+import { v217 } from './v217-persistence-request-claim-phase.ts';
+import { v218 } from './v218-purge-legacy-worktree-manifest-files.ts';
+import { v219 } from './v219-pages-reconcile-name-indexes.ts';
+import { v220 } from './v220-persistence-request-preparation-attempts.ts';
+import { v221 } from './v221-chunk-embedding-pending-since.ts';
+import { v222 } from './v222-persistence-consumers.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -430,4 +437,11 @@ export const MIGRATIONS: Migration[] = [
   v213,
   v214,
   v215,
+  v216,
+  v217,
+  v218,
+  v219,
+  v220,
+  v221,
+  v222,
 ];
