@@ -291,7 +291,8 @@ export async function discoverManagedSync(engine: BrainEngine, opts: SyncOpts, c
         present = bytes !== null || changed;
         if (!changed) changed = bytes === null || sha256(bytes.toString('utf8')) !== hold!.upstream_version;
       } else if (!changed) {
-        changed = !blob || (hold!.meta.blob_oid ? blob.oid !== hold!.meta.blob_oid : sha256(contents.get(blob.oid) ?? '') !== hold!.upstream_version);
+        // #6278: a held deletion has no bytes to compare; the file reappearing is the change.
+        changed = hold!.meta.deleted ? !!blob : !blob || (hold!.meta.blob_oid ? blob.oid !== hold!.meta.blob_oid : sha256(contents.get(blob.oid) ?? '') !== hold!.upstream_version);
       }
       if (!changed) continue;
       if (retry.has(path)) retryTaken.push(path);
