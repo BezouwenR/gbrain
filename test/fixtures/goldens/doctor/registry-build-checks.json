@@ -707,6 +707,18 @@
       },
       {
         "category": "ops",
+        "name": "two_consumers_on_host"
+      },
+      {
+        "category": "ops",
+        "name": "consumers_without_heartbeat"
+      },
+      {
+        "category": "ops",
+        "name": "host_identity_mismatch"
+      },
+      {
+        "category": "ops",
         "name": "search_mode"
       },
       {

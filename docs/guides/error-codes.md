@@ -582,6 +582,14 @@ More: [docs/guides/write-refusals.md#concurrent_write](../../docs/guides/write-r
 
 More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-connect.md#troubleshooting)
 
+### consumers_without_heartbeat
+
+<a id="consumers_without_heartbeat"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A process holds live write claims on this host without a consumer heartbeat row. | Only a gbrain older than the heartbeat release, or a consumer whose renewals keep failing, claims without a row; the consumer election cannot see such a process, so a new process beside it starts a second full consumer. | Restart the named process on this gbrain version; its claims resume under the new owner. Run: gbrain sources writer status --json | agent | `gbrain doctor --json` | 1 | no |
+
 ### content_rejected
 
 <a id="content_rejected"></a>
@@ -1291,6 +1299,14 @@ More: [docs/guides/bootstrap.md#harness_hook_unowned](../../docs/guides/bootstra
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Held out required for bundled. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### host_identity_mismatch
+
+<a id="host_identity_mismatch"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A managed worktree on this filesystem belongs to another host.json identity. | Host identity is a file under GBRAIN_HOME; a process started with another HOME or GBRAIN_HOME (a job worker in a container, for example) mints a new identity, sees the binding as another host's, and every write it submits reports owner_unavailable while its maintenance never runs. Doctor names both files and the home each was minted under; nothing is re-identified. | Set GBRAIN_HOME on that process's supervisor to the owner's home (the parent of its .gbrain directory) and restart it; never delete or regenerate either host.json. Run: gbrain sources writer status --json | agent | `gbrain doctor --json` | 1 | no |
 
 ### idempotency_conflict
 
@@ -2553,6 +2569,14 @@ More: [docs/guides/data-ingestion.md#credential-redaction](../../docs/guides/dat
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The operation runs only from the trusted local CLI on the brain host; no MCP connection can call it. | Only the operator of the brain host can change what blocks this. | Ask the user to run the named gbrain command on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
+
+### two_consumers_on_host
+
+<a id="two_consumers_on_host"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Two resident processes on one host have each run a full persistence consumer for over 30 seconds. | One full consumer per host is a preference the consumer election keeps (persistence.single_consumer); two consumers on one host preceded every #6317 wedge, so a persistent overlap is reported from the heartbeat rows rather than bounded. | Stop one of the two (the sync CLI or jobs worker, never the serve), or let the shorter-lived one finish; a process started with --no-delegate or before the owner keeps its own consumer until it exits. Run: gbrain sources writer status --json | agent | `gbrain doctor --json` | 1 | no |
 
 ### unavailable
 

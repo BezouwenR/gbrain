@@ -60,7 +60,7 @@ function privateJson<T>(path: string, create: () => T): T {
  * reject any other version, so the version never changes); a file minted
  * before this release reads as `minted_under: null`, reported as unknown.
  */
-export interface HostIdentityMintedUnder { home: string | null; gbrain_home: string | null; hostname: string; machine_id: string | null }
+export interface HostIdentityMintedUnder extends Record<string, unknown> { home: string | null; gbrain_home: string | null; hostname: string; machine_id: string | null }
 export interface HostIdentityFile { version: number; id: string; minted_under?: HostIdentityMintedUnder }
 export interface LocalHostIdentity { id: string; path: string; persistence_home: string; minted_under: HostIdentityMintedUnder | null }
 const MACHINE_ID_FILES = ['/etc/machine-id', '/var/lib/dbus/machine-id'];

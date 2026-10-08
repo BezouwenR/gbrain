@@ -228,6 +228,8 @@ export async function runPersistenceAdministration(engine: BrainEngine, operatio
       host_id: existingLocalHostId(), local_host_id: existingLocalHostId(), bindings, admin_state: adminState,
       admin_lock: { locked: adminLock.locked, set_at: adminLock.set_at, host_id: adminLock.host_id }, blocking_effects: blockingEffects,
       writer_versions: writerVersions, onboarding, shared_skills: sharedSkills, ...(native ? { native_lock: native } : {}),
+      // #6317 (B3): every process holding a consumer on this host, from the heartbeat rows (kind, pid, nonce, mode, age, wedge report).
+      host: { host_id: existingLocalHostId(), ...await (await import('./consumer-diagnostics.ts')).hostConsumersReport(engine, existingLocalHostId()) },
       worktree_refreshes: await (await import('./worktree-refresh.ts')).activeWorktreeRefreshes(engine, params.source_id as string | undefined) };
   }
   if (operation === 'writer_claim') {

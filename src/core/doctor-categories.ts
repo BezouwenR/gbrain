@@ -249,6 +249,10 @@ export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'persistence_request_indexes',
   'persistence_write_stall',
   'persistence_session_timeouts',
+  // #6317: consumer heartbeat rows and host identity (doctor/checks/persistence-consumers.ts).
+  'two_consumers_on_host',
+  'consumers_without_heartbeat',
+  'host_identity_mismatch',
   'stale_embedding_effects',
   'vector_plan',
   'writer_version',
