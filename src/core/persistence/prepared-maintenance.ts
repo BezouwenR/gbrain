@@ -1,4 +1,5 @@
 import { realpathSync } from 'node:fs';
+import { enterClaimStep, type ClaimPhaseClock } from './claim-phase.ts';
 import { join } from 'node:path';
 import type { BrainEngine, FactRow } from '../engine.ts';
 import { loadConfig, type GBrainConfig } from '../config.ts';
@@ -266,7 +267,8 @@ export async function submitFactFenceAdoption(engine: BrainEngine, authority: Ma
   }
 }
 
-async function prepareFactFenceAdoption(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
+/** `clock` (#6278): the claim's phase clock; the adoption's await boundaries (read facts, parse, occupied rows, the page) name their step. */
+async function prepareFactFenceAdoption(engine: BrainEngine, row: WriteRequest, config: GBrainConfig, clock?: ClaimPhaseClock): Promise<PreparedMutation> {
   const p = row.intent!;
   const facts = p.facts as FactFenceAssignment[];
   if (p.source_incarnation !== row.source_incarnation) throw opError('source_changed', 'The fact adoption source changed.',
@@ -277,8 +279,11 @@ async function prepareFactFenceAdoption(engine: BrainEngine, row: WriteRequest, 
       `Fact-fence adoption request ${row.request_id} for ${row.slug} in ${row.source_id} was refused before publication; nothing changed. The plan itself is malformed, so report the request ID to the user rather than running the same backfill again.`,
       { fix: receiptFix(row) });
   }
+  enterClaimStep(clock, 'adoption_parse_fence');
   const fence = new Map(parseFactsFence(p.content as string).facts.map(f => [f.rowNum, f]));
+  // `lock` is the publication transaction's re-check: the claim's clock stamps only the preparation's reads.
   const check = async (db: BrainEngine, lock: boolean) => {
+    if (!lock) enterClaimStep(clock, 'adoption_read_facts', undefined, 'db');
     const current = await readFacts(db, row.source_id, facts.map(f => f.id), lock);
     for (const assignment of facts) {
       const fact = current.find(f => f.id === assignment.id);
@@ -295,6 +300,7 @@ async function prepareFactFenceAdoption(engine: BrainEngine, row: WriteRequest, 
           { fix: receiptFix(row) });
       }
     }
+    if (!lock) enterClaimStep(clock, 'adoption_occupied_rows', undefined, 'db');
     const occupied = await db.executeRaw(`SELECT id FROM facts WHERE source_id=$1 AND source_markdown_slug=$2
       AND row_num=ANY($3::integer[])${lock ? ' FOR UPDATE' : ''}`, [row.source_id, row.slug, facts.map(f => f.row_num)]);
     if (occupied.length) throw opError('revision_conflict', 'An adopted fence position is already owned by another fact.',
@@ -303,7 +309,7 @@ async function prepareFactFenceAdoption(engine: BrainEngine, row: WriteRequest, 
   };
   await check(engine, false);
   const prepared = await preparePageMutation(engine, { ...row, intent: { kind: 'managed_maintenance_page', content: p.content,
-    expected_revision: p.expected_revision } }, config);
+    expected_revision: p.expected_revision } }, config, undefined, undefined, { clock });
   return { ...prepared, validate: async tx => { await prepared.validate?.(tx); await check(tx, true); }, apply: async tx => {
     // Runs ahead of the page import and its canonical projection, so the
     // projection's expiry pass and insertFacts see the adopted positions.
@@ -335,14 +341,16 @@ export async function applyPreservingTakeResolutions(tx: BrainEngine, pageId: nu
   return outcome;
 }
 
-export async function prepareMaintenanceMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
+/** `clock` (#6278): the claim's phase clock, threaded to the page and adoption preparers' step boundaries. */
+export async function prepareMaintenanceMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig, clock?: ClaimPhaseClock): Promise<PreparedMutation> {
   if (row.authority.remote) throw trustedCliRequired('Remote maintenance publication is not supported.');
+  enterClaimStep(clock, 'maintenance_dispatch');
   if (row.intent?.kind === 'managed_maintenance_restore_extractor_facts') return (await import('../repair/extractor-facts.ts')).prepareExtractorFactsRestore(engine, row);
   if (row.intent?.kind === 'managed_maintenance_expire_captured_facts') return (await import('../repair/captured-facts.ts')).prepareCapturedFactsExpiry(engine, row);
   if (row.intent?.kind === 'managed_maintenance_timeline_extract') return (await import('../../commands/extract-timeline-db.ts')).prepareTimelineExtract(engine, row);
   if (row.intent?.kind === 'managed_maintenance_page') {
     const prepared = await preparePageMutation(engine, row.intent.expected_revision === null
-      ? { ...row, intent: { ...row.intent, expected_revision: undefined } } : row, config);
+      ? { ...row, intent: { ...row.intent, expected_revision: undefined } } : row, config, undefined, undefined, { clock });
     const projection = row.intent.event_projection as MaintenanceEventProjection | undefined;
     if (!projection) return prepared;
     // #5523: the event page and its depth-page timeline row commit together in
@@ -356,7 +364,7 @@ export async function prepareMaintenanceMutation(engine: BrainEngine, row: Write
       return { ...outcome, event_projected: projected };
     } };
   }
-  if (row.intent?.kind === 'managed_maintenance_adopt_fact_fence') return prepareFactFenceAdoption(engine, row, config);
+  if (row.intent?.kind === 'managed_maintenance_adopt_fact_fence') return prepareFactFenceAdoption(engine, row, config, clock);
   if (row.intent?.kind === 'managed_maintenance_phantom_merge') return (await import('../cycle/phantom-redirect-managed.ts')).preparePhantomMerge(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_phantom_delete') return (await import('../cycle/phantom-redirect-managed.ts')).preparePhantomDelete(engine, row, config);
   if (row.intent?.kind === 'managed_maintenance_chronicle_event' || row.intent?.kind === 'managed_maintenance_chronicle_retire') {

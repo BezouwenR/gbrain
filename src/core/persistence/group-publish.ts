@@ -145,7 +145,7 @@ const STABLE_IN_PREPARATION = new Set([
  * publication re-checks what it relies on under its locks. It lives only for
  * one group's preparation; a failed read is not kept.
  */
-function preparationReads(engine: BrainEngine): BrainEngine {
+export function preparationReads(engine: BrainEngine): BrainEngine {
   const reads = new Map<string, Promise<unknown>>();
   const once = <T>(id: string, read: () => Promise<T>): Promise<T> => {
     let value = reads.get(id) as Promise<T> | undefined;
