@@ -90,7 +90,30 @@ export const LANE_BUSY = Symbol('gbrain.laneBusy');
 
 /** `clock` (#6278): the claim's phase clock, for `enterClaimStep` at the preparer's await boundaries. */
 export type PrepareMutation = (engine: BrainEngine, row: WriteRequest, config: GBrainConfig, signal?: AbortSignal, clock?: ClaimPhaseClock) => Promise<PreparedMutation>;
-export class PersistenceConsumer {
+/** What `status()` always carries; the full consumer adds its sampled phases and preparations. */
+export interface ConsumerStatus extends Record<string, unknown> { accepting: boolean; active_preparations: number; active_worktrees: number; restart_required: boolean }
+/**
+ * #6317: the consumer's whole external surface, as `service.ts` and every
+ * `awaitWrite` caller use it. `PersistenceConsumer` is the full consumer;
+ * `WaiterOnlyConsumer` (consumer-election.ts) is the same surface for a
+ * process that defers to a live owner on its host and claims nothing.
+ */
+export interface PersistenceConsumerLike {
+  readonly engine: BrainEngine;
+  readonly config: GBrainConfig;
+  start(): void;
+  /** Mandatory barrier: engine.close must be sequenced AFTER this promise. */
+  stop(): Promise<void>;
+  wake(ownAdmission?: boolean): void;
+  /** One tick now (single-flight); tests drive the consumer with it. */
+  tick(afterProgress?: boolean): Promise<void>;
+  holds(id: string): boolean;
+  foregroundCompletions(worktreeId: string): number;
+  onLane<T>(run: (transaction: <R>(fn: (tx: BrainEngine) => Promise<R>) => Promise<R>) => Promise<T>): Promise<T | typeof LANE_BUSY>;
+  status(): ConsumerStatus;
+  restartRequired(): boolean;
+}
+export class PersistenceConsumer implements PersistenceConsumerLike {
   private stopping = false;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private tickPromise: Promise<void> | undefined;
@@ -109,8 +132,8 @@ export class PersistenceConsumer {
   private active = new Set<Promise<void>>();
   /** #5373: preparations and renewals that outlived their claim; stop() drains them before the engine closes. */
   private outlived = new Set<Promise<void>>();
-  /** #6278: preparations whose claim the budget (or a lost claim, with the switch on) released; stop() gives them ABANDONED_STOP_GRACE_MS. */
-  private abandoned = new Set<Promise<void>>();
+  /** #6278: preparations whose claim the budget (or a lost claim, with the switch on) released, by the claim start they block their root from; stop() gives them ABANDONED_STOP_GRACE_MS. */
+  private abandoned = new Map<Promise<void>, number>();
   /** #6278: abandoned preparations past the ceiling, by request row id. */
   private zombies = new Map<string, AbandonedPreparation>();
   private policy: EffectivePreparationPolicy = { ...DEFAULT_PREPARATION_POLICY, deadlines: true };
@@ -661,12 +684,23 @@ export class PersistenceConsumer {
    * grace); off, to `outlived` as before (stop() waits for it). The returned
    * promise never rejects.
    */
-  private keepAbandoned(work: Promise<unknown>): Promise<void> {
+  private keepAbandoned(work: Promise<unknown>, claimedAt = Date.now()): Promise<void> {
     if (!this.policy.deadlines) return this.keepUntilSettled(work);
     const settled = work.then(() => undefined, () => undefined);
-    this.abandoned.add(settled);
+    this.abandoned.set(settled, claimedAt);
     void settled.then(() => { this.abandoned.delete(settled); });
     return settled;
+  }
+  /**
+   * #6317: the age, from its claim start, of the oldest abandoned preparation still holding a root barrier (or a zombie past
+   * the ceiling); null when none. The heartbeat row carries it so a waiter-only consumer can see a wedged owner
+   * (a barrier older than `persistence.preparation_ceiling_ms`) that keeps renewing its heartbeat.
+   */
+  oldestRootBarrierAgeMs(now = Date.now()): number | null {
+    let oldest: number | undefined;
+    for (const claimedAt of this.abandoned.values()) if (oldest === undefined || claimedAt < oldest) oldest = claimedAt;
+    for (const zombie of this.zombies.values()) { const at = Date.parse(zombie.claimed_at); if (oldest === undefined || at < oldest) oldest = at; }
+    return oldest === undefined ? null : Math.max(0, now - oldest);
   }
   /**
    * #6278: the #5373 root barrier for an abandoned preparation, bounded by the
@@ -734,7 +768,7 @@ export class PersistenceConsumer {
     // The budget passed (on the timer, or reported by a bounded read the server ended): the claim is released now, charged,
     // whether or not the preparer settles; its late result never publishes (#6278).
     const deadline = async (): Promise<boolean> => {
-      root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work));
+      root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work, clock.claimedAt));
       if (!lease.held || this.stopping) { await releaseUnpublishedClaim(this.engine, row, releaseReason()); return false; }
       if ((row.preparation_attempts ?? 0) + 1 >= policy.maxAttempts) {
         const done = await finishPreparationStalled(this.engine, row, stallInfo(), true);
@@ -748,7 +782,7 @@ export class PersistenceConsumer {
       // With the switch on the budget wins the race even against a preparer that ignores its signal; off, the preparer's own settlement decides.
       const raced = await lease.whileHeld(policy.deadlines ? prep.outcome : prep.work.then(result => ({ result })));
       if (raced === CLAIM_LOST) {
-        root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work));
+        root.until = this.abandonedRootBlock(row, clock, this.keepAbandoned(prep.work, clock.claimedAt));
         await endLostLease(lease);
         await releaseUnpublishedClaim(this.engine, row, 'claim_lost');
         return false;
@@ -817,7 +851,7 @@ export class PersistenceConsumer {
         leftRunning: (work, blocksRoot, abandoned) => {
           if (!blocksRoot) { this.keepUntilSettled(work); return; }
           // #6278: an abandoned member blocks its root until it settles or the ceiling passes; several abandoned members all hold it.
-          const settled = this.keepAbandoned(work);
+          const settled = this.keepAbandoned(work, abandoned?.clock.claimedAt);
           const block = abandoned ? this.abandonedRootBlock(abandoned.row, abandoned.clock, settled) : settled;
           root.until = root.until ? Promise.all([root.until, block]).then(() => undefined) : block;
         },
@@ -843,7 +877,7 @@ export class PersistenceConsumer {
     // renewals and publications in `outlived` keep their bounded waits.
     if (this.abandoned.size) {
       let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([Promise.allSettled([...this.abandoned]), new Promise<void>(resolve => { timer = setTimeout(resolve, ABANDONED_STOP_GRACE_MS); })]);
+      await Promise.race([Promise.allSettled([...this.abandoned.keys()]), new Promise<void>(resolve => { timer = setTimeout(resolve, ABANDONED_STOP_GRACE_MS); })]);
       if (timer) clearTimeout(timer);
     }
     while (this.outlived.size) await Promise.all([...this.outlived]);

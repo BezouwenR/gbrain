@@ -31,6 +31,7 @@
  */
 import type { BrainEngine } from '../engine.ts';
 import { VERSION } from '../../version.ts';
+import { consumerIdentity, sameProcess } from './consumer-heartbeat.ts';
 
 export type ClaimPhaseName = 'preparing' | 'publishing';
 export const WAITING_ON = ['git', 'fs', 'db', 'pool', 'unknown'] as const;
@@ -58,8 +59,11 @@ export interface ClaimPhaseClock {
    */
   deadlineAt?: number;
 }
-/** The process that holds a claim, as the stamp records it. */
-export interface ClaimOwner { kind: string; pid: number; version: string }
+/**
+ * The process that holds a claim, as the stamp records it. #6317: `nonce` (random per process) and `pid_ns` (the pid
+ * namespace where readable) tell a reused pid or another container's pid from this process; an older owner stamps neither.
+ */
+export interface ClaimOwner { kind: string; pid: number; version: string; nonce?: string; pid_ns?: string | null }
 
 export function startClaimPhase(now = Date.now(), signal?: AbortSignal, budgetMs?: number): ClaimPhaseClock {
   return { phase: 'preparing', claimedAt: now, since: now, step: null, stepSince: now, waitingOn: 'unknown', ...(signal ? { signal } : {}),
@@ -89,11 +93,21 @@ export function enterClaimStep(clock: ClaimPhaseClock | undefined, step: string,
 
 const OWNER_COMMANDS = new Set(['sync', 'serve', 'jobs', 'autopilot', 'mcp', 'dream', 'cycle', 'sources', 'migrate-graduation', 'put', 'import']);
 let ownerOverride: ClaimOwner | undefined;
-/** The owning process for the stamp: the gbrain command this process runs (`cli` when none is recognisable), its pid and build. */
+/** The gbrain command this process runs (`cli` when none is recognisable). */
+export function claimOwnerKind(): string {
+  if (ownerOverride) return ownerOverride.kind;
+  const command = process.argv.slice(2).find(arg => !arg.startsWith('-'));
+  return command && OWNER_COMMANDS.has(command) ? command : 'cli';
+}
+/** The owning process for the stamp: the gbrain command this process runs (`cli` when none is recognisable), its pid, nonce, pid namespace and build. */
 export function claimOwner(): ClaimOwner {
   if (ownerOverride) return ownerOverride;
-  const command = process.argv.slice(2).find(arg => !arg.startsWith('-'));
-  return { kind: command && OWNER_COMMANDS.has(command) ? command : 'cli', pid: process.pid, version: VERSION };
+  const { pid, nonce, pid_ns } = consumerIdentity();
+  return { kind: claimOwnerKind(), pid, version: VERSION, nonce, pid_ns };
+}
+/** Whether a stamped owner is this process: the pid and, when the stamp carries one, the nonce (#6317: `owner_pid === process.pid` alone is not enough). */
+export function claimOwnerIsThisProcess(owner: Pick<ClaimOwner, 'pid' | 'nonce'> | null | undefined): boolean {
+  return sameProcess(owner);
 }
 /** Test seam. */
 export function setClaimOwnerForTest(owner: ClaimOwner | undefined): void { ownerOverride = owner; }
