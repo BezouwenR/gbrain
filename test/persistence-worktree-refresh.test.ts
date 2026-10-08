@@ -320,13 +320,16 @@ test('12. an unmanaged brain refuses refresh_not_managed naming gbrain sync, on 
 test('13. drain starvation: a writer every 50 ms is refused during draining and the refresh completes inside --wait-drain', () => each(async f => {
   const target = f.push('alpha/two.md', page('Alpha two', 'Upstream.'));
   await f.put(f.alpha, 'notes/seed', page('Seed', 'Has a git effect.'));
-  await requeueGitEffect(f, 1000);
+  // The git effect the refresh drains becomes runnable once the writer has been refused four times (not after a fixed
+  // delay), so the draining window always spans several writer attempts however slow one write is on the host.
+  const effect = await requeueGitEffect(f, 60_000);
   let stop = false;
   const outcomes: string[] = [];
   const writer = (async () => {
     while (!stop) {
       try { await f.put(f.alpha, `notes/w-${randomUUID().slice(0, 8)}`, page('W', 'steady traffic')); outcomes.push('accepted'); }
       catch (error) { outcomes.push((error as { code?: string }).code ?? 'error'); }
+      if (outcomes.filter(code => code === 'worktree_refreshing').length === 4) await f.engine.executeRaw('UPDATE persistence_effects SET next_attempt_at=now() WHERE id=$1', [effect]);
       await new Promise(resolve => setTimeout(resolve, 50));
     }
   })();
