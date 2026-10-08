@@ -8,6 +8,8 @@
  *     [--marker-pages 20] [--doomed-pages 12] [--drip-rows 20] [--backlog-marker-pages 20] [--rtt 57] [--pool-size 10] [--pooler pgbouncer|none]
  *     [--cli-repo <checkout>] [--max-minutes 90] [--passes 3] [--sample-seconds 30] [--adoption-interval 60]
  *     [--stall-minutes 5] [--stall-kill-minutes 15] [--stall-signal SIGUSR2] [--seed 1] [--label <name>] [--out <dir>] [--keep] [--inspect] [--inspect-port 6499]
+ *     [--chaos-at <minutes>] [--chaos-toxicity 0.3] [--chaos-kind timeout|reset|lock] [--chaos-stream downstream|upstream] [--chaos-for <seconds>]
+ *     [--chaos-lock 'LOCK TABLE pages IN ACCESS EXCLUSIVE MODE']
  *     [--pg-port 55432] [--proxy-port 55433] [--api-port 58474] [--pooler-port 55434]
  *
  * Topology: pgvector Postgres in Docker, a transaction-mode PgBouncer in front
@@ -103,6 +105,20 @@ const INSPECT = process.argv.includes('--inspect');
 const INSPECT_PORT = Number(flag('inspect-port', '6499'));
 /** `--stall-signal SIGUSR2`: sent to the sync process on every sample while it is stalled; with scripts/bench/stall-debug-instrument.py applied to the checkout under test, each signal dumps the in-flight preparations to the pass's stderr. Default: no signal. */
 const STALL_SIGNAL = flag('stall-signal', '');
+/**
+ * `--chaos-at <minutes>` (0 = off): that many minutes into pass 1, a toxiproxy toxic is added to the database proxy with
+ * `--chaos-toxicity` (probability per connection, existing ones included): `timeout` (default) is a black hole, responses on
+ * the affected connections never arrive and the connection stays open, as a pooler that silently drops a server-side
+ * session leaves a client; `reset` closes them with a TCP reset instead. `--chaos-for <seconds>` removes the toxic again
+ * after that long (0 = keep it for the rest of the run).
+ */
+const CHAOS_AT_MS = Number(flag('chaos-at', '0')) * 60_000;
+const CHAOS_TOXICITY = Number(flag('chaos-toxicity', '0.3'));
+const CHAOS_KIND = flag('chaos-kind', 'timeout');
+const CHAOS_FOR_MS = Number(flag('chaos-for', '0')) * 1000;
+const CHAOS_STREAM = flag('chaos-stream', 'downstream');
+/** `--chaos-kind lock`: instead of a toxic, one connection through the pooler opens a transaction, runs `--chaos-lock` and holds it (a leaked or pending table lock behind a pooler that dropped statement_timeout). */
+const CHAOS_LOCK = flag('chaos-lock', 'LOCK TABLE pages IN ACCESS EXCLUSIVE MODE');
 const LABEL = flag('label', `${gitDescribe(CLI_REPO)}-pool${POOL_SIZE}-${POOLER}`).replace(/[^\w.-]/g, '_');
 const OUT = resolve(flag('out', join(REPO, '.context', 'bench', `stall-repro-${LABEL}-${Date.now()}`)));
 if (POOLER !== 'pgbouncer' && POOLER !== 'none') { console.error(`--pooler takes pgbouncer or none; got ${POOLER}`); process.exit(2); }
@@ -457,6 +473,48 @@ async function adoptionLoop(row: Row, legacy: LegacyRow[], stop: () => boolean):
   }
 }
 
+/** Forced fault (see `--chaos-at`): a toxic on the database proxy, recorded in chaos.jsonl. */
+let chaosRow: Row | null = null;
+async function chaos(stop: () => boolean): Promise<void> {
+  if (CHAOS_AT_MS <= 0) return;
+  while (!stop() && !(state.pass && state.pass.pass === 1 && Date.now() - state.pass.startedAt >= CHAOS_AT_MS)) await Bun.sleep(1000);
+  if (stop()) return;
+  if (CHAOS_KIND === 'lock') {
+    const via = chaosRow!.poolerUrl ?? chaosRow!.proxyUrl;
+    const sql = postgres(via, { max: 1, onnotice: () => {}, prepare: false, connect_timeout: 20 });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const holder = sql.begin(async tx => {
+      await tx.unsafe(CHAOS_LOCK);
+      append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'lock_held', statement: CHAOS_LOCK, via: 'pooler', pass: state.pass?.pass ?? null, committed: state.committed });
+      log(`CHAOS: holding "${CHAOS_LOCK}" in an open transaction through the pooler${CHAOS_FOR_MS > 0 ? ` for ${CHAOS_FOR_MS / 1000} s` : ' for the rest of the run'}`);
+      await held;
+    }).catch(error => { append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'lock_error', error: String(error) }); log(`CHAOS: lock holder failed: ${error instanceof Error ? error.message : String(error)}`); });
+    const until = CHAOS_FOR_MS > 0 ? Date.now() + CHAOS_FOR_MS : Infinity;
+    while (!stop() && Date.now() < until) await Bun.sleep(1000);
+    release();
+    await holder;
+    await sql.end({ timeout: 5 }).catch(() => undefined);
+    append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'lock_released', committed: state.committed });
+    log('CHAOS: lock released');
+    return;
+  }
+  const api = `http://127.0.0.1:${flag('api-port', '58474')}/proxies/pg-${flag('proxy-port', '55433')}/toxics`;
+  const toxic = CHAOS_KIND === 'reset'
+    ? { name: 'chaos_reset', type: 'reset_peer', stream: CHAOS_STREAM, toxicity: CHAOS_TOXICITY, attributes: { timeout: 0 } }
+    : { name: 'chaos_blackhole', type: 'timeout', stream: CHAOS_STREAM, toxicity: CHAOS_TOXICITY, attributes: { timeout: 0 } };
+  const r = await fetch(api, { method: 'POST', body: JSON.stringify(toxic) });
+  const record = { t: Date.now(), at: new Date().toISOString(), action: 'add', toxic, ok: r.ok, response: (await r.text()).slice(0, 400), pass: state.pass?.pass ?? null, committed: state.committed };
+  append('chaos.jsonl', record);
+  log(`CHAOS: ${toxic.type} toxic added (toxicity ${CHAOS_TOXICITY}, ${CHAOS_STREAM}) ok=${r.ok}: ${record.response.slice(0, 200)}`);
+  if (CHAOS_FOR_MS <= 0) return;
+  const until = Date.now() + CHAOS_FOR_MS;
+  while (!stop() && Date.now() < until) await Bun.sleep(1000);
+  const d = await fetch(`${api}/${toxic.name}`, { method: 'DELETE' });
+  append('chaos.jsonl', { t: Date.now(), at: new Date().toISOString(), action: 'remove', name: toxic.name, ok: d.ok, committed: state.committed });
+  log(`CHAOS: toxic removed ok=${d.ok}`);
+}
+
 async function committedCount(row: Row): Promise<number> {
   return admin(row.directUrl, async sql => Number((await sql.unsafe(SAMPLE_SQL.committedSync))[0]!.n));
 }
@@ -533,7 +591,8 @@ try {
   log(`session timeouts: ${JSON.stringify(report.session_timeouts)}`);
   save();
   const stop = () => stopped;
-  const background = Promise.allSettled([sampler(row, stop), adoptionLoop(row, built.legacy, stop)]);
+  chaosRow = row;
+  const background = Promise.allSettled([sampler(row, stop), adoptionLoop(row, built.legacy, stop), chaos(stop)]);
   const passes: SyncPass[] = [];
   const started = Date.now();
   for (let pass = 1; pass <= PASSES && Date.now() - started < MAX_MS; pass++) {
@@ -556,7 +615,9 @@ try {
       CASE WHEN error_message ~ 'repeated_marker' THEN 'repeated_marker' WHEN error_message ~ 'does not render its legacy fact' THEN 'adoption_roundtrip' ELSE left(error_message, 80) END AS error_class, count(*)::int AS n
     FROM persistence_requests WHERE state IN ('failed','conflict','cancelled') GROUP BY 1,2,3,4,5 ORDER BY n DESC`));
   const adoption = existsSync(join(OUT, 'adoption.jsonl')) ? readFileSync(join(OUT, 'adoption.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
-  report.result = { committed_sync_requests: state.committed, backlog_entries: backlogPages.length, states: final.states, stalls: state.stalls,
+  const chaosEvents = existsSync(join(OUT, 'chaos.jsonl')) ? readFileSync(join(OUT, 'chaos.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
+  const stallDebug = existsSync(join(OUT, 'stall-debug.jsonl')) ? readFileSync(join(OUT, 'stall-debug.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l)) : [];
+  report.result = { committed_sync_requests: state.committed, chaos: chaosEvents, stall_debug_last: stallDebug.at(-1) ?? null, backlog_entries: backlogPages.length, states: final.states, stalls: state.stalls,
     failed_receipts_by_kind_and_error: failedAll, failed_receipts_recent: failed, holds: final.holds, samples: state.samples,
     adoption_runs: adoption.length, adoption_summary: adoption.map((a: Record<string, unknown>) => ({ i: a.i, status: a.status, dripped: a.dripped, fenced: a.unfenced_rows_fenced, pending: a.legacy_rows_pending, fence_failed: a.fence_failed, code: a.code })),
     legacy_pending_at_end: await admin(row.directUrl, async sql => Number((await sql.unsafe(`SELECT count(*)::int AS n FROM facts WHERE source_id=$1 AND row_num IS NULL AND expired_at IS NULL`, [SOURCE]))[0]!.n)) };
