@@ -582,6 +582,16 @@ More: [docs/guides/write-refusals.md#concurrent_write](../../docs/guides/write-r
 
 More: [docs/guides/google-connect.md#troubleshooting](../../docs/guides/google-connect.md#troubleshooting)
 
+### consumers_without_heartbeat
+
+<a id="consumers_without_heartbeat"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Running write claims on this host are stamped by a process that writes no `persistence_consumers` heartbeat row, so its liveness and mode cannot be read. | Every full consumer on this release renews a heartbeat row every 10 s; a claim owner with no row is a gbrain process from before the heartbeat table (an older `serve`, jobs worker or sync CLI), which also never defers to the resident consumer, so the host may run two full consumers until it is upgraded. | Upgrade and restart the process whose pid the check names (its kind and gbrain version come from the claim stamp); until then the host runs its consumer beside the resident one. Run: gbrain sources writer status --json | agent | `gbrain doctor --only consumers_without_heartbeat --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#consumers-without-heartbeat](../../docs/guides/troubleshooting.md#consumers-without-heartbeat)
+
 ### content_rejected
 
 <a id="content_rejected"></a>
@@ -1303,6 +1313,16 @@ More: [docs/guides/bootstrap.md#harness_hook_unowned](../../docs/guides/bootstra
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | Held out required for bundled. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
+
+### host_identity_mismatch
+
+<a id="host_identity_mismatch"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| This process's `host.json` identity differs from the identity that owns the binding although both resolve on this machine, so writes that need the owner read it as another host. | Host identity is a file under the persistence home: a job worker or container launched with a different `HOME` or `GBRAIN_HOME` mints a new `host.json` and sees the binding as another host's (`owner_unavailable`, `host_mismatch`), so its maintenance writes never reach the owner. The check names both files and the environment each was minted under (`minted_under`, `unknown` for a file minted before it was recorded); re-deriving the identity would re-own every existing binding, so the fix is the environment, never the file. | Set GBRAIN_HOME on the supervisor of the process to the owner's home (the value the check prints; config appends .gbrain itself) and restart it; never edit or delete a host.json. Run: gbrain doctor --only host_identity_mismatch --json | host_admin | `gbrain doctor --only host_identity_mismatch --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#host-identity-mismatch](../../docs/guides/troubleshooting.md#host-identity-mismatch)
 
 ### idempotency_conflict
 
@@ -2587,6 +2607,16 @@ More: [docs/guides/data-ingestion.md#credential-redaction](../../docs/guides/dat
 | Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
 |---|---|---|---|---|---|---|
 | The operation runs only from the trusted local CLI on the brain host; no MCP connection can call it. | Only the operator of the brain host can change what blocks this. | Ask the user to run the named gbrain command on the brain host. | host_admin | `gbrain doctor --json` | 1 | no |
+
+### two_consumers_on_host
+
+<a id="two_consumers_on_host"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| Two resident gbrain processes on this host (`serve`, `sync`, `jobs`, `autopilot` or `mcp`) have each run a full persistence consumer for longer than 30 s, so both claim writes on the same roots. | One full consumer per host is a preference, not a fenced role: a `serve` always starts full, every other resident kind defers to the first live full consumer it finds in `persistence_consumers`, and two processes that start within one renewal of each other, or a CLI that took its consumer before the `serve` started, both stay full until one exits. Every observed `preparing` wedge had two consumers alive on the host. Short-lived commands (`put`, `import`, `dream`, `cli`) and rows younger than 30 s are listed, never warned. | Let the shorter-lived of the two finish (a sync CLI run ends on its own) or restart it so it defers; with persistence.single_consumer off, this is the configured behavior. Run: gbrain sources writer status --json | agent | `gbrain doctor --only two_consumers_on_host --json` | 1 | no |
+
+More: [docs/guides/troubleshooting.md#two-consumers-on-host](../../docs/guides/troubleshooting.md#two-consumers-on-host)
 
 ### unavailable
 
