@@ -27,6 +27,8 @@ beforeAll(async () => {
   if (!url) return;
   assertSafeE2eDatabaseUrl(url);
   admin = postgres(url, { max: 1, onnotice: () => {} });
+  // The pgvector case needs the extension; a fresh database (the stress gate makes one per iteration) has none yet.
+  await admin.unsafe('CREATE EXTENSION IF NOT EXISTS vector');
   await admin.unsafe(`CREATE TABLE ${table} (c int)`);
   await admin.unsafe(`INSERT INTO ${table} VALUES (1)`);
 });
