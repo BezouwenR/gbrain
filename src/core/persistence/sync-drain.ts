@@ -617,7 +617,11 @@ export interface DrainNext {
   rate_pages_per_min: number | null;
   why: string;
   docs?: string;
-  /** #6317: the stop's code and cause, and its agent-operator fix (`next: wait` while the ceiling is ahead, `tell_user_to_run` once it passed). */
+  /**
+   * #6317: the stop's code and cause, and its agent-operator fix: while the ceiling is ahead the agent reruns the same command after
+   * `retry_after_ms` (`next: run`, `safe_to_loop: true`; `wait` is reserved for provider-side work, agent-output.ts deriveNext);
+   * once it passed, `tell_user_to_run` names the owner process to restart.
+   */
   code?: string;
   cause?: DrainStall['cause'];
   fix?: RenderedAction;
@@ -675,8 +679,8 @@ export function drainNext(result: SyncResult, resumeCommand: string, sourceId: s
     const where = `${stall.step ? ` at step ${stall.step}` : ''}${stall.waiting_on && stall.waiting_on !== 'unknown' ? `, waiting on ${stall.waiting_on}` : ''}${stall.last_sql ? `, last statement ${stall.last_sql.label}` : ''}`;
     const ahead = !stall.past_ceiling && (d.retry_after_ms ?? 0) > 0;
     const action: Action = ahead
-      ? { argv: resumeCommand.split(' '), consent: [], actor: 'provider', requires_exclusive: false,
-        why: `The ${owner} on this host still renews the claim; its own budget frees the root at the ceiling in ${formatDuration(Math.ceil((d.retry_after_ms ?? 0) / 1000))}, after which the same command resumes and holds the entry if it stalls again.`,
+      ? { argv: resumeCommand.split(' '), consent: [], actor: 'agent', requires_exclusive: false,
+        why: `The ${owner} on this host still renews the claim; its own budget frees the root at the ceiling in ${formatDuration(Math.ceil((d.retry_after_ms ?? 0) / 1000))}. Rerun this after retry_after_ms (safe in a loop): it resumes the cursor and holds the entry if it stalls again.`,
         verify: { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'] } }
       : { argv: ['gbrain', 'sources', 'writer', 'status', '--source', sourceId, '--json'], consent: [], actor: 'host_admin', requires_exclusive: false,
         why: `The ${owner} on this host holds the claim past the ceiling${stall.owner_row?.restart_required ? ' and reports restart_required' : ''}; only restarting that process ends the preparation it is parked in. Status names the request, step and owner, read-only.`,
@@ -738,6 +742,8 @@ export interface ManagedSyncBacklog {
   rate_pages_per_min: number | null;
   eta_seconds: number | null;
   last_progress_at: string | null;
+  /** #6317: entries this cursor advanced past as holds (no page committed for them). */
+  held: number;
   resume_command: string;
   /** #6278: the arguments after `gbrain sync` that resume this cursor with its stored options. */
   resume_args: string[];
@@ -749,7 +755,7 @@ export interface ManagedSyncBacklog {
  */
 export async function readManagedSyncBacklog(engine: BrainEngine, sourceIds?: string[]): Promise<ManagedSyncBacklog[]> {
   const rows = await engine.executeRaw<{ header: { sourceId: string; index: number; total: number; done?: boolean; progress?: { startedAt: number; startIndex: number; lastAt: number; lastIndex: number };
-    processingOptions?: { noEmbed?: boolean; noExtract?: boolean; noSchemaPack?: boolean }; syncOptions?: Parameters<typeof managedSyncResumeArgs>[0]['syncOptions'] } }>(
+    counts?: { held?: number }; processingOptions?: { noEmbed?: boolean; noExtract?: boolean; noSchemaPack?: boolean }; syncOptions?: Parameters<typeof managedSyncResumeArgs>[0]['syncOptions'] } }>(
     `SELECT completed_keys->0 AS header FROM op_checkpoints WHERE op='managed-sync' AND COALESCE(completed_keys->0->>'done','false')<>'true'`);
   return rows.map(({ header }) => header).filter(h => h?.sourceId && (!sourceIds || sourceIds.includes(h.sourceId))).map(h => {
     const remaining = Math.max(0, Number(h.total) - Number(h.index));
@@ -757,7 +763,7 @@ export async function readManagedSyncBacklog(engine: BrainEngine, sourceIds?: st
     const estimate = p ? drainEstimate(remaining, p.lastIndex - p.startIndex, p.lastAt - p.startedAt) : { rate_pages_per_min: null, eta_seconds: null };
     const args = managedSyncResumeArgs({ sourceId: h.sourceId, processingOptions: h.processingOptions, syncOptions: h.syncOptions });
     return { source_id: h.sourceId, index: Number(h.index), total: Number(h.total), remaining, ...estimate,
-      last_progress_at: p ? new Date(p.lastAt).toISOString() : null, resume_command: syncResumeCommand(args), resume_args: args };
+      last_progress_at: p ? new Date(p.lastAt).toISOString() : null, held: Number(h.counts?.held ?? 0), resume_command: syncResumeCommand(args), resume_args: args };
   });
 }
 

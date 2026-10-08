@@ -108,7 +108,7 @@ describe('claim-aware no-progress window', () => {
       expect(drainJsonFields(result, RESUME, 's')).toMatchObject({ outcome: 'blocked', next: { fix: { next: 'tell_user_to_run' } } });
     });
 
-    test('an owner whose heartbeat row is wedged stops the drain before the ceiling with retry_after_ms to it and fix.next wait (safe to loop)', async () => {
+    test('an owner whose heartbeat row is wedged stops the drain before the ceiling with retry_after_ms to it and a rerunnable fix (safe to loop)', async () => {
       const owner = async () => ({ kind: 'serve', pid: process.pid + 1, nonce: 'other-nonce', mode: 'full', live: true, restart_required: true, root_barrier_age_ms: null });
       const result = await runDrain({ pass: async () => pending(2), probe: probeWith(claim({ step_age_ms: 160_000, claim_age_ms: 200_000, ...other }), 'same', { owner }), pauseMs: 1, stallMs: 20 });
       expect(result.drain).toMatchObject({ outcome: 'blocked', stop_reason: 'drain_stalled', stall: { cause: 'owner_wedged_here', past_ceiling: false, owner_row: { restart_required: true } } });
@@ -116,7 +116,9 @@ describe('claim-aware no-progress window', () => {
       expect(result.drain!.retry_after_ms).toBeLessThanOrEqual(400_000);
       const next = drainNext(result, RESUME, 's')!;
       expect(next).toMatchObject({ safe_to_loop: true, command: RESUME, cause: 'owner_wedged_here' });
-      expect(next.fix).toMatchObject({ next: 'wait', actor: 'provider' });
+      // `wait` derives only from a provider actor (agent-output.ts deriveNext); a wedged owner is not one, so the agent reruns after retry_after_ms.
+      expect(next.fix).toMatchObject({ next: 'run', actor: 'agent', command: RESUME });
+      expect(next.fix!.verify?.argv).toEqual(['gbrain', 'sources', 'writer', 'status', '--source', 's', '--json']);
       expect(next.why).toContain('reports restart_required');
       // A live, healthy row keeps the drain running.
       let passes = 0;

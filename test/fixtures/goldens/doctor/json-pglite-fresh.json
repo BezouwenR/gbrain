@@ -1873,6 +1873,18 @@
         },
         {
           "category": "ops",
+          "details": {
+            "count": 0,
+            "docs": "docs/guides/troubleshooting.md#managed-sync-not-moving",
+            "parked": 0,
+            "sources": []
+          },
+          "message": "No managed sync is pending.",
+          "name": "managed_sync_not_moving",
+          "status": "ok"
+        },
+        {
+          "category": "ops",
           "message": "Mode: conservative (no per-key overrides — mode bundle is canonical).",
           "name": "search_mode",
           "status": "ok"

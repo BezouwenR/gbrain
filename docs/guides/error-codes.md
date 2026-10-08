@@ -728,6 +728,18 @@ More: [docs/guides/ambient-recall.md#replay-after-a-degraded-wake](../../docs/gu
 |---|---|---|---|---|---|---|
 | Commit or stash canonical skill edits before optimization. | The request itself was wrong or no longer matches the brain; nothing was changed. | Correct the request using the message above, then retry. | agent | `repeat the read that failed` | 1 | no |
 
+### drain_stalled
+
+<a id="drain_stalled"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A managed sync drain stopped `blocked` because its head write made no progress (no committed receipt and no step advance) for the whole stall window. | A renewed lease is not progress: the detector keys on the head claim's phase and step. With a live owner on this host the drain prints `stalled <N>s on <step>` from the allowance (budget plus 30 s) and keeps going; it stops only when `persistence.preparation_ceiling_ms` passes without the root being released, or when that owner's heartbeat row reads wedged (`cause: owner_wedged_here`, with the owner's kind, pid and nonce and `retry_after_ms` to the ceiling, after which the owner frees the root and the next pass holds the entry). A lapsed claim (`owner_missing`) stops at once unless this host owns the checkout and a live full consumer can reclaim it, which gets one more window. `drain.stall.cause` names which. | Inspect the writer with gbrain sources writer status --source <id> --json (read-only: the owner process, its step and what it waits on, and the next action). Before the ceiling (`next.safe_to_loop` true) rerun next.command after retry_after_ms; past it, or with a wedged owner, restart the named owner process on the brain host and rerun the same sync. Run: gbrain sources writer status --source '{source_id}' --json | host_admin | `gbrain doctor --only managed_sync_not_moving --json` | 1 | no |
+
+Reasons: `owner_wedged_here`, `owner_missing`, `preparation_overdue`, `publication_overdue`, `no_progress`.
+
+More: [docs/guides/write-refusals.md#drain-stalled](../../docs/guides/write-refusals.md#drain-stalled)
+
 ### dream_breaker_tripped
 
 <a id="dream_breaker_tripped"></a>
@@ -1581,6 +1593,18 @@ More: [docs/guides/cron-schedule.md#dream-beside-autopilot](../../docs/guides/cr
 | The managed pull was skipped. | A temporary condition (a lock, a pending write, a rate limit); the same request can succeed later. | Wait briefly, then retry the same request (writes: reuse the same request_id). | agent | `repeat the read that failed` | 1 | yes |
 
 More: [docs/guides/write-refusals.md#managed_pull_skipped](../../docs/guides/write-refusals.md#managed_pull_skipped)
+
+### managed_sync_not_moving
+
+<a id="managed_sync_not_moving"></a>
+
+| Meaning | Why | Next step | Who acts · consent | Verify | Exit | Retryable |
+|---|---|---|---|---|---|---|
+| A managed source has unfinished sync work and a live consumer on its owner host, but no committed `managed_sync_*` receipt and no head step advance for longer than `persistence.preparation_ceiling_ms`. | Process liveness is not data movement: `/health` ok, a live pid and `sync_running: true` all held while one deployment moved nothing for weeks. `sources status --json` carries `data_moving`, `not_moving_since` and `movement_state` per source (`parked` when no drain or full consumer is live, informational), doctor warns with this code and counts it against the score, `serve` prints one notice when a source flips, and `gbrain sources writer movement` judges a window after a restart and exits 1 with this code (`reason: movement_check`) when pending work does not move. | Run gbrain sources writer status --source <id> --json (read-only): its next_action names the owner process, the step it is parked on and whether to wait or restart it. After the fix, gbrain sources writer movement proves the data moves again. Run: gbrain sources writer status --source '{source_id}' --json | host_admin | `gbrain doctor --only managed_sync_not_moving --json` | 1 | no |
+
+Reasons: `movement_check`.
+
+More: [docs/guides/troubleshooting.md#managed-sync-not-moving](../../docs/guides/troubleshooting.md#managed-sync-not-moving)
 
 ### manual_only_skipped
 

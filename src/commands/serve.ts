@@ -9,6 +9,7 @@ import { parseTokenTtl } from './auth.ts';
 import { RESIDENT_POOL_FLOOR } from '../core/pg-access-classify.ts';
 import { redirectStdoutLoggingToStderr } from '../core/console-prefix.ts';
 import { startFactsDrainScheduler, type FactsDrainScheduler, type FactsDrainSchedulerOpts } from '../core/facts/drain-scheduler.ts';
+import { startMovementWatch, type MovementWatch } from '../core/persistence/sync-movement.ts';
 import { onForwardProgress } from '../core/forward-progress.ts';
 import { graduationHandoffRequested, writeServeGraduationEnvelope } from '../core/persistence/graduation-serve-guard.ts';
 import {
@@ -591,9 +592,11 @@ function installStdioLifecycle(
   let idleSweepTimer: unknown = null;
   let activateIdleActivityTracking = (): void => {};
   let factsDrain: FactsDrainScheduler | null = null;
+  let movementWatch: MovementWatch | null = null;
   const beginShutdown = (reason: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
+    movementWatch?.stop();
 
     // Stop the parent-watchdog interval as soon as a shutdown begins so
     // it cannot fire a redundant 'parent-died' shutdown while the first
@@ -853,6 +856,8 @@ function installStdioLifecycle(
 
   // Automatic facts drain (Lane D): see installFactsDrain.
   factsDrain = installFactsDrain(engine, opts, deps, () => shuttingDown);
+  // #6317 (B4): one notice when a managed source's sync data stops moving (reader in persistence/sync-movement.ts).
+  movementWatch = startMovementWatch(engine, { log: deps.log, setInterval: deps.setInterval as typeof setInterval, clearInterval: deps.clearInterval as typeof clearInterval });
 
   // Optional idle-timeout safety net. Default OFF; opt-in via
   // `--stdio-idle-timeout <seconds>`. The flag is for the rare case where
