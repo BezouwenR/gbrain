@@ -48,7 +48,7 @@ describe('claimPhaseStamp and claimStateOf', () => {
     const clock = startClaimPhase(Date.parse('2026-10-08T03:00:00Z'));
     enterClaimStep(clock, 'origin_check', undefined, 'db', Date.parse('2026-10-08T03:01:00Z'));
     expect(JSON.parse(claimPhaseStamp(clock, 'tok-1'))).toEqual({ phase: 'preparing', claimed_at: '2026-10-08T03:00:00.000Z', since: '2026-10-08T03:00:00.000Z', token: 'tok-1',
-      step: 'origin_check', step_since: '2026-10-08T03:01:00.000Z', waiting_on: 'db', owner: { kind: 'sync', pid: 4242, version: '0.60.200.0' } });
+      step: 'origin_check', step_since: '2026-10-08T03:01:00.000Z', waiting_on: 'db', last_sql: null, owner: { kind: 'sync', pid: 4242, version: '0.60.200.0' } });
   });
   test('the default owner is this process: the gbrain command (cli when none), pid, build and (#6317) its nonce and pid namespace', () => {
     const owner = claimOwner();

@@ -706,10 +706,6 @@
         "name": "core_memory"
       },
       {
-        "category": "brain",
-        "name": "fence_integrity"
-      },
-      {
         "category": "ops",
         "name": "managed_sync_not_moving"
       },
@@ -724,6 +720,10 @@
       {
         "category": "ops",
         "name": "host_identity_mismatch"
+      },
+      {
+        "category": "brain",
+        "name": "fence_integrity"
       },
       {
         "category": "ops",

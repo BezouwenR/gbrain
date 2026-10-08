@@ -151,7 +151,7 @@ describe('the doctor codes each have a troubleshooting symptom row that names wh
     for (const step of ['gbrain sources status default --json', 'gbrain doctor --only managed_sync_not_moving --json', 'gbrain sources writer status --source default --json', 'gbrain sources retry-held default', 'gbrain sources writer movement default']) {
       expect(doc, `transcript lacks ${step}`).toContain(step);
     }
-    expect(doc).toContain('"next_action"');
+    expect(doc).toContain('"next": { "code": "claim_overdue"');
     expect(doc).toContain('cause=owner_wedged_here');
     expect(doc).not.toContain('budget times its attempts');
   });
