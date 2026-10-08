@@ -217,7 +217,7 @@ try {
   const all = JSON.parse(readFileSync(results, 'utf8')) as WriteResult[];
   const measured = all.slice(WARMUP);
   const records = readTrace(row.trace, r => r.label.startsWith('foreground'));
-  Object.assign(report, summarize(records, measured));
+  for (const [key, value] of Object.entries(summarize(records, measured))) report[key] = value;
   mkdirSync(dirname(OUT), { recursive: true });
   copyFileSync(row.trace, OUT.replace(/\.json$/, '') + '.trace.jsonl');
   report.trace = OUT.replace(/\.json$/, '') + '.trace.jsonl';
