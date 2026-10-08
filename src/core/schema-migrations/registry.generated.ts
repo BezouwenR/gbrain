@@ -221,7 +221,7 @@ import { v217 } from './v217-persistence-request-claim-phase.ts';
 import { v218 } from './v218-purge-legacy-worktree-manifest-files.ts';
 import { v219 } from './v219-pages-reconcile-name-indexes.ts';
 import { v220 } from './v220-persistence-request-preparation-attempts.ts';
-import { v221 } from './v221-persistence-consumers.ts';
+import { v221 } from './v221-chunk-embedding-pending-since.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
