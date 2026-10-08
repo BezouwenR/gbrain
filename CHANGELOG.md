@@ -10,7 +10,7 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
-## [0.60.111.0] - 2026-10-08
+## [0.60.112.0] - 2026-10-08
 
 **A managed catch-up no longer stalls on one stuck write: the write is cut off, its file is held, and the rest of the source keeps syncing.**
 
@@ -78,7 +78,7 @@ gbrain doctor --only persistence_write_stall,persistence_session_timeouts,git_he
 
 If a catch-up stops or files are held, follow [catch-up stuck](docs/guides/troubleshooting.md#catch-up-stuck). If a step fails or the numbers look wrong, file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor`.
 
-## [0.60.108.0] - 2026-10-08
+## [0.60.111.0] - 2026-10-08
 
 **Managed Postgres sync catches up more than twice as fast, starts committing in about 20 seconds instead of 80, and a page you save during a catch-up no longer waits behind it.**
 
