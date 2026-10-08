@@ -222,6 +222,33 @@ test('lanes publish several groups at once and every page still commits, attribu
   expect(cursor!.n).toBe(0);
 }), 300_000);
 
+test('admit-ahead fits the writer\'s outstanding-request limit instead of stopping when a batch would exceed it', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_BULK_SIZE: '4' }, async () => {
+  if (!engine) return;
+  // Eight lanes keep sixteen groups of four admitted ahead; the principal may hold only 40 outstanding requests.
+  await engine.setConfig('persistence.limits.principal_outstanding', '40');
+  try {
+    const f = await fixture(engine, notes(160));
+    const admitted: number[] = []; // the source's queued and running requests at each cursor step
+    installFaultHook(async (point, detail) => {
+      if (point !== 'sync:mid_checkpoint' || detail.sourceId !== f.id) return;
+      const [row] = await engine!.executeRaw<{ n: number }>("SELECT count(*)::int AS n FROM persistence_requests WHERE source_id=$1 AND state IN ('queued','running')", [f.id]);
+      admitted.push(row!.n);
+    });
+    const result = await performSync(engine, { sourceId: f.id, noPull: true, noEmbed: true, noExtract: true, drain: true, lanes: 8 });
+    installFaultHook(undefined);
+    expect(result.drain).toMatchObject({ outcome: 'synced' });
+    expect((await imports(engine, f.id)).every(row => row.state === 'committed')).toBe(true);
+    // Groups kept being admitted ahead through the whole run: between the first admission and the last commits,
+    // the sync never ran out of admitted requests (an admission over the limit used to stop admit-ahead until the window drained).
+    const first = admitted.findIndex(n => n > 0), last = admitted.length - 1 - [...admitted].reverse().findIndex(n => n > 0);
+    expect(admitted.slice(first, last + 1).filter(n => n === 0)).toEqual([]);
+    expect(Math.max(...admitted)).toBeLessThanOrEqual(40);
+  } finally {
+    installFaultHook(undefined);
+    await engine.executeRaw("DELETE FROM config WHERE key='persistence.limits.principal_outstanding'");
+  }
+}), 300_000);
+
 test('a failed page under lanes stops the run: earlier pages commit, nothing after it publishes', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home, GBRAIN_SYNC_BULK_SIZE: '4' }, async () => {
   if (!engine) return;
   const f = await fixture(engine, notes(60, i => i === 30 ? '---\ntitle: Conflict\nslug: notes/other\n---\nA conflicting identity must not be imported.\n' : null));

@@ -28,7 +28,8 @@ import { writeFailureDiagnostic } from './verb-errors.ts';
 import { extractManagedStaleLinks } from './links-maintenance.ts';
 import { CHECKPOINT_VALIDATION_TIMEOUT, checkpointRetryCommand, checkpointTimeoutHint } from './checkpoint-validation.ts';
 import { isTerminalWriteState, publicWriteReceipt, type WriteReceipt } from './types.ts';
-import type { WriteRequest } from './model.ts';
+import { principalKey, type WriteRequest } from './model.ts';
+import { readJournalLimits } from './limits.ts';
 import { assertManagedSyncAllowed } from './worktree-refresh.ts';
 import type { GBrainConfig } from '../config.ts';
 import { admitGroup, freezeFollowers, groupableIntent, nextGroupSize, type BulkSettings } from './sync-group.ts';
@@ -681,6 +682,14 @@ function laneRunOf(cursor: Cursor, bulk: BulkPass): string | null {
  * while foreground writes are recent (one was queued on the worktree in the last minute), or when the next
  * entry is not groupable (renames, holds, waivers, the checkpoint and overtaken entries stay on the single path).
  */
+/** Requests the sync writer may still admit before its principal or the brain reaches the outstanding-request limit, less a reserve of 10. */
+async function admissionRoom(engine: BrainEngine, cursor: Cursor): Promise<number> {
+  const [limits, counters] = await Promise.all([readJournalLimits(engine),
+    engine.executeRaw<{ key: string; outstanding: string }>('SELECT key,outstanding_count::text AS outstanding FROM persistence_counters WHERE key=ANY($1::text[])',
+      [['brain', principalKey(cursor.authority.writer.principal)]])]);
+  const used = (key: string) => Number(counters.find(row => row.key === key)?.outstanding ?? 0);
+  return Math.min(limits.principalOutstanding - used(principalKey(cursor.authority.writer.principal)), limits.brainOutstanding - used('brain')) - 10;
+}
 async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk: BulkPass, config: GBrainConfig, freezeAt: FreezeAt,
   assertActive: () => void): Promise<Cursor> {
   if (!bulk.settings.enabled || !cursor.group?.length) return cursor;
@@ -707,14 +716,19 @@ async function admitAhead(engine: BrainEngine, cursor: Cursor, key: string, bulk
       if (foreground) bulk.foregroundAt = performance.now();
     }
     if (!bulk.foregroundFirst && bulk.foregroundAt !== undefined && performance.now() - bulk.foregroundAt < FOREGROUND_RECENT_MS) break;
+    // The admission must fit the writer's outstanding-request capacity (a refused admission would end admit-ahead):
+    // the groups admitted at once take only the room left after the cursor's next group and the agent's own writes.
+    const room = await admissionRoom(engine, current) - bulk.settings.size;
     // The window's free slots are frozen and then admitted and saved in one transaction, up to a lane count of
     // groups at a time, so lanes start on the first ones while the rest are frozen.
     const formed: Pending[][] = [];
     let next = start;
     while (window.length + formed.length < depth && formed.length < Math.max(1, depth / 2) && next < current.entries.length) {
       const base: Cursor = { ...current, index: next - 1 };
+      const size = Math.min(groupSize(base, bulk), room - formed.flat().length);
+      if (size < 1) break;
       // A freeze refusal here is left for the single path to raise in order, after the publishing groups.
-      const frozen = await freezeFollowers(engine, base, config, groupSize(base, bulk), freezeAt(base)).catch(() => []);
+      const frozen = await freezeFollowers(engine, base, config, size, freezeAt(base)).catch(() => []);
       if (!frozen.length) break;
       const after = (formed.at(-1) ?? window.at(-1) ?? current.group!).at(-1)!.requestId;
       formed.push(frozen.map(member => ({ ...member, intent: { ...member.intent, group: frozen[0]!.requestId, after, ...(lane ? { lane } : {}) } })));

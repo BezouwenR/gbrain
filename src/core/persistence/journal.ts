@@ -779,6 +779,11 @@ export function receiptFor(row: WriteRequest, facts?: WriteHealthFacts, now = Da
 
 const healthQueries = new WeakMap<BrainEngine, Promise<unknown>>();
 /**
+ * #6275: a head needs recovery only when it is recovering, or holds a recovery record without a live claim; a
+ * publication in progress keeps its ordinary before-image record, and the requests behind it are only waiting.
+ */
+const STUCK_RECOVERY = (r: string) => `(${r}.state='recovering' OR (${r}.recovery IS NOT NULL AND (${r}.state<>'running' OR ${r}.claim_expires_at<now())))`;
+/**
  * Receipt health facts per root. #5984: a queued request waits on any earlier unfinished request of its root;
  * a claimed one (a lane, a group follower, or a foreground write claimed ahead of queued sync rows) waits only
  * on an earlier one already publishing or recovering, so the queued rows it overtook never make it report
@@ -802,14 +807,14 @@ export async function writeHealthFacts(engine: BrainEngine, rows: WriteRequest[]
     LEFT JOIN LATERAL (
       (SELECT r.sequence,(SELECT s.sequence FROM persistence_requests s WHERE s.worktree_id=w.id
           AND (s.state IN ('running','recovering') OR s.recovery IS NOT NULL) ORDER BY s.sequence LIMIT 1) AS started_sequence,
-        r.recovery IS NOT NULL AS recovering,
+        ${STUCK_RECOVERY('r')} AS recovering,
         r.blocked_reason IN ('unexpected_file_bytes','unexpected_staging_bytes') AS inspect_owner FROM persistence_requests r
         WHERE r.worktree_id=w.id AND (r.state IN ('queued','running','recovering') OR r.recovery IS NOT NULL)
         ORDER BY r.sequence LIMIT 1)
       UNION ALL
       (SELECT r.sequence,(SELECT s.sequence FROM persistence_requests s WHERE s.worktree_id IS NULL AND s.source_incarnation=r.source_incarnation
           AND s.state IN ('running','recovering') ORDER BY s.sequence LIMIT 1) AS started_sequence,
-        r.recovery IS NOT NULL AS recovering,
+        ${STUCK_RECOVERY('r')} AS recovering,
         r.blocked_reason IN ('unexpected_file_bytes','unexpected_staging_bytes') AS inspect_owner FROM persistence_requests r
         WHERE r.worktree_id IS NULL AND r.source_incarnation=CASE WHEN roots.root LIKE 'db:%' THEN substring(roots.root FROM 4)::uuid END
         AND r.state IN ('queued','running','recovering') ORDER BY r.sequence LIMIT 1)
