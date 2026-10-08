@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { writeSwitchOn } from './switches.ts';
+import { WRITE_SWITCHES, writeSwitchOn } from './switches.ts';
 import type { BrainEngine } from '../engine.ts';
 import { assertRecoveryStagingAbsent } from './staging.ts';
 import { OperationError, opError } from '../ops/contract.ts';
@@ -414,12 +414,12 @@ const NAMES_PAGE = (sync: string, write: string) => `(${sync}.source_id=${write}
  * sync row that has not started and does not name its page. Running and recovering rows, recovery records and
  * a sync row naming the page still come first; a passed sync row waits until the foreground request finishes.
  */
-const PASSES_QUEUED_SYNC = (earlier: string, r: string, priority: string) => `(${priority}::boolean AND NOT ${SYNC_KIND(r)}
+const PASSES_QUEUED_SYNC = (earlier: string, r: string, priority: string) => `((${priority}) AND NOT ${SYNC_KIND(r)}
   AND ${earlier}.state='queued' AND ${earlier}.recovery IS NULL AND ${SYNC_KIND(earlier)} AND NOT ${NAMES_PAGE(earlier, r)})`;
 /**
  * The rows `claimNextWrite` may claim, over `persistence_requests r LEFT JOIN
  * persistence_worktrees w`, with $1 = host id and $2 = excluded root keys and
- * `priority` the parameter carrying the `foreground_priority` switch. An
+ * `priority` the SQL condition of the `foreground_priority` switch. An
  * unresolved head blocks its entire root.
  */
 export const claimableWriteSql = (priority: string) => `r.state='queued' AND (r.worktree_id IS NULL OR (w.owner_host_id=$1::uuid AND w.state='active'))
@@ -435,10 +435,20 @@ export const claimableWriteSql = (priority: string) => `r.state='queued' AND (r.
               =COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)
         AND earlier.sequence<r.sequence AND earlier.state IN ('queued','running','recovering')
         AND NOT ${PASSES_QUEUED_SYNC('earlier', 'r', priority)})
-      AND NOT (${priority}::boolean AND ${SYNC_KIND('r')} AND EXISTS (SELECT 1 FROM persistence_requests ahead
+      AND NOT ((${priority}) AND ${SYNC_KIND('r')} AND EXISTS (SELECT 1 FROM persistence_requests ahead
         WHERE ahead.worktree_id=r.worktree_id AND ahead.sequence>r.sequence AND ahead.state IN ('running','recovering') AND NOT ${SYNC_KIND('ahead')}))`;
 /** With the switch on, a claimable foreground request is claimed before the sync rows it passes. */
-const CLAIM_ORDER = (priority: string) => `(${priority}::boolean AND NOT ${SYNC_KIND('r')}) DESC, r.sequence`;
+const CLAIM_ORDER = (priority: string) => `(${priority} AND NOT ${SYNC_KIND('r')}) DESC, r.sequence`;
+/**
+ * The `foreground_priority` switch as SQL, so a claim reads it in its own statement: the environment
+ * override (a process constant) or, without one, the brain config row (on unless `0`/`false`).
+ */
+export function foregroundPrioritySql(): string {
+  const env = process.env[WRITE_SWITCHES.foreground_priority.env]?.trim().toLowerCase();
+  if (env === '0' || env === 'false') return 'false';
+  if (env === '1' || env === 'true') return 'true';
+  return `NOT EXISTS (SELECT 1 FROM config WHERE key='${WRITE_SWITCHES.foreground_priority.key}' AND lower(trim(value)) IN ('0','false'))`;
+}
 /** Whether `foreground_priority` is on for this brain; on when the switch cannot be read. */
 export function foregroundPriority(engine: SqlEngine): Promise<boolean> {
   return writeSwitchOn(engine, 'foreground_priority').catch(() => true);
@@ -447,7 +457,7 @@ export function foregroundPriority(engine: SqlEngine): Promise<boolean> {
 /** #5401: whether `claimNextWrite` would find a row now. Read-only: no lock and no claim. */
 export async function hasClaimableWrite(engine: SqlEngine, hostId: string, excludeRoots: string[] = [], signal?: AbortSignal): Promise<boolean> {
   const [row] = await engine.executeRaw<{ claimable: boolean }>(`SELECT EXISTS (SELECT 1 FROM persistence_requests r
-      LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id WHERE ${claimableWriteSql('$3')} LIMIT 1) AS claimable`, [hostId, excludeRoots, await foregroundPriority(engine)], { signal });
+      LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id WHERE ${claimableWriteSql(foregroundPrioritySql())} LIMIT 1) AS claimable`, [hostId, excludeRoots], { signal });
   return row?.claimable === true;
 }
 
@@ -457,25 +467,25 @@ export async function hasClaimableWrite(engine: SqlEngine, hostId: string, exclu
  * claimed ahead of a queued sync row (`passed_sync`) committed since it last claimed a sync row, so there the claim is plain FIFO.
  */
 export async function claimNextWrite(engine: BrainEngine, hostId: string, leaseMs = 30_000, excludeRoots: string[] = [], fifoRoots: string[] = []): Promise<(WriteRequest & { passed_sync?: boolean }) | null> {
-  const priority = await foregroundPriority(engine);
-  const first = `($3::boolean AND NOT (COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)=ANY($4::text[])))`;
+  const first = `(${foregroundPrioritySql()}) AND NOT (COALESCE(r.worktree_id::text,'db:'||r.source_incarnation::text)=ANY($3::text[]))`;
   return engine.transactionDirect(async tx => {
     // The protocol declaration and the FIFO head read are sent together.
     const [, [row]] = await pipelined(tx, [
       () => declarePersistenceProtocol(tx),
-      // `passed_sync`: the claimed row went ahead of a queued sync row of its root.
-      () => tx.executeRaw<WriteRequest & { passed_sync: boolean }>(`SELECT r.*,EXISTS (SELECT 1 FROM persistence_requests earlier
-        WHERE earlier.worktree_id=r.worktree_id AND earlier.sequence<r.sequence AND earlier.state='queued' AND ${SYNC_KIND('earlier')}) AS passed_sync
-      FROM persistence_requests r
+      () => tx.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
       LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
-      WHERE ${claimableWriteSql(first)}
-      ORDER BY ${CLAIM_ORDER(first)} LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, excludeRoots, priority, fifoRoots]),
-    ]) as [unknown, Array<WriteRequest & { passed_sync: boolean }>];
+      WHERE ${claimableWriteSql(`(${first})`)}
+      ORDER BY ${CLAIM_ORDER(`(${first})`)} LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, excludeRoots, fifoRoots]),
+    ]) as [unknown, WriteRequest[]];
     if (!row) return null;
-    const [claimed] = await tx.executeRaw<WriteRequest>(`UPDATE persistence_requests SET state='running',
+    // `passed_sync`: the claimed row went ahead of a queued sync row of its root.
+    const [claimed] = await tx.executeRaw<WriteRequest & { passed_sync: boolean }>(`UPDATE persistence_requests SET state='running',
       execution_token=$2::uuid,claim_expires_at=now()+($3::double precision*interval '1 millisecond'),
-      updated_at=now(),blocked_reason=NULL WHERE id=$1::uuid RETURNING *`, [row.id, randomUUID(), leaseMs]);
-    return claimed && { ...claimed, passed_sync: row.passed_sync === true };
+      updated_at=now(),blocked_reason=NULL WHERE id=$1::uuid RETURNING *,EXISTS (SELECT 1 FROM persistence_requests earlier
+        WHERE earlier.worktree_id=persistence_requests.worktree_id AND earlier.sequence<persistence_requests.sequence
+        AND earlier.state='queued' AND ${SYNC_KIND('earlier')}) AS passed_sync`,
+    [row.id, randomUUID(), leaseMs]);
+    return claimed ?? null;
   });
 }
 /**
@@ -494,7 +504,6 @@ export async function claimNextWrite(engine: BrainEngine, hostId: string, leaseM
  */
 export async function claimNextLaneHead(engine: BrainEngine, hostId: string, worktreeId: string, run: string, leaseMs = 30_000,
   seenSequence: string | null = null): Promise<(WriteRequest & { seen_sequence: string }) | null> {
-  const priority = await foregroundPriority(engine);
   return engine.transactionDirect(async tx => {
     await declarePersistenceProtocol(tx);
     const [row] = await tx.executeRaw<WriteRequest>(`SELECT r.* FROM persistence_requests r
@@ -509,13 +518,13 @@ export async function claimNextLaneHead(engine: BrainEngine, hostId: string, wor
           AND (earlier.state IN ('queued','recovering') OR (earlier.state='running' AND COALESCE(earlier.intent->>'lane','')<>$3)))
         -- #5984 Phase 4.5: no new lane head while a foreground write that may go first is unfinished, except one head
         -- after each foreground commit since this run's last head claim, so a stream of writes cannot starve the drain.
-        AND NOT ($4::boolean AND EXISTS (SELECT 1 FROM persistence_requests f WHERE f.worktree_id=r.worktree_id AND f.state IN ('queued','running','recovering')
+        AND NOT ((${foregroundPrioritySql()}) AND EXISTS (SELECT 1 FROM persistence_requests f WHERE f.worktree_id=r.worktree_id AND f.state IN ('queued','running','recovering')
             AND f.recovery IS NULL AND NOT ${SYNC_KIND('f')}
             AND NOT EXISTS (SELECT 1 FROM persistence_requests named WHERE named.worktree_id=f.worktree_id AND named.sequence<f.sequence
               AND named.state IN ('queued','running','recovering') AND ${SYNC_KIND('named')} AND ${NAMES_PAGE('named', 'f')}))
-          AND NOT EXISTS (SELECT 1 FROM persistence_requests c WHERE c.sequence>COALESCE($5::bigint,0) AND c.worktree_id=r.worktree_id
+          AND NOT EXISTS (SELECT 1 FROM persistence_requests c WHERE c.sequence>COALESCE($4::bigint,0) AND c.worktree_id=r.worktree_id
             AND c.state='committed' AND NOT ${SYNC_KIND('c')}))
-      ORDER BY r.sequence LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, worktreeId, run, priority, seenSequence]);
+      ORDER BY r.sequence LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, [hostId, worktreeId, run, seenSequence]);
     if (!row) return null;
     const [claimed] = await tx.executeRaw<WriteRequest & { seen_sequence: string }>(`UPDATE persistence_requests SET state='running',
       execution_token=$2::uuid,claim_expires_at=now()+($3::double precision*interval '1 millisecond'),

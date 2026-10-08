@@ -1,6 +1,6 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
-import { claimableWriteSql, foregroundPriority, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, compactWriteReceipts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
+import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, compactWriteReceipts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
 import { finishUnpublishedFailure, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { localHostId } from './identity.ts';
 import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
@@ -196,7 +196,7 @@ export class PersistenceConsumer {
     const retryingTopologies = [...this.topologyRetryAfter.keys()];
     const [row] = await this.phase('idle_probe', async signal => this.probeQuery<{ work: boolean }>(this.laneInUse ? undefined : await this.acquireIdleLane(signal), `SELECT (
       EXISTS (SELECT 1 FROM persistence_requests r LEFT JOIN persistence_worktrees w ON w.id=r.worktree_id
-        WHERE ${claimableWriteSql('$5')}
+        WHERE ${claimableWriteSql(foregroundPrioritySql())}
         AND ($3::boolean OR r.blocked_reason IS DISTINCT FROM 'writer_pool_capacity'))
       OR EXISTS (SELECT 1 FROM persistence_requests r JOIN persistence_worktrees w ON w.id=r.worktree_id
         WHERE w.owner_host_id=$1::uuid AND r.recovery IS NOT NULL AND NOT (r.worktree_id::text=ANY($2::text[])))
@@ -219,7 +219,7 @@ export class PersistenceConsumer {
       OR EXISTS (SELECT 1 FROM persistence_topology_changes c
         JOIN persistence_worktrees w ON w.id=(c.recovery->>'worktreeId')::uuid
         WHERE c.recovery IS NOT NULL AND w.owner_host_id=$1::uuid AND NOT (c.id::text=ANY($4::text[])))
-    ) AS work`, [this.hostId, excluded, publicationConcurrency(this.engine) > 0, retryingTopologies, await foregroundPriority(this.engine)], signal));
+    ) AS work`, [this.hostId, excluded, publicationConcurrency(this.engine) > 0, retryingTopologies], signal));
     return row?.work === true;
   }
   /**
