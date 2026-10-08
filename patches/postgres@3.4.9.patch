@@ -1,5 +1,5 @@
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..f6d76e59ab690dc0a92986f90ade8839bc0470d4 100644
+index 07f6716..f6d76e5 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
 @@ -78,6 +78,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -146,7 +146,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..f6d76e59ab690dc0a92986f90ade8839
    }
  
 diff --git a/cjs/src/index.js b/cjs/src/index.js
-index f09c61c7e998f411560b95c9a8e1ed6a97972c11..a58dbb6c1e27094bb10e461d354af8c3e5eb9ff7 100644
+index f09c61c..65dd5d1 100644
 --- a/cjs/src/index.js
 +++ b/cjs/src/index.js
 @@ -200,40 +200,134 @@ function Postgres(a, b) {
@@ -349,7 +349,42 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..a58dbb6c1e27094bb10e461d354af8c3
      }
    }
  
-@@ -398,7 +496,14 @@ function Postgres(a, b) {
+@@ -351,7 +449,7 @@ function Postgres(a, b) {
+     return new Promise((resolve, reject) => {
+       query.state
+         ? query.active
+-          ? Connection(options).cancel(query.state, resolve, reject)
++          ? cancelActive(query, resolve, reject)
+           : query.cancelled = { resolve, reject }
+         : (
+           queries.remove(query),
+@@ -362,6 +460,25 @@ function Postgres(a, b) {
+     })
+   }
+ 
++  function cancelActive(query, resolve, reject, delay = 50) {
++    Connection(options).cancel(query.state, () => {
++      if (!query.active)
++        return resolve()
++      let waiting = true
++      const timer = setTimeout(next, delay)
++      Promise.prototype.then.call(query, next, next)
++      function next() {
++        if (!waiting)
++          return
++        waiting = false
++        clearTimeout(timer)
++        query.active
++          ? cancelActive(query, resolve, reject, Math.min(delay * 2, 1000))
++          : resolve()
++      }
++    }, reject)
++  }
++
+   async function end({ timeout = null } = {}) {
+     if (ending)
+       return ending
+@@ -398,7 +515,14 @@ function Postgres(a, b) {
      move(c, ended)
    }
  
@@ -365,7 +400,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..a58dbb6c1e27094bb10e461d354af8c3
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +523,32 @@ function Postgres(a, b) {
+@@ -418,12 +542,32 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -399,7 +434,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..a58dbb6c1e27094bb10e461d354af8c3
    }
  }
  
-@@ -491,6 +616,8 @@ function parseOptions(a, b) {
+@@ -491,6 +635,8 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
@@ -409,7 +444,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..a58dbb6c1e27094bb10e461d354af8c3
      socket          : o.socket,
      transform       : parseTransform(o.transform || { undefined: undefined }),
 diff --git a/cjs/src/query.js b/cjs/src/query.js
-index 45327f2fabcdbf8f8ec5020675012c310c04fee6..1d092504ac1ce1fdac78cb0c4ef3a8aa957676e4 100644
+index 45327f2..1d09250 100644
 --- a/cjs/src/query.js
 +++ b/cjs/src/query.js
 @@ -23,11 +23,12 @@ const Query = module.exports.Query = class Query extends Promise {
@@ -453,7 +488,7 @@ index 45327f2fabcdbf8f8ec5020675012c310c04fee6..1d092504ac1ce1fdac78cb0c4ef3a8aa
            this.execute()
            return promise
 diff --git a/cjs/src/queue.js b/cjs/src/queue.js
-index 8438f5da92cf7637d98a33491d75c75b1c817c25..c444310ff87b0ac81fd19cd3170a0ba607a66781 100644
+index 8438f5d..c444310 100644
 --- a/cjs/src/queue.js
 +++ b/cjs/src/queue.js
 @@ -15,6 +15,7 @@ function Queue(initial = []) {
@@ -465,7 +500,7 @@ index 8438f5da92cf7637d98a33491d75c75b1c817c25..c444310ff87b0ac81fd19cd3170a0ba6
        const out = xs[index++]
  
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..792c83d36a32b8181a438e0b0e91e0a7db8083ca 100644
+index 1b1cccd..792c83d 100644
 --- a/src/connection.js
 +++ b/src/connection.js
 @@ -78,6 +78,9 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -612,7 +647,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..792c83d36a32b8181a438e0b0e91e0a7
    }
  
 diff --git a/src/index.js b/src/index.js
-index c7fba3dace20173f4cb13f3f138bb6d213b43683..58b370bb3482de2ab6c86246cd63dfda0c1ea466 100644
+index c7fba3d..b715f5b 100644
 --- a/src/index.js
 +++ b/src/index.js
 @@ -200,40 +200,134 @@ function Postgres(a, b) {
@@ -815,7 +850,42 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..58b370bb3482de2ab6c86246cd63dfda
      }
    }
  
-@@ -398,7 +496,14 @@ function Postgres(a, b) {
+@@ -351,7 +449,7 @@ function Postgres(a, b) {
+     return new Promise((resolve, reject) => {
+       query.state
+         ? query.active
+-          ? Connection(options).cancel(query.state, resolve, reject)
++          ? cancelActive(query, resolve, reject)
+           : query.cancelled = { resolve, reject }
+         : (
+           queries.remove(query),
+@@ -362,6 +460,25 @@ function Postgres(a, b) {
+     })
+   }
+ 
++  function cancelActive(query, resolve, reject, delay = 50) {
++    Connection(options).cancel(query.state, () => {
++      if (!query.active)
++        return resolve()
++      let waiting = true
++      const timer = setTimeout(next, delay)
++      Promise.prototype.then.call(query, next, next)
++      function next() {
++        if (!waiting)
++          return
++        waiting = false
++        clearTimeout(timer)
++        query.active
++          ? cancelActive(query, resolve, reject, Math.min(delay * 2, 1000))
++          : resolve()
++      }
++    }, reject)
++  }
++
+   async function end({ timeout = null } = {}) {
+     if (ending)
+       return ending
+@@ -398,7 +515,14 @@ function Postgres(a, b) {
      move(c, ended)
    }
  
@@ -831,7 +901,7 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..58b370bb3482de2ab6c86246cd63dfda
      if (queries.length === 0)
        return move(c, open)
  
-@@ -418,12 +523,32 @@ function Postgres(a, b) {
+@@ -418,12 +542,32 @@ function Postgres(a, b) {
        : move(c, full)
    }
  
@@ -865,7 +935,7 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..58b370bb3482de2ab6c86246cd63dfda
    }
  }
  
-@@ -491,6 +616,8 @@ function parseOptions(a, b) {
+@@ -491,6 +635,8 @@ function parseOptions(a, b) {
      onnotice        : o.onnotice,
      onnotify        : o.onnotify,
      onclose         : o.onclose,
@@ -875,7 +945,7 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..58b370bb3482de2ab6c86246cd63dfda
      socket          : o.socket,
      transform       : parseTransform(o.transform || { undefined: undefined }),
 diff --git a/src/query.js b/src/query.js
-index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..96967780bdb55671bdcdda0fd0bb6e718e0a0e78 100644
+index 0d44a15..9696778 100644
 --- a/src/query.js
 +++ b/src/query.js
 @@ -23,11 +23,12 @@ export class Query extends Promise {
@@ -919,7 +989,7 @@ index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..96967780bdb55671bdcdda0fd0bb6e71
            this.execute()
            return promise
 diff --git a/src/queue.js b/src/queue.js
-index c4ef97164f057db99dce1b9af3401dbb1af37e31..8fba891b879e8f5c7fdb03ea0590753663c824c3 100644
+index c4ef971..8fba891 100644
 --- a/src/queue.js
 +++ b/src/queue.js
 @@ -15,6 +15,7 @@ function Queue(initial = []) {
@@ -931,7 +1001,7 @@ index c4ef97164f057db99dce1b9af3401dbb1af37e31..8fba891b879e8f5c7fdb03ea05907536
        const out = xs[index++]
  
 diff --git a/types/index.d.ts b/types/index.d.ts
-index 13c3432f761e2c2ee5b7dc1bdafe93e49f993dc7..d7ba214bc614097fddbf2951127c5685d7c8e643 100644
+index 13c3432..d7ba214 100644
 --- a/types/index.d.ts
 +++ b/types/index.d.ts
 @@ -119,6 +119,18 @@ interface BaseOptions<T extends Record<string, postgres.PostgresType>> {
