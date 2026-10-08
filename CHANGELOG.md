@@ -10,7 +10,7 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
-## [0.60.114.0] - 2026-10-08
+## [0.60.115.0] - 2026-10-08
 
 **A managed brain no longer calls itself healthy while its sync moves nothing: one consumer per host, a stall the drain can see from the same host, and `gbrain sources writer movement` as the deploy gate.**
 
@@ -65,7 +65,7 @@ gbrain config set persistence.single_consumer false        # brain-wide: every p
 
 Fixes #6317. Follows #6278.
 
-## To take advantage of v0.60.113.0
+## To take advantage of v0.60.115.0
 
 `gbrain upgrade` applies migration v221 (one new table and one partial index). Then restart every resident gbrain process on the host, not only `serve`, and let the data prove it moves:
 
@@ -77,6 +77,43 @@ gbrain doctor --only managed_sync_not_moving,two_consumers_on_host,consumers_wit
 ```
 
 If `writer movement` exits 1 or a source reads `data_moving: false`, follow [the catch-up is parked](docs/guides/troubleshooting.md#managed-sync-not-moving): two read-only calls name the owner process, its step and the next action. If a step fails or the numbers look wrong, file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor`.
+
+## [0.60.114.0] - 2026-10-08
+
+**A write owner no longer parks forever on a database round-trip that a transaction-mode pooler never completes.**
+
+On the managed brain behind the #6278 report, one `gbrain sync` with no lanes and no `serve` still stopped after 45 pages: the consumer's `expired_claims` statement sat with its Postgres backend in `ClientRead` through Supavisor's transaction pooler (port 6543), the owner's 5 s phase deadline fired, but the cancel request never reached the backend and the awaited promise never settled, so the owner was parked until the watchdog. The same command on the session-mode URL (port 5432) drained cleanly. Now a cancelled statement that is still unsettled `GBRAIN_CANCEL_SETTLE_MS` (default 2000 ms) after its cancel request has its reserved connection discarded, which settles the promise client-side; the phase ends `deadline_exceeded`, the consumer keeps ticking and the catch-up continues.
+
+### How to use it
+
+```bash
+gbrain sync --source <id> --no-pull --no-embed                 # nothing to change
+gbrain doctor --only persistence_session_timeouts --json       # names a transaction-mode pooler URL and the session-mode alternative
+GBRAIN_CANCEL_SETTLE_MS=5000 gbrain serve                      # a longer settle window if a slow pooler honours cancels late
+```
+
+### What you see
+
+| Where | What changed |
+|---|---|
+| A consumer phase whose statement never completes | Ends as `deadline_exceeded` once (the connection is discarded after the settle window), never as `storage_error` / `CONNECTION_DESTROYED`; the next tick runs and the drain proceeds. |
+| A preparation read ended that way | Classified as the preparation deadline (released `preparation_deadline`, counted toward `preparation_stalled`), with the step and `waiting_on: db` on the claim. |
+| doctor `persistence_session_timeouts` | Warns `transaction_mode_pooler` when the configured URL is a transaction-mode pooler even if the session timeout reaches the server, and names the port 5432 session-mode URL as the alternative for the persistence owner. |
+
+### Things to watch
+
+- **Interim mitigation that works today:** point the persistence owner (`gbrain sync`, `gbrain serve`) at the session-mode URL of the same pooler (Supabase: port 5432). That is the configuration the reporter measured as the longest clean drain in weeks.
+- **A discarded connection is a reconnect**, not a lost write: the statement's request stays claimed or queued and is retried on the next tick; the pooler's backend is released when the client socket closes.
+
+### Itemized changes
+
+- `src/core/postgres-engine.ts`: `runUnsafe` arms a settle timer after `cancel()`; a statement still pending at `cancelSettleMs()` has its reserved connection discarded (`CONNECTION_DESTROYED`), once. `GBRAIN_CANCEL_SETTLE_MS` (>= 100) overrides the 2 s default.
+- `src/core/persistence/consumer.ts`: a phase past its deadline that ends with `CONNECTION_DESTROYED` or `CONNECTION_CLOSED` (the discarded connection) throws `PhaseDeadlineError` (`code: deadline_exceeded`); `report()` records it under the phase without a second log line.
+- `src/core/persistence/bounded-reads.ts` and `coordinator.ts`: a discarded connection after the budget is the preparation deadline, never `storage_error` or `database_contention`.
+- Doctor `persistence_session_timeouts` gains the `transaction_mode_pooler` warning (`resolvePrepare(url) === false`).
+- Tests: `test/postgres-engine-cancel-settle.test.ts` (never-settling statement is discarded at the window; a honoured cancel is not), `test/persistence-consumer-log.test.ts` (the consumer logs one `deadline_exceeded`, no `storage_error`, and ticks again), `test/e2e/persistence-pooler-wedge-postgres.test.ts` (a wedged `expired_claims` statement inside a real 60-page managed catch-up: cancel swallowed, discarded at the window, the run drains `synced`; hangs on the previous release).
+
+Refs #6278 (the mechanism behind the never-settling `preparing` wedge); the two-consumer and direct-URL work continues in #6317.
 
 ## [0.60.113.0] - 2026-10-08
 
