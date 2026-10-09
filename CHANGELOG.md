@@ -10,7 +10,7 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
-## [0.60.121.0] - 2026-10-08
+## [0.60.121.0] - 2026-10-09
 
 **A managed catch-up on a live checkout finishes unattended: a page that moves under the run is held, a dropped database connection is retried, a relaunch resumes the frozen manifest, and `gbrain sync status` / `gbrain sync unblock` let an operator agent run the recovery loop without a human.**
 
