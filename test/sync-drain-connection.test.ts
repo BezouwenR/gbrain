@@ -82,7 +82,7 @@ describe('runDrain over a dropping connection', () => {
     expect(next).toMatchObject({ command: RESUME, safe_to_loop: true, retry_after_ms: 60_000, code: 'connection_lost', docs: ERROR_CATALOGUE.sync_drain_connection_lost.docs });
     expect(next.why).toContain('3 times in a row');
     expect(next.why).toContain('without re-freezing');
-    expect(ERROR_CATALOGUE.sync_drain_connection_lost).toEqual({ code: 'connection_lost', docs: 'docs/guides/sync-unblock-runbook.md#connection' });
+    expect(ERROR_CATALOGUE.sync_drain_connection_lost).toEqual({ code: 'connection_lost', docs: 'docs/guides/write-refusals.md#drain-connection-lost' });
     expect(CODES.connection_lost).toMatchObject({ class: 'retryable', retryable: true });
     expect(drainJsonFields(result, RESUME, 's')).toMatchObject({ outcome: 'blocked', next: { command: RESUME, safe_to_loop: true } });
     const summary = formatDrainSummary(result, RESUME, 's').join('\n');

@@ -548,7 +548,7 @@ More: [docs/guides/write-refusals.md#concurrent_write](../../docs/guides/write-r
 |---|---|---|---|---|---|---|
 | The managed sync drain lost its database connection three times in a row without committing a page in between, so it stopped where the cursor stands; nothing is recorded against the source. | A pooler drop (ECONNABORTED, ECONNRESET, ETIMEDOUT, EPIPE) is a transport fault, not a page fault: the drain reconnects and retries at 5, 15 and 45 seconds, and the frozen manifest and cursor stay as they are. Three consecutive drops with no progress mean the database is unreachable from here for now. | Check the database URL and pooler (gbrain doctor --json), then rerun the same gbrain sync; it resumes at the stored cursor without re-freezing the manifest. | agent | `repeat the read that failed` | 1 | yes |
 
-More: [docs/guides/sync-unblock-runbook.md#connection](../../docs/guides/sync-unblock-runbook.md#connection)
+More: [docs/guides/write-refusals.md#drain-connection-lost](../../docs/guides/write-refusals.md#drain-connection-lost)
 
 ### connector_account_changed
 

@@ -108,7 +108,7 @@ export const CODES = {
   connection_lost: { class: 'retryable', retryable: true, actor: 'agent',
     summary: "The managed sync drain lost its database connection three times in a row without committing a page in between, so it stopped where the cursor stands; nothing is recorded against the source.",
     why: "A pooler drop (ECONNABORTED, ECONNRESET, ETIMEDOUT, EPIPE) is a transport fault, not a page fault: the drain reconnects and retries at 5, 15 and 45 seconds, and the frozen manifest and cursor stay as they are. Three consecutive drops with no progress mean the database is unreachable from here for now.",
-    docs: 'docs/guides/sync-unblock-runbook.md#connection',
+    docs: 'docs/guides/write-refusals.md#drain-connection-lost',
     suggestion: 'Check the database URL and pooler (gbrain doctor --json), then rerun the same gbrain sync; it resumes at the stored cursor without re-freezing the manifest.' },
   connector_account_changed: { class: 'caller', summary: "The connector credential resolves to a different account than the source is pinned to." },
   connector_fence_below_timeline: { class: 'caller', summary: "A stored page carries a fence the connector render cannot preserve." },

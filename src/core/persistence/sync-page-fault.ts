@@ -84,11 +84,14 @@ export async function pageChangeProof(engine: Pick<BrainEngine, 'executeRaw'>, i
   return { request_id: writer.request_id, operation: writer.operation, revision: page.revision };
 }
 
-/** The page's live revision (null when it no longer exists), for a hold that records what it observed. */
+/**
+ * The page's current revision, soft-deleted pages included (a deletion advances the revision, and a new-file entry whose slug
+ * a page now occupies has moved too); null when no row exists. For a hold that records what it observed.
+ */
 export async function liveRevision(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, page: { pageId: number | null; slug: string }): Promise<string | null> {
   const [row] = page.pageId === null
-    ? await engine.executeRaw<{ revision: string | null }>('SELECT knowledge_revision::text AS revision FROM pages WHERE source_id=$1 AND slug=$2 AND deleted_at IS NULL', [sourceId, page.slug])
-    : await engine.executeRaw<{ revision: string | null }>('SELECT knowledge_revision::text AS revision FROM pages WHERE id=$1 AND source_id=$2 AND deleted_at IS NULL', [page.pageId, sourceId]);
+    ? await engine.executeRaw<{ revision: string | null }>('SELECT knowledge_revision::text AS revision FROM pages WHERE source_id=$1 AND slug=$2', [sourceId, page.slug])
+    : await engine.executeRaw<{ revision: string | null }>('SELECT knowledge_revision::text AS revision FROM pages WHERE id=$1 AND source_id=$2', [page.pageId, sourceId]);
   return row?.revision ?? null;
 }
 
