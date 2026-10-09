@@ -2426,8 +2426,7 @@ async function prepareConnectedDispatch(command: string, args: string[]): Promis
   // deadline even when the main event loop is starved by a synchronous spin —
   // the only thing that stops the cron orphan-pileup. Disposed in the finally.
   let syncWatchdog: { dispose(): void } | null = null;
-  // #6340: `gbrain sync status` / `gbrain sync unblock` are read-and-schedule commands on the brain's own engine: no
-  // watchdog, no serve delegation (a delegate would refuse the subcommand as an unsupported option).
+  // #6340: `sync status` / `sync unblock` read and schedule on the brain's own engine: no watchdog, no serve delegation (a delegate would refuse the subcommand).
   const syncOperator = command === 'sync' && (args[0] === 'status' || args[0] === 'unblock');
   if (command === 'sync' && !syncOperator) {
     try {

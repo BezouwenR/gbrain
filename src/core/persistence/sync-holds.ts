@@ -418,12 +418,12 @@ export function gitHoldFix(record: Pick<GitHoldRecord, 'source_id' | 'path' | 'c
       return fenceHoldFix(record, auto);
     case 'worktree_dirty': {
       const verify = { argv: ['gbrain', 'sources', 'status', source, '--json'] };
-      return { argv: ['git', '-C', '<source root>', 'status', '--porcelain', '--', record.path], consent: [], actor: 'agent', requires_exclusive: false, docs: 'docs/guides/write-refusals.md#worktree_dirty',
+      return { argv: ['gbrain', 'sync', 'unblock', '--source', source, '--apply', '--json'], consent: [], actor: 'agent', requires_exclusive: false, docs: 'docs/guides/write-refusals.md#worktree_dirty',
         why: `${record.path} has uncommitted working-tree bytes that match neither the pinned commit nor the current page, so sync held it instead of overwriting the local edit; the rest of the source kept syncing. `
-          + `Whoever edits that file (an agent writing to the checkout) should commit it; once git status is clean for it, run gbrain sources retry-held ${source} and gbrain sync --source ${source} --no-pull. `
-          + `A later commit that changes the file re-screens the hold on its own. Do not discard or normalize the local bytes.`,
-        then: { argv: ['gbrain', 'sources', 'retry-held', source], consent: [], actor: 'agent', requires_exclusive: false, verify,
-          why: `Schedules ${record.path} for a re-screen on the next sync, once its edit is committed (gbrain sync unblock --source ${source} --apply does this check and scheduling for every such hold).` },
+          + `Whoever edits that file (an agent writing to the checkout) should commit it. unblock checks whether the bytes are committed at HEAD now: if so it schedules the re-screen and prints the sync to run, `
+          + `if not it refuses still_dirty and the file stays held. A later commit that changes the file re-screens the hold on its own. Do not discard or normalize the local bytes.`,
+        then: { argv: ['gbrain', 'sync', '--source', source, '--no-pull'], consent: [], actor: 'agent', requires_exclusive: false, verify,
+          why: `Re-imports ${record.path} once it is scheduled (unblock prints this command with the cursor's own options); a file that is still dirty stays held without blocking the rest.` },
         verify };
     }
     case 'concurrent_write': {

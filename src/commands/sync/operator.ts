@@ -9,7 +9,7 @@ import type { BrainEngine } from '../../core/engine.ts';
 import { cliRenderContext, renderAction } from '../../core/agent-output.ts';
 import { opError } from '../../core/ops/contract.ts';
 import { readSyncStatus, unblockSync } from '../../core/persistence/sync-status.ts';
-import { SYNC_FAULT_TABLE } from '../../core/persistence/sync-fault-class.ts';
+import { HOLD_ATTEMPTS_NEEDS_HUMAN } from '../../core/persistence/sync-fault-class.ts';
 import { resolveSourceIdEngineFree } from '../../core/source-resolver.ts';
 
 export function printSyncStatusHelp(): void {
@@ -43,7 +43,7 @@ it leaves a file out, and each refusal names the file, why, and its fix.
   preparation_stalled   re-screened (the writer, not the file, stalled)
   concurrent_write      refused: a person reconciles the two versions
   repair-class holds    refused with the repair preview to run
-  held ${SYNC_FAULT_TABLE.find(rule => rule.code === 'worktree_dirty')!.escalate.split(' ')[1]} times            refused: the page keeps moving; needs a person
+  held ${HOLD_ATTEMPTS_NEEDS_HUMAN} times          refused: the page keeps moving; needs a person
 
 Then run the sync \`next\` names (the cursor's own options).
 `);
@@ -52,8 +52,8 @@ Then run the sync \`next\` names (the cursor's own options).
 function sourceOf(args: string[]): string {
   const explicit = args.find((a, i) => args[i - 1] === '--source') ?? null;
   const source = resolveSourceIdEngineFree(explicit, process.cwd());
-  if (!source || source === '__all__') throw opError('invalid_params', 'sync status and sync unblock need one source.', 'Pass --source <id>; gbrain sources list --json lists the ids.',
-    { fix: { argv: ['gbrain', 'sources', 'list', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Lists the source ids, read-only.' } });
+  if (!source || source === '__all__') throw opError('invalid_params', 'sync status and sync unblock need one source.', 'Name one source with --source; the fix lists the ids.',
+    { fix: { argv: ['gbrain', 'sources', 'list', '--json'], consent: [], actor: 'agent', requires_exclusive: false, why: 'Lists the source ids, read-only; then rerun with --source and one of them.' } });
   return source;
 }
 

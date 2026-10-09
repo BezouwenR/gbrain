@@ -12,7 +12,7 @@ import { getWriteRequest, admitWriteInTransaction, foregroundPriority, intentDig
 import { preparationConfigView } from './config-snapshot.ts';
 import { isWriteCapacityWait, retryWriteAdmission } from './admission-retry.ts';
 import { assertPersistenceAccepting, awaitWrite, foregroundWriteCompletions, startPersistenceConsumer, type WriteWait } from './service.ts';
-import { assertSyncEntryOrigin, discoverManagedSync, resolveManagedSyncContext, readSyncContent, readSyncFile, syncGit, type SyncDiscovery } from './sync-discovery.ts';
+import { assertSyncEntryOrigin, discoverManagedSync, resolveManagedSyncContext, readSyncContent, readSyncFile, syncGit, type ManagedSyncContext, type SyncDiscovery } from './sync-discovery.ts';
 import { isImageFilePath } from '../sync.ts';
 import { assertSyncPageOrigin, sameSyncOrigin, syncOriginScope } from './sync-origin.ts';
 import { assertManagedSyncActive, assertSyncDispatchActive, managedSyncAuthority, validateSyncAuthority, validateManagedSyncOptions, syncProcessingOptions, SYNC_PROCESSING_KEYS, type SyncAuthority, type SyncProcessingOptions } from './sync-authority.ts';
@@ -1163,6 +1163,33 @@ export async function managedSyncCursorKey(engine: BrainEngine, opts: SyncOpts):
   const authority = await managedSyncAuthority(engine, context.sourceId, context.incarnation, opts.repoPath ?? context.root);
   return managedCursorKey(context.incarnation, authority, currentCompanyBrainSync(context.sourceId), cursorSyncOptions(opts));
 }
+/**
+ * `--retry-failed` on an unfinished cursor whose pending request failed (or whose run has a ledger row). #6340: a pending
+ * request the run would now hold (a page that moved, a dirty file, a fence) converts in place with the frozen manifest;
+ * only a failure no hold covers still rediscovers from HEAD. Null when nothing applies (an unfinished request, no failure).
+ */
+async function retryFailedStart(engine: BrainEngine, cursor: Cursor, key: string, input: { opts: SyncOpts; context: ManagedSyncContext; authority: SyncAuthority;
+  processingOptions: SyncProcessingOptions; syncOptions: SyncCursorOptions; startupConfig: BrainEngine; frozenRun: Parameters<typeof freezeEntry>[4]; runStartedAt: string;
+  discoveryRun: string; assertActive: () => void }): Promise<{ cursor: Cursor; discoveryTarget?: string } | null> {
+  const { opts, context, authority, processingOptions, syncOptions, assertActive } = input;
+  const unfinished = await engine.executeRaw(`SELECT id FROM persistence_requests WHERE source_id=$1
+    AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1`, [cursor.sourceId]);
+  assertActive();
+  if (unfinished.length) return null;
+  const failed = cursor.pending ? await getWriteRequest(engine, cursor.authority.writer.principal, cursor.pending.requestId) : null;
+  const recorded = await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1 AND completed_keys->0->>'run_id'=$2", [key, cursor.runId]);
+  assertActive();
+  if (!((failed && ['failed', 'conflict', 'cancelled'].includes(failed.state)) || (recorded.length && (failed?.state === 'committed' || !failed)))) return null;
+  const screen = failed && cursor.pending ? await loadSyncScreenRun(input.startupConfig, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote) : null;
+  const converted = screen ? await convertBlockedCursor(engine, cursor, key, assertActive, { ...input.frozenRun, screen, observedAt: cursor.discoveredAt ?? input.runStartedAt }) : cursor;
+  assertActive();
+  if (converted !== cursor) return { cursor: converted };
+  const discoveryTarget = syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
+  const discovery = await discoverManagedSync(engine, opts, context);
+  assertActive();
+  return { cursor: await replaceCursor(engine, key, header(cursor), { ...discovery, authority, processingOptions, syncOptions, runId: input.discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 } }, assertActive), discoveryTarget };
+}
+
 export async function performManagedSync(engine: BrainEngine, opts: SyncOpts, slice?: { maxPages: number; maxMs: number }): Promise<SyncResult> {
   const state: HoldRunState = {};
   const synced = await runManagedSync(engine, opts, slice, state);
@@ -1252,29 +1279,8 @@ async function runManagedSync(engine: BrainEngine, opts: SyncOpts, slice: { maxP
     }
     const startupConfig = await preparationConfigView(engine); // #5984 G3: one config read answers the startup's config reads
     if (cursor && opts.retryFailed && !opts.dryRun && !company && !cursor.done) {
-      const unfinished = await engine.executeRaw(`SELECT id FROM persistence_requests WHERE source_id=$1
-        AND (state IN ('queued','running','recovering') OR recovery IS NOT NULL) LIMIT 1`, [cursor.sourceId]);
-      assertActive();
-      if (!unfinished.length) {
-        const failed = cursor.pending ? await getWriteRequest(engine, cursor.authority.writer.principal, cursor.pending.requestId) : null;
-        const recorded = await engine.executeRaw("SELECT 1 FROM op_checkpoints WHERE op='managed-sync-failure' AND fingerprint=$1 AND completed_keys->0->>'run_id'=$2", [key, cursor.runId]);
-        assertActive();
-        if ((failed && ['failed', 'conflict', 'cancelled'].includes(failed.state)) || (recorded.length && (failed?.state === 'committed' || !failed))) {
-          // #6340: a pending request the run would now hold (a page that moved, a dirty file, a fence) converts in place with
-          // the frozen manifest instead of rediscovering it; only a failure no hold covers still rediscovers.
-          const screen = failed && cursor.pending ? await loadSyncScreenRun(startupConfig, cursor.sourceId, cursor.processingOptions ?? processingOptions, authority.writer.remote) : null;
-          const converted = screen ? await convertBlockedCursor(engine, cursor, key, assertActive, { ...frozenRun, screen, observedAt: cursor.discoveredAt ?? runStartedAt }) : cursor;
-          assertActive();
-          if (converted !== cursor) cursor = converted;
-          else {
-            phase = 'discovery';
-            discoveryTarget = syncGit(context.gitRoot, ['rev-parse', 'HEAD']).trim();
-            const discovery = await discoverManagedSync(engine, opts, context);
-            assertActive();
-            cursor = await replaceCursor(engine, key, header(cursor), { ...discovery, authority, processingOptions, syncOptions, runId: discoveryRun, index: 0, counts: { added: 0, modified: 0, deleted: 0, chunks: 0 } }, assertActive);
-          }
-        }
-      }
+      const retried = await retryFailedStart(engine, cursor, key, { opts, context, authority, processingOptions, syncOptions, startupConfig, frozenRun, runStartedAt, discoveryRun, assertActive });
+      if (retried) { cursor = retried.cursor; if (retried.discoveryTarget) { phase = 'discovery'; discoveryTarget = retried.discoveryTarget; } }
     }
     assertActive();
     // #5988: a finished run is not pending work; the dry run previews the holds of what a new run would discover.
