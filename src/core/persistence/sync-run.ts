@@ -43,8 +43,7 @@ import { isRetryableConnError, isStatementTimeoutError } from '../retry-matcher.
 import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
 import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, preparationStalledHold, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
 import { fenceReceiptLocation } from '../fence-repair/refusal.ts';
-import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-write.ts';
-import { headCommittedBytes, pageChangeProof, pageChangedHold, pageMovedSinceAdmission, pinnedWorktreeConflict, worktreeDirtyHold } from './sync-page-fault.ts';
+import { headCommittedBytes, originFaultHold, pageChangeProof, pageChangedHold, pinnedWorktreeConflict, receiptPageFaultHold } from './sync-page-fault.ts';
 import { faultPoint } from './fault-points.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { withCoordinatedWrite } from './context.ts';
@@ -361,10 +360,7 @@ async function freezeEntry(engine: BrainEngine, cursor: Cursor, key: string, ass
     }), engine.readPageSnapshot(entry.slug!, { sourceId: cursor.sourceId, includeDeleted: true })]);
     assertActive();
     if (occupant && 'originFault' in occupant) {
-      const proof = await pageChangeProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pageId: entry.pageId ?? null, expectedRevision: entry.revision ?? null });
-      assertActive();
-      return { hold: pageChangedHold(entry, entry.slug!, snapshot?.page.id ?? entry.pageId ?? null, { content: null, blobOid: undefined, expected_revision: entry.revision ?? null },
-        { proof, revision: snapshot?.revision ?? null, why: `the page recorded at ${entry.sourcePath} no longer identifies the one this sync enumerated (${occupant.originFault.message})` }), overtaken: true };
+      return { hold: await originFaultHold(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, entry, observed: snapshot, message: occupant.originFault.message }), overtaken: true };
     }
     let bytes: Buffer | null = null;
     try { bytes = readSyncFile(cursor.root, entry.path); }
@@ -635,13 +631,11 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
   const compacted = !fence && failed.compacted === true && failed.error_message == null && ['invalid_params', 'take_row_collision'].includes(failed.error_code ?? '');
   // #6340: a cursor an older run left blocked on a page that moved under it converts the same way the run now does.
   if (!fence && !compacted && entry && entry.path === previous.intent.path && previous.intent.kind !== 'managed_sync_checkpoint' && !blocked.companyPlan) {
-    const proof = previous.intent.kind === 'managed_sync_import' ? await concurrentWriteProof(engine, { sourceId: blocked.sourceId, incarnation: blocked.incarnation, pending: previous, done: failed }) : null;
-    const moved = proof ? null : await pageMovedSinceAdmission(engine, blocked.sourceId, previous, failed);
-    const dirty = !proof && !moved && previous.intent.kind === 'managed_sync_import' && pinnedWorktreeConflict(failed);
+    const hold = await receiptPageFaultHold(engine, { sourceId: blocked.sourceId, incarnation: blocked.incarnation, entry, pending: previous, done: failed });
     assertActive();
-    if (proof || moved || dirty) {
+    if (hold) {
       // The file may have been committed meanwhile: a re-freeze then imports HEAD's bytes instead of holding the stale conflict.
-      if (dirty && headCommittedBytes(blocked, entry.path)?.rawHash !== undefined) {
+      if (hold.code === 'worktree_dirty' && headCommittedBytes(blocked, entry.path)?.rawHash !== undefined) {
         const base: Cursor = { ...blocked }; delete base.pending;
         const again = await freezeEntry(engine, base, key, assertActive, run);
         const converted = [...(blocked.convertedFromFailed ?? []), previous.requestId];
@@ -652,9 +646,6 @@ async function convertBlockedCursor(engine: BrainEngine, blocked: Cursor, key: s
         return saveCursor(engine, key, blocked, { ...blocked, convertedFromFailed: converted, pending: { ...again, converted: true } }, false, assertActive,
           tx => recordSyncConversion(tx, blocked.sourceId, blocked.incarnation, { request_id: previous.requestId, path: previous.intent.path ?? null, slug: previous.slug, run_id: blocked.runId, outcome: 'refrozen' }));
       }
-      const hold = proof ? concurrentWriteHold(entry, previous.slug, previous.pageId!, previous.intent, proof)
-        : moved ? pageChangedHold(entry, previous.slug, previous.pageId, previous.intent, { proof: null, revision: moved.revision, why: `page ${previous.slug} changed in the database` })
-          : worktreeDirtyHold(entry, previous.slug, previous.pageId, previous.intent);
       const held = await holdUnderGate(engine, { cursor: blocked, key, pending: previous, hold, assertActive, observedAt: run.observedAt!, waitMs: 5000, failedId: failed.id });
       return held === 'pending' ? blocked : held;
     }
@@ -710,18 +701,13 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
     base = { ...cursor, breaker }; delete base.pending; delete base.group; delete base.window;
   }
   const fence = stalled || !page ? null : fenceReceiptLocation(done);
-  // #6194 (D4): a revision conflict proven to come from a concurrent database-only write is held the same way (sync-concurrent-write.ts).
-  const proof = stalled || fence || !page ? null : await concurrentWriteProof(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, pending, done });
-  // #6340: a revision conflict whose page really moved (no proof of who moved it) and a pinned-worktree conflict (uncommitted
-  // local bytes) hold the page too (sync-page-fault.ts); a run-level revision conflict (the page is where it was) still blocks.
-  const moved = stalled || fence || proof ? null : await pageMovedSinceAdmission(engine, cursor.sourceId, pending, done);
-  const dirty = !stalled && !fence && !proof && !moved && page && pinnedWorktreeConflict(done);
-  if (!stalled && !fence && !proof && !moved && !dirty) return null;
+  // #6194 (D4): a revision conflict proven to come from a concurrent database-only write is held the same way; #6340: so is one
+  // whose page really moved with no proof of who moved it, and a pinned-worktree conflict (uncommitted local bytes) holds
+  // `worktree_dirty` (sync-page-fault.ts). A run-level revision conflict (the page is where it was) still blocks.
+  const fault = stalled || fence ? null : await receiptPageFaultHold(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, entry, pending, done });
+  if (!stalled && !fence && !fault) return null;
   const hold = stalled ? preparationStalledHold(entry, pending.slug, pending.pageId, done, pending.intent.content ?? null, pending.intent.blobOid, resumeArgsOf(cursor, run))
-    : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content!, pending.intent.blobOid)
-      : proof ? concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof)
-        : moved ? pageChangedHold(entry, pending.slug, pending.pageId, pending.intent, { proof: null, revision: moved.revision, why: `page ${pending.slug} changed in the database` })
-          : worktreeDirtyHold(entry, pending.slug, pending.pageId, pending.intent);
+    : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content!, pending.intent.blobOid) : fault!;
   return holdUnderGate(engine, { cursor, key, pending, hold, assertActive, observedAt: run.observedAt!, waitMs, failedId: done.id, base });
 }
 

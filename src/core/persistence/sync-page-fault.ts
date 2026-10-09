@@ -38,6 +38,7 @@ import { readTreeBlobs } from './sync-blobs.ts';
 import type { SyncIntent } from './sync-prepare.ts';
 import type { HeldEntry } from './sync-screen.ts';
 import type { GitHoldMeta } from './sync-holds.ts';
+import { concurrentWriteHold, concurrentWriteProof } from './sync-concurrent-write.ts';
 
 export { HOLD_ATTEMPTS_NEEDS_HUMAN } from './sync-fault-class.ts';
 
@@ -144,4 +145,33 @@ export async function pageMovedSinceAdmission(engine: Pick<BrainEngine, 'execute
   if (done.state === 'committed' || done.error_code !== 'revision_conflict') return null;
   const revision = await liveRevision(engine, sourceId, pending);
   return revision === (pending.intent.expected_revision === null || pending.intent.expected_revision === undefined ? null : String(pending.intent.expected_revision)) ? null : { revision };
+}
+
+/**
+ * The hold a terminal receipt of a page request earns when its page moved under the sync, or null when the receipt is
+ * not such a fault: #6194's proven race (`concurrent_write` with the competing request), a `revision_conflict` whose page
+ * really moved (`concurrent_write` by revision), or a `pinned_git_worktree_conflict` (`worktree_dirty`). Shared by the
+ * run's receipt branch and the start-of-run conversion of an older release's blocked cursor.
+ */
+export async function receiptPageFaultHold(engine: Pick<BrainEngine, 'executeRaw'>, input: { sourceId: string; incarnation: string; entry: HoldEntry;
+  pending: { slug: string; pageId: number | null; intent: SyncIntent }; done: Pick<WriteRequest, 'state' | 'error_code' | 'error_message'> }): Promise<HeldEntry | null> {
+  const { entry, pending, done } = input;
+  const page = pending.intent.kind === 'managed_sync_import' && typeof pending.intent.content === 'string';
+  const proof = page ? await concurrentWriteProof(engine, { sourceId: input.sourceId, incarnation: input.incarnation, pending, done }) : null;
+  if (proof) return concurrentWriteHold(entry, pending.slug, pending.pageId!, pending.intent, proof);
+  const moved = await pageMovedSinceAdmission(engine, input.sourceId, pending, done);
+  if (moved) return pageChangedHold(entry, pending.slug, pending.pageId, pending.intent, { proof: null, revision: moved.revision, why: `page ${pending.slug} changed in the database` });
+  return page && pinnedWorktreeConflict(done) ? worktreeDirtyHold(entry, pending.slug, pending.pageId, pending.intent) : null;
+}
+
+/**
+ * The `concurrent_write` hold for an entry whose recorded origin no longer identifies the page this sync enumerated
+ * (`assertSyncPageOrigin` refused at freeze time: the page at that origin was deleted, re-bound or replaced in the database).
+ */
+export async function originFaultHold(engine: Pick<BrainEngine, 'executeRaw'>, input: { sourceId: string; incarnation: string; entry: HoldEntry & Pick<SyncEntry, 'slug' | 'pageId' | 'revision'>;
+  observed: { page: { id: number }; revision: string | null } | null; message: string }): Promise<HeldEntry> {
+  const { entry } = input;
+  const proof = await pageChangeProof(engine, { sourceId: input.sourceId, incarnation: input.incarnation, pageId: entry.pageId ?? null, expectedRevision: entry.revision ?? null });
+  return pageChangedHold(entry, entry.slug!, input.observed?.page.id ?? entry.pageId ?? null, { content: null, blobOid: undefined, expected_revision: entry.revision ?? null },
+    { proof, revision: input.observed?.revision ?? null, why: `the page recorded at ${entry.sourcePath} no longer identifies the one this sync enumerated (${input.message})` });
 }
