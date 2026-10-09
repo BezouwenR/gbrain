@@ -10,6 +10,110 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.120.0] - 2026-10-08
+
+**Advisers, board members and investors stop showing up as employees, typed relation lines refuse template and dictionary junk and explain every refusal, and turning the line grammar on or off now changes the graph instead of only new writes.**
+
+Link inference typed "is an adviser to [X]" as nothing, "not an advisor to [X]" as `advises`, "board director at [X]" as `works_at`, and read "Became an advisor at [X]" as the start of a job, so a person's board seats and advisory roles read as jobs and opened employment stints that never existed. Three typing changes fix that; each was preregistered and confirmed on held-out data that nobody on the change saw (decision `q2-parser-gaps-2026-10`). The opt-in typed relation lines (`line_grammar.enabled`) got guards against the shapes the first held-out audit caught (unfilled template slots, separator rows, placeholders, dictionary usage labels) and a finding for every line they refuse. They stay off by default: the second held-out audit, run on fresh natural pages with the guards, still read 583 list lines as grammar lines, 459 of them wrong, and minted 17 of 52 decoy lines; typed lines written on purpose were read 511 of 511.
+
+### How to use it
+
+```bash
+gbrain extract --stale                                   # finish the one-time re-extraction now (zero model calls); managed extraction does it in the background
+gbrain doctor --json                                     # links_extraction_lag 0 when every page is re-extracted
+gbrain config set line_grammar.enabled true              # opt in to typed relation lines; prints how many pages re-extract
+gbrain get people/alice-example --grammar-diagnostics    # every line-grammar finding for a page (MCP: get_page grammar_diagnostics: true)
+```
+
+### What you see
+
+| Where | What changed |
+|---|---|
+| Link types (U1) | "is an adviser to [X]", "serves as an adviser to", "now advising [X]" type `advises`. "not an advisor to [X]", "no longer advises [X]" and "stopped advising [X]" no longer type `advises` for that occurrence (a dated "no longer advises" still ends an `advises` the page states elsewhere). A job title such as "financial adviser at [Bank]" and a third party's role stay as they were. |
+| Link types (U3) | "board director at [X]", "independent director of [X]", "joined as an observer at [X]" never type `works_at`; "holds a board seat at [X]" types `invested_in` only with investor wording or an investor role prior. Board membership is not a type of its own, so these links read `mentions` unless a role prior applies. |
+| Employment starts (U4) | "Became an advisor at [X]", "Took an advisory role with [X]", "Took a board role at [X]" no longer start a `works_at` stint; advisory, board, investor, angel and observer roles are skipped by the employment start cue. |
+| Existing pages | `LINK_EXTRACTOR_VERSION_TS` moves to 2026-10-08, so every page re-extracts its links once in the background with zero model calls. |
+| `gbrain config set/unset line_grammar.*` | The setting and the time it changed commit together, every page extracted before that time re-extracts once, and the command prints how many pages are queued. Turning the grammar off restores inferred types on every page; setting the same value again changes nothing. |
+| Typed relation and fact lines (opt-in) | `- [Time] - [Event]`, `- [Date] — Kickoff`, `- [Item] TBD` and `- [noun] a thing` are no longer read as fact lines. `- **works_at** [[x]]`, `` - `works_at` [[x]] `` and `- works_at: [[x]]` are refused with the bare form as the fix. |
+| `put_page` and `get_page` | `put_page`'s `line_grammar` findings follow the agent operator contract (`code`, `why`, `canonical`, `verify`), at most five per write with `more` naming the call that lists all of them: `get_page` with `grammar_diagnostics: true`, which reads the brain's settings and the source's schema pack. A brain whose settings cannot be read returns `diagnostics_failed` with a `gbrain doctor` step, never an ungated reading. |
+
+### Numbers
+
+Measured on the three units together (dev set, temporal-edges phrasings A, A2, A3, seeds 3 and 5): false employment starts 48/48/37 → 0, wrong closures from them 24/24/8 → 0, wrong transitions by identity 89/89/59 → 17/17/14, live recall and traps unchanged. Two more candidate units were not shipped: ordinary role wording with leave idioms (U25) added nothing on the held-out confirmation set (difference 0.000 on all 200 pairs), and start framings such as "first day at" (U6) failed the held-out safety conditions.
+
+Re-extraction cost after a version bump or a line-grammar toggle (`scripts/bench-link-extraction-drain.ts`): Postgres 10k pages drains at 21.4 ms/page (218 s), and 100k pages on a 16-vCPU VM at 15.9 ms/page (26.6 min), with `get_links` at 13.6 ms while 71,550 pages wait; `put_page` p50/p95/p99 is 121/180/238 ms with the grammar off and 126/151/174 ms with it on at 100k. PGLite on the same VM drains 10k pages at 7.9 ms/page (80 s) and 100k pages at 5.9 ms/page (9.9 min), with `get_links` at 7.6 ms while 63,150 pages wait and `put_page` p50/p95/p99 116/145/202 ms (grammar off) and 110/127/195 ms (on) at 100k. Those PGLite numbers include the stale-statistics fix that shipped separately (`ANALYZE` after bulk writes); without it, the same 10k drain took 119 ms/page.
+
+### For contributors
+
+- `src/core/link-typing-units.ts` holds the units and `ENABLED_TYPING_UNITS` (U3, U4, U1); `explainLinkType` / `traceLinkType` report the rule, unit, attachment and suppressed matches behind each link type, and `scripts/q2-typing-dev.ts` / `scripts/q2-typing-package.ts` rebuild the dev digests and unit packages.
+- `test/link-typing-units-subsets.test.ts` pins world-v1 typing: with no unit it is byte-identical to master, and with the shipped units it is the confirmed held-out package plus master's later target-role rule (#6191).
+- The grammar's settings-bound extraction lives in `src/core/line-grammar-config.ts` and `src/core/link-extraction-watermark.ts`; `src/core/line-grammar-report.ts` builds the findings.
+- The preregistration, harness and held-out verdicts are in gbrain-evals (`docs/benchmarks/2026-10-06-q2-parser-gaps-preregistration.md`, `docs/benchmarks/2026-10-05-heldout-program/q2.md`).
+
+## [0.60.119.0] - 2026-10-08
+
+**A managed catch-up starts committing about 4 seconds sooner, and a page you save during it no longer waits on locks the sync never needed.**
+
+On a managed Postgres brain 57 ms from the database, the first page of a catch-up used to land about 19 seconds after `gbrain sync` started; now it lands after about 15.5. A page save during the catch-up stays within a second of its idle time at the slow end, where one run in three on the previous release went over two seconds and lost a write to its wait.
+
+### How to use it
+
+```bash
+gbrain sync --source <id>                    # nothing to change
+GBRAIN_PG_TYPE_CACHE_PERSIST=0 gbrain sync   # keep described parameter types in this process only
+GBRAIN_PG_TYPE_CACHE=0 gbrain sync           # no sharing of described parameter types at all
+```
+
+### The numbers that matter
+
+Ubicloud 16-core VMs, Postgres behind a 57 ms proxy, 1,500 files with 34 already-deleted files first, default settings, three runs each.
+
+| What you do | v0.60.117.0 | Now |
+|---|---|---|
+| Time until the first page is committed | 19.0 to 19.6 s | 15.5 to 15.6 s |
+| Slowest saves during a catch-up (p95), over the same save with nothing running | +0.5 to +2.3 s, one save failed | +0.5 to +0.8 s, none failed |
+| Catch-up speed while your agent saves a page every 5 s | 61 to 65% of idle | 55 to 64% of idle |
+| Catch-up pages per minute with nothing else running | 370 to 379 | 370 to 393 |
+
+### Things to watch
+
+- **gbrain now keeps a small cache file per database** under `~/.gbrain/cache/pg-types/`: the parameter types Postgres described for gbrain's statements, so the next command skips asking again. It holds hashes and type numbers only (no SQL text, no credentials), is ignored when the Postgres version or the brain's schema version differs, and is deleted when a migration runs.
+- **The first catch-up after an upgrade is slower than the next one.** A statement only the catch-up runs still asks Postgres for its types the first time.
+- **The first page still takes 15.5 s, not the 15 s target.** What remains is serial startup reads, screening already-deleted files four at a time, and the first group's own round trips.
+
+### Itemized changes
+
+- Postgres: a pool's `shared_types` takes the Map to share described parameter types in; every pool in a process that reaches one database shares one, and it is saved for the next process, scoped to the server version, the schema version and the database as the server names it.
+- Sync: a waiver run screens each entry it froze against that freeze's page read and authority check instead of repeating both, and each freeze reads the page beside its origin check.
+- Lanes: claiming a lane group's followers locks only the group's rows, not the write queued after it.
+- Lanes: a foreground write another process claimed but has not started publishing holds back new lane groups, as a queued one does; before, groups kept starting ahead of it until that process handed it back.
+- Benchmarks: `docs/eval/managed-sync-catchup.md` corrects v0.60.111.0's catch-up-while-saving figure (45%, one low run) to the 57 to 71% every later run of that code measured.
+- Driver: `patches/postgres@3.4.9.patch` matches the vendored driver again (`bash vendor/update-postgres.sh --check` passes).
+
+## [0.60.118.0] - 2026-10-08
+
+**Background fact extraction now uses Claude Haiku 5.5 when nothing else chooses a model, cutting the cost of a gbrain write from $15.94 to $1.38 per 1,000 pages.**
+
+Every page an agent writes queues a background job that asks a chat model which facts the page states. With an Anthropic key and no model set, that model was Claude Sonnet 4.6, an older generation and most of the cost of a write: on 1,000 LongMemEval-S sessions at v0.60.110.0 the job cost $15.60 of the $15.94 total. A preregistered facts-absorb quality gate in gbrain-evals ran the real job with three models on the same pages (`docs/benchmarks/2026-10-08-facts-extraction-model.md`). Claude Haiku 5.5 passed every check against Sonnet 4.6: recall and precision non-inferior, attribution and correction handling no worse, no parse failures, every fact readable after a restart. A switched-off extractor and an extractor whose output is dropped both failed the gate. GPT-6 Luna failed the attribution check, so OpenAI-only installs keep their current default.
+
+The cost is a small loss on long natural conversations: on 20 natural transcripts, Haiku 5.5's facts covered 4.6 points fewer planted items than Sonnet 4.6's (95% interval −9.0 to −0.6), inside the gate's 10-point harm margin. To keep Sonnet 4.6:
+
+```bash
+gbrain config set facts.extraction_model anthropic:claude-sonnet-4-6
+gbrain models          # the facts.extraction_model row shows the model and "measured default" when the new default applies
+```
+
+### What you see
+
+| Where | What changed |
+|---|---|
+| Fact extraction (`facts-absorb`, `extract_facts`, the drain) | Uses `anthropic:claude-haiku-5-5` when `facts.extraction_model`, `models.tier.reasoning`, `models.default` and `GBRAIN_MODEL` are all unset and the reasoning tier resolves through Anthropic. Any of those settings still wins. |
+| `gbrain models` | The `facts.extraction_model` row reports the model extraction actually uses and the setting that chose it (`measured default`, `config: facts.extraction_model`, `config: models.tier.reasoning`, ...). |
+| Budget caps | `anthropic:claude-haiku-5-5` is priced ($0.10 / $0.50 per 1M tokens, prompts up to 100,000 tokens), so `--max-usd` and the drain's caps meter it. |
+| Takes extraction | Unchanged: it uses the gateway's chat model, not `facts.extraction_model`. |
+
+The `behavior_changes` notice lists this change once.
+
 ## [0.60.117.0] - 2026-10-08
 
 **A managed brain no longer calls itself healthy while its sync moves nothing: one consumer per host, a stall the drain can see from the same host, and `gbrain sources writer movement` as the deploy gate.**
