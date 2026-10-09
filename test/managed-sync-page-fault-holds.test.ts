@@ -285,3 +285,44 @@ test('when HEAD moves past the pinned target during the run, the drain takes exa
     expect(quiet.status).toBe('up_to_date'); expect(quiet.drain?.extra_pass).toBeUndefined();
   }
 }), 120_000);
+
+test('a file committed between admission and publication (raw_file_changed) is re-frozen once and imported as HEAD has it; a file that changes again is held', async () => withEnv({ GBRAIN_HOME: home, GBRAIN_SYNC_FAILURES_DIR: home }, async () => {
+  for (const engine of engines) {
+    const f = await fixture(engine, { 'a.md': note('Alpha one.'), 'b.md': note('Beta one.'), 'c.md': note('Gamma one.') });
+    expect((await performManagedSync(engine, f.opts)).status).toBe('first_sync');
+    for (const name of ['a', 'b', 'c']) writeFileSync(join(f.root, `${name}.md`), note(`${name} two.`));
+    const pin = commit(f.root, 'version two');
+    // The admission transaction's last statement re-checks the cursor still holds this entry (ENG-A7). Right after it, for b.md,
+    // another agent commits version three: publication then finds the file's bytes changed after admission.
+    const executeRaw = engine.executeRaw;
+    let commits = 0, versions = 0;
+    const armed = (sql: string, params?: unknown[]) => sql.includes("completed_keys->0->'pending'->>'requestId' AS request_id") && sql.includes('FOR SHARE') && String(params?.[2] ?? '').includes('"path":"b.md"');
+    engine.executeRaw = async function (this: BrainEngine, sql: string, params?: unknown[]) {
+      const rows = await executeRaw.call(this, sql, params);
+      if (armed(sql, params) && commits < versions) { writeFileSync(join(f.root, 'b.md'), note(`b round ${versions} change ${commits}, committed after admission.`)); commit(f.root, `b moves after admission ${commits}`); commits++; }
+      return rows;
+    } as BrainEngine['executeRaw'];
+    try {
+      versions = 1;
+      const once = await performManagedSync(engine, { ...f.opts, noBulk: true });
+      expect(once).toMatchObject({ status: 'synced', toCommit: pin });
+      expect(once.held ?? []).toEqual([]);
+      expect(once.converted_from_failed).toHaveLength(1);
+      expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('b round 1 change 0');
+      expect(await readManagedSyncFailures(engine, [f.id])).toEqual([]);
+      // A file that moves again under its re-frozen request is held (never a third request for the same entry).
+      for (const name of ['a', 'b', 'c']) writeFileSync(join(f.root, `${name}.md`), note(`${name} four.`));
+      const pin4 = commit(f.root, 'version four');
+      commits = 0; versions = 2;
+      const twice = await performManagedSync(engine, { ...f.opts, noBulk: true });
+      expect(twice).toMatchObject({ status: 'synced', toCommit: pin4, held_count: 1, held: [{ path: 'b.md', code: 'worktree_dirty' }] });
+      expect(commits).toBe(2);
+      expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('b round 1 change 0');
+      // The next sync re-screens the hold (the blob at HEAD differs from the hold's) and imports the latest commit.
+      const settled = await performManagedSync(engine, { ...f.opts, noBulk: true });
+      expect(settled.status).toBe('synced');
+      expect((await engine.getPage('b', { sourceId: f.id }))?.compiled_truth).toContain('b round 2 change 1');
+      expect(await readManagedSyncFailures(engine, [f.id])).toEqual([]);
+    } finally { engine.executeRaw = executeRaw; await disposePersistenceConsumer(engine); }
+  }
+}), 120_000);

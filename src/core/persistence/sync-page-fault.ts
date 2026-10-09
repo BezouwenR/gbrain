@@ -139,6 +139,12 @@ export function pinnedWorktreeConflict(done: Pick<WriteRequest, 'state' | 'error
     && ['Newer working-tree bytes and the current page disagree with this pinned Git import.', 'Newer code file bytes disagree with the pinned import.'].includes(done.error_message ?? '');
 }
 
+/** The receipt of an import whose file bytes changed between admission and publication (`raw_file_changed` in verb-errors.ts). */
+export function fileChangedAfterAdmission(done: Pick<WriteRequest, 'state' | 'error_code' | 'error_message'>): boolean {
+  return done.state !== 'committed' && done.error_code === 'source_changed'
+    && ['The imported file changed after sync admission.', 'The canonical file changed after preparation.', 'The canonical file changed during preparation.'].includes(done.error_message ?? '');
+}
+
 /** A `revision_conflict` receipt whose page really moved (its live revision differs from the frozen one); run-level conflicts stay blocking. */
 export async function pageMovedSinceAdmission(engine: Pick<BrainEngine, 'executeRaw'>, sourceId: string, pending: { slug: string; pageId: number | null; intent: Pick<SyncIntent, 'expected_revision'> },
   done: Pick<WriteRequest, 'state' | 'error_code'>): Promise<{ revision: string | null } | null> {

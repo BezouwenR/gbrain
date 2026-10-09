@@ -43,7 +43,8 @@ import { isRetryableConnError, isStatementTimeoutError } from '../retry-matcher.
 import { SYNC_READ_BOUND, type TreeBlob } from './sync-blobs.ts';
 import { dryRunScreen, isSyncReadBound, loadSyncScreenRun, managedImageHold, pinnedBlob, preparationStalledHold, prepareTimeFenceHold, screenFrozenImport, type HeldEntry, type SyncScreenRun } from './sync-screen.ts';
 import { fenceReceiptLocation } from '../fence-repair/refusal.ts';
-import { headCommittedBytes, originFaultHold, pageChangeProof, pageChangedHold, pinnedWorktreeConflict, receiptPageFaultHold } from './sync-page-fault.ts';
+import { managedSyncWriteDiagnostic } from './sync-write-diagnostic.ts';
+import { fileChangedAfterAdmission, headCommittedBytes, originFaultHold, pageChangeProof, pageChangedHold, pinnedWorktreeConflict, receiptPageFaultHold, worktreeDirtyHold } from './sync-page-fault.ts';
 import { faultPoint } from './fault-points.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { withCoordinatedWrite } from './context.ts';
@@ -290,35 +291,7 @@ function result(cursor: Cursor | CursorHeader, status: SyncResult['status'], rea
     ...(cursor.counts.skippedContextualMode || cursor.counts.skippedCanonicalBytes ? { legacySkips: {
       contextualMode: cursor.counts.skippedContextualMode ?? 0, canonicalBytes: cursor.counts.skippedCanonicalBytes ?? 0 } } : {}) };
 }
-function writeDiagnostic(cursor: Cursor, pending: Pending, row: WriteRequest): ManagedSyncWriteDiagnostic {
-  const terminal = isTerminalWriteState(row.state);
-  const code = terminal ? row.error_code ?? (row.state === 'cancelled' ? 'cancelled' : 'storage_error') : 'write_pending';
-  const blockedReason = ['writer_busy', 'writer_pool_capacity', 'owner_unavailable', 'recovery_required', 'writer_lock_unavailable',
-    'database_contention', 'consumer_stopping', 'revision_changed_repreparing', 'unexpected_file_bytes', 'unexpected_staging_bytes',
-    'preparation_deadline', 'group_member_waiting'].includes(row.blocked_reason ?? '') ? row.blocked_reason! : 'write_pending';
-  const detail = terminal ? writeFailureDiagnostic(code, row.error_message) : {
-    reason: blockedReason, message: 'The write is accepted but not committed; the sync checkpoint has not advanced.',
-    suggestion: 'Re-run the same sync options to resume this request. Do not submit a replacement request or skip the pending write.',
-  };
-  const diagnostic: ManagedSyncWriteDiagnostic = { source_id: cursor.sourceId, slug: pending.slug,
-    path: pending.intent.path, write_error: code, ...detail, write_request: publicWriteReceipt(receiptFor(row)) };
-  // #6194: an import that lost to a database write the hold could not prove; --retry-failed re-imports the Git version over it.
-  if (terminal && code === 'revision_conflict' && pending.intent.kind === 'managed_sync_import') diagnostic.suggestion = `The page changed in the database after this import was frozen. `
-    + `Before retrying, compare the file and the page with gbrain sources reconcile ${cursor.sourceId} ${pending.slug} --preview (it writes nothing): a retry re-imports the Git version over the database one. ${diagnostic.suggestion}`;
-  if (terminal) diagnostic.suggestion += ` After repair, run ${checkpointRetryCommand({ sourceId: cursor.sourceId, processingOptions: cursor.processingOptions, syncOptions: cursor.syncOptions ?? null, repoPath: pending.intent.repoPath })} to start a new request. Without --retry-failed, the frozen terminal request returns the same outcome. Skipping failures cannot bypass a managed write.`;
-  if (diagnostic.reason === 'pinned_git_worktree_conflict' && pending.intent.path && pending.intent.content !== null) {
-    try {
-      const bytes = readSyncFile(cursor.root, pending.intent.path);
-      if (bytes && sha256(bytes) === pending.intent.rawHash && sha256(bytes) !== sha256(pending.intent.content)
-        && bytes.equals(Buffer.from(bytes.toString('utf8')))
-        && bytes.toString('utf8').replace(/\r\n/g, '\n') === pending.intent.content.replace(/\r\n/g, '\n')) {
-        diagnostic.line_endings = 'crlf_lf_only';
-        diagnostic.message += ' The frozen working-tree and Git versions differ only by CRLF/LF line endings; exact byte protection still applies.';
-      }
-    } catch {}
-  }
-  return diagnostic;
-}
+const writeDiagnostic = (cursor: Cursor, pending: Pending, row: WriteRequest) => managedSyncWriteDiagnostic({ sourceId: cursor.sourceId, root: cursor.root, processingOptions: cursor.processingOptions, syncOptions: cursor.syncOptions ?? null }, pending, row);
 /**
  * #5984 G3: the page snapshot each frozen entry was validated against, read right before its sync authority check;
  * a waiver run's screen of that entry uses it instead of reading the page and the authority again.
@@ -540,8 +513,10 @@ const resumeArgsOf = (cursor: Cursor, run: { syncOptions: SyncCursorOptions; rep
  * predecessor into a committed one; cancelled successors are re-frozen under a
  * fresh dependency chain when the run continues.
  */
-async function holdUnderGate(engine: BrainEngine, input: { cursor: Cursor; key: string; pending: Pending; hold: HeldEntry; assertActive: () => void;
-  observedAt: string; waitMs: number; failedId: string; base?: Cursor }): Promise<Cursor | 'pending'> {
+async function holdUnderGate(engine: BrainEngine, input: { cursor: Cursor; key: string; pending: Pending; assertActive: () => void;
+  observedAt: string; waitMs: number; failedId: string; base?: Cursor } & ({ hold: HeldEntry; refrozen?: undefined } | { hold?: undefined;
+  /** #6340: instead of a hold, the entry re-frozen under a fresh request (its file changed after admission); same gate, same conversion record. */
+  refrozen: Pending })): Promise<Cursor | 'pending'> {
   const { cursor, key, pending, assertActive } = input;
   const principal = cursor.authority.writer.principal;
   const base: Cursor = input.base ?? { ...cursor }; delete base.group; delete base.window; delete base.pending;
@@ -569,9 +544,10 @@ async function holdUnderGate(engine: BrainEngine, input: { cursor: Cursor; key: 
       const stale = await tx.executeRaw<{ request_id: string }>(`SELECT request_id::text AS request_id FROM persistence_requests WHERE worktree_id=$1::uuid AND intent->>'runId'=$2
         AND ${SYNC_PAGE_KINDS_SQL} AND intent->>'index'=$3 AND state IN ('failed','cancelled','conflict')`, [cursor.binding.worktree_id, cursor.runId, String(cursor.index)]);
       const converted = [...new Set([...(cursor.convertedFromFailed ?? []), ...stale.map(row => row.request_id), pending.requestId])];
-      return writeCursor(tx, key, cursor, advanceHeld(base, converted), async inner => {
-        await heldWrite(cursor, input.hold, input.observedAt)(inner);
-        await recordSyncConversion(inner, cursor.sourceId, cursor.incarnation, { request_id: pending.requestId, path: pending.intent.path ?? null, slug: pending.slug, run_id: cursor.runId, outcome: 'held' });
+      const next: Cursor = input.hold ? advanceHeld(base, converted) : { ...base, convertedFromFailed: converted, pending: { ...input.refrozen, converted: true } };
+      return writeCursor(tx, key, cursor, next, async inner => {
+        if (input.hold) await heldWrite(cursor, input.hold, input.observedAt)(inner);
+        await recordSyncConversion(inner, cursor.sourceId, cursor.incarnation, { request_id: pending.requestId, path: pending.intent.path ?? null, slug: pending.slug, run_id: cursor.runId, outcome: input.hold ? 'held' : 'refrozen' });
       }, true);
     });
     if (saved) { await faultPoint('sync:mid_checkpoint', { sourceId: cursor.sourceId }); return saved; }
@@ -705,6 +681,16 @@ async function holdFailedFenceRequest(engine: BrainEngine, cursor: Cursor, key: 
   // whose page really moved with no proof of who moved it, and a pinned-worktree conflict (uncommitted local bytes) holds
   // `worktree_dirty` (sync-page-fault.ts). A run-level revision conflict (the page is where it was) still blocks.
   const fault = stalled || fence ? null : await receiptPageFaultHold(engine, { sourceId: cursor.sourceId, incarnation: cursor.incarnation, entry, pending, done });
+  // #6340: the file changed after admission (a commit landed between freeze and publication on a live checkout): re-freeze the
+  // entry once under a fresh request (committed bytes import as HEAD has them; uncommitted ones reach the dirty hold above);
+  // a second change under the same entry is held, so a file that keeps changing never loops.
+  if (!stalled && !fence && !fault && page && fileChangedAfterAdmission(done)) {
+    const refrozen = await freezeEntry(engine, base ?? (() => { const b: Cursor = { ...cursor }; delete b.pending; delete b.group; delete b.window; return b; })(), key, assertActive, run);
+    assertActive();
+    if ('hold' in refrozen) return holdUnderGate(engine, { cursor, key, pending, hold: refrozen.hold, assertActive, observedAt: run.observedAt!, waitMs, failedId: done.id, base });
+    if (pending.converted) return holdUnderGate(engine, { cursor, key, pending, hold: worktreeDirtyHold(entry, pending.slug, pending.pageId, { ...pending.intent, rawHash: refrozen.intent.rawHash }), assertActive, observedAt: run.observedAt!, waitMs, failedId: done.id, base });
+    return holdUnderGate(engine, { cursor, key, pending, refrozen, assertActive, observedAt: run.observedAt!, waitMs, failedId: done.id, base });
+  }
   if (!stalled && !fence && !fault) return null;
   const hold = stalled ? preparationStalledHold(entry, pending.slug, pending.pageId, done, pending.intent.content ?? null, pending.intent.blobOid, resumeArgsOf(cursor, run))
     : fence ? prepareTimeFenceHold(entry, pending.slug, pending.pageId, fence, pending.intent.content!, pending.intent.blobOid) : fault!;
